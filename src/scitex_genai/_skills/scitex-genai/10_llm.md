@@ -1,5 +1,13 @@
 ---
-description: Unified LLM provider factory `GenAI` — same API across OpenAI / Anthropic / Google / Groq / DeepSeek / Perplexity / Llama, with cost tracking and conversation history.
+description: |
+  [TOPIC] LLM Submodule
+  [DETAILS] Unified LLM provider factory `GenAI` — same API across OpenAI /
+  Anthropic / Google / Groq / DeepSeek / Perplexity / Llama, with cost tracking
+  and conversation history. Provider is inferred from the model name via the
+  internal `_PARAMS.MODELS` table; provider SDKs are opt-in extras to keep
+  cold-start light. Future direction: litellm-backed routing to consolidate the
+  provider dispatch layer.
+tags: [scitex-genai-llm]
 ---
 
 # scitex_genai.llm
