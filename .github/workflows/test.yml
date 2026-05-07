@@ -30,7 +30,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           python -m pytest "$GITHUB_WORKSPACE/tests/" -v --tb=short --timeout=120 \
-            --cov=src/scitex_ai \
+            --cov=src/scitex_genai \
             --cov-report=xml --cov-report=term
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
