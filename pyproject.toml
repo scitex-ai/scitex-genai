@@ -42,6 +42,7 @@ dependencies = [
     "anthropic",
     "google-genai",
     "groq",
+    "markdown2",
     "matplotlib",
     "Pillow",
     "tqdm",
