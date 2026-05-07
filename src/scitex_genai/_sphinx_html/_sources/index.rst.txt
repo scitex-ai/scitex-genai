@@ -10,9 +10,9 @@ fragments by modality.
 
    from scitex_genai import GenAI
 
-   ai = GenAI(provider="openai", model="gpt-4o")
-   print(ai.complete("Explain neural networks in one sentence."))
-   print(ai.get_cost_summary())
+   ai = GenAI(model="gpt-4o-mini")
+   print(ai("Explain neural networks in one sentence."))
+   print("cost USD:", ai.cost)
 
 The umbrella ``scitex-python`` exposes this package as ``scitex.genai``.
 For classical / deep ML utilities (factored out of the same legacy

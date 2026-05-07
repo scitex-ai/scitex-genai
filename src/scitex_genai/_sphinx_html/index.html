@@ -115,9 +115,9 @@ agents, image, audio, video, embeddings, and multimodal as the field
 fragments by modality.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">scitex_genai</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenAI</span>
 
-<span class="n">ai</span> <span class="o">=</span> <span class="n">GenAI</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">&quot;openai&quot;</span><span class="p">,</span> <span class="n">model</span><span class="o">=</span><span class="s2">&quot;gpt-4o&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">ai</span><span class="o">.</span><span class="n">complete</span><span class="p">(</span><span class="s2">&quot;Explain neural networks in one sentence.&quot;</span><span class="p">))</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">ai</span><span class="o">.</span><span class="n">get_cost_summary</span><span class="p">())</span>
+<span class="n">ai</span> <span class="o">=</span> <span class="n">GenAI</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;gpt-4o-mini&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">ai</span><span class="p">(</span><span class="s2">&quot;Explain neural networks in one sentence.&quot;</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;cost USD:&quot;</span><span class="p">,</span> <span class="n">ai</span><span class="o">.</span><span class="n">cost</span><span class="p">)</span>
 </pre></div>
 </div>
 <p>The umbrella <code class="docutils literal notranslate"><span class="pre">scitex-python</span></code> exposes this package as <code class="docutils literal notranslate"><span class="pre">scitex.genai</span></code>.
