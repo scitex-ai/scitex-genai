@@ -26,6 +26,10 @@ umbrella `scitex-python` exposes this package as `scitex.genai`.
 Reserved namespaces import successfully but raise `NotImplementedError`
 on attribute access — import paths are stable as features land.
 
+## Sub-skills
+
+* [llm.md](llm.md) — `GenAI` factory, supported providers, cost tracking, planned litellm backend.
+
 ## Quick Reference
 
 ```python
