@@ -19,3 +19,6 @@ env/
 .idea/
 *.swp
 .DS_Store
+docs/sphinx/_build/
+docs/sphinx/_generated/
+docs/sphinx/_static/
