@@ -10,6 +10,16 @@
   <a href="https://scitex-genai.readthedocs.io/">Full Documentation</a> · <code>pip install scitex-genai</code>
 </p>
 
+<!-- scitex-badges:start -->
+<p align="center">
+  <a href="https://pypi.org/project/scitex-genai/"><img src="https://img.shields.io/pypi/v/scitex-genai.svg" alt="PyPI"></a>
+  <a href="https://pypi.org/project/scitex-genai/"><img src="https://img.shields.io/pypi/pyversions/scitex-genai.svg" alt="Python"></a>
+  <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/test.yml"><img src="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="https://codecov.io/gh/ywatanabe1989/scitex-genai"><img src="https://codecov.io/gh/ywatanabe1989/scitex-genai/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/license-AGPL_v3-blue.svg" alt="License: AGPL v3"></a>
+</p>
+<!-- scitex-badges:end -->
+
 ---
 
 ## Overview
