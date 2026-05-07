@@ -1,4 +1,4 @@
-# scitex-genai
+# SciTeX GenAI (<code>scitex-genai</code>)
 
 <p align="center">
   <a href="https://scitex.ai">
