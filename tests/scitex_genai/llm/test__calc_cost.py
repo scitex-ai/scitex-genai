@@ -13,7 +13,6 @@ __DIR__ = os.path.dirname(__FILE__)
 
 import pytest
 
-pytest.importorskip("zarr")
 from unittest.mock import patch
 
 import pandas as pd

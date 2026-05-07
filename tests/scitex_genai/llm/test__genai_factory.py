@@ -16,7 +16,6 @@ from unittest.mock import Mock, patch
 import pandas as pd
 import pytest
 
-pytest.importorskip("zarr")
 from scitex_genai.llm._genai_factory import genai_factory
 
 

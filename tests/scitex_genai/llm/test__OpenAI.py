@@ -6,7 +6,6 @@
 
 import pytest
 
-pytest.importorskip("zarr")
 import os
 from unittest.mock import MagicMock, Mock, patch
 

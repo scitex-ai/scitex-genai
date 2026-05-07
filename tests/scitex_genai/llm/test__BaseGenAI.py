@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-pytest.importorskip("zarr")
 from scitex_genai.llm import BaseGenAI
 
 
@@ -279,7 +278,6 @@ class TestBaseGenAI:
     )
     def test_ensure_base64_encoding(self, image_input, expected_type):
         """Test base64 encoding of images."""
-        import io
 
         # Create a proper mock image with size attribute
         mock_img = MagicMock()

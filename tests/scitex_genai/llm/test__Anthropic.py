@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-pytest.importorskip("zarr")
 from scitex_genai.llm import Anthropic
 
 

@@ -6,7 +6,6 @@
 
 import pytest
 
-pytest.importorskip("zarr")
 from scitex_genai.llm import format_output_func
 
 
