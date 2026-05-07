@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scitex-genai"
+version = "0.1.0"
+description = "SciTeX GenAI — modality-organised generative-AI provider abstraction (LLM, agents, image/audio/video stubs)"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.10"
+authors = [
+    { name = "Yusuke Watanabe", email = "ywatanabe@scitex.ai" },
+]
+keywords = [
+    "genai",
+    "llm",
+    "openai",
+    "anthropic",
+    "agents",
+    "litellm",
+    "ollama",
+    "scitex",
+    "science",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# `llm/` modules import provider SDKs at top level today — keep them in core.
+# A follow-up will route through litellm and demote these to optional.
+dependencies = [
+    "openai",
+    "anthropic",
+    "google-genai",
+    "groq",
+    "matplotlib",
+    "Pillow",
+    "tqdm",
+    # SciTeX standalone deps
+    "scitex-logging>=0.1.3",
+    "scitex-str>=0.1.0",
+    "scitex-types>=0.1.3",
+]
+
+[project.optional-dependencies]
+# Forward-looking extras — wire up as modality submodules land.
+agent = [
+    "claude-agent-sdk",
+]
+litellm = [
+    "litellm",
+]
+ollama = [
+    "ollama",
+]
+image = []
+audio = []
+video = []
+embed = []
+multimodal = []
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-timeout",
+    "ruff",
+    "scitex-dev",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=2.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-autodoc-typehints>=1.25",
+]
+all = [
+    "scitex-genai[agent]",
+    "scitex-genai[litellm]",
+    "scitex-genai[ollama]",
+]
+
+[project.urls]
+Homepage = "https://github.com/ywatanabe1989/scitex-genai"
+Repository = "https://github.com/ywatanabe1989/scitex-genai"
+Documentation = "https://scitex-genai.readthedocs.io"
+Issues = "https://github.com/ywatanabe1989/scitex-genai/issues"
+
+[project.entry-points."scitex_dev.docs"]
+scitex-genai = "scitex_genai"
+
+[project.entry-points."scitex_dev.skills"]
+scitex-genai = "scitex_genai"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scitex_genai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E402"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/scitex_genai/__init__.py" = ["E402", "F401"]
+"src/scitex_genai/**/__init__.py" = ["F401"]
+
+[tool.scitex-linter]
+library_dirs = ["src", "tests", "examples"]
