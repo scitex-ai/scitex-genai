@@ -51,13 +51,13 @@ Through the umbrella: `pip install scitex[genai]`. Requires Python ≥ 3.10.
 ```python
 import scitex_genai
 
-ai = scitex_genai.GenAI(provider="openai", model="gpt-4o")
-print(ai.complete("Explain neural networks in one sentence."))
-print(ai.get_cost_summary())
+ai = scitex_genai.GenAI(model="gpt-4o-mini")
+print(ai("Explain neural networks in one sentence."))
+print("cost USD:", ai.cost)
 
 # Switch backends without changing the call shape:
-ai = scitex_genai.GenAI(provider="anthropic", model="claude-sonnet-4-6")
-ai.complete("Same call, different provider.")
+ai = scitex_genai.GenAI(model="claude-sonnet-4-6")
+ai("Same call, different provider.")
 ```
 
 For a runnable walk-through see [`examples/01_genai.ipynb`](examples/01_genai.ipynb).
@@ -71,7 +71,7 @@ gracefully when the relevant API key is unset.
 
 ```mermaid
 flowchart LR
-    User[your code] -->|GenAI&#40;provider, model&#41;| Factory[scitex_genai.llm.GenAI]
+    User[your code] -->|GenAI&#40;model&#41;| Factory[scitex_genai.llm.GenAI]
     Factory -->|dispatch| OpenAI[OpenAI]
     Factory --> Anthropic[Anthropic]
     Factory --> Google[Google]
@@ -83,7 +83,7 @@ flowchart LR
     Anthropic -.-> Tracker
     Google -.-> Tracker
     Groq -.-> Tracker
-    Tracker --> Out[ai.complete&#40;...&#41; · ai.get_cost_summary&#40;&#41;]
+    Tracker --> Out[ai&#40;...&#41; · ai.cost · ai.history]
 ```
 
 A second `examples/example_genai.py` runs the same flow as a script and
@@ -142,9 +142,9 @@ Reserved namespaces import successfully but raise `NotImplementedError` on attri
 ```python
 from scitex_genai import GenAI
 
-ai = GenAI(provider="openai", model="gpt-4o")
-print(ai.complete("..."))
-print(ai.get_cost_summary())
+ai = GenAI(model="gpt-4o-mini")
+print(ai("..."))
+print("cost USD:", ai.cost)
 ```
 
 > **[Full API reference](https://scitex-genai.readthedocs.io/en/latest/api.html)**

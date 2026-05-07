@@ -35,9 +35,9 @@ on attribute access — import paths are stable as features land.
 ```python
 import scitex_genai
 
-ai = scitex_genai.GenAI(provider="openai", model="gpt-4o")
-print(ai.complete("Explain neural networks in one sentence."))
-print(ai.get_cost_summary())
+ai = scitex_genai.GenAI(model="gpt-4o-mini")
+print(ai("Explain neural networks in one sentence."))
+print("cost USD:", ai.cost)
 ```
 
 ## Umbrella access

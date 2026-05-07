@@ -5,16 +5,16 @@
 ```python
 from scitex_genai import GenAI
 
-ai = GenAI(provider="openai", model="gpt-4o")
-print(ai.complete("Explain neural networks in one sentence."))
-print(ai.get_cost_summary())
+ai = GenAI(model="gpt-4o-mini")
+print(ai("Explain neural networks in one sentence."))
+print("cost USD:", ai.cost)
 ```
 
 ## Switch providers without changing the call
 
 ```python
-ai = GenAI(provider="anthropic", model="claude-sonnet-4-6")
-ai.complete("Same call, different backend.")
+ai = GenAI(model="claude-sonnet-4-6")
+ai("Same call, different backend.")
 ```
 
 The `GenAI` factory dispatches to the matching provider class inside

@@ -4,29 +4,31 @@ description: Unified LLM provider factory `GenAI` — same API across OpenAI / A
 
 # scitex_genai.llm
 
-Single entrypoint for text-completion-style LLMs. Every provider goes through the same `GenAI` factory, returning a client whose `.complete()` and `.stream()` methods have identical signatures regardless of backend.
+Single entrypoint for text-completion-style LLMs. Every provider goes through the same `GenAI(model=...)` factory, which infers the provider from the model name and returns a callable client. The instance's `__call__(prompt)` returns the response text; `.cost` and `.history` track cumulative spend and conversation buffer.
 
 ## Quick reference
 
 ```python
 from scitex_genai import GenAI
 
-ai = GenAI(provider="openai", model="gpt-4o")
-print(ai.complete("Explain neural networks in one sentence."))
-print(ai.get_cost_summary())     # cumulative cost since instantiation
+ai = GenAI(model="gpt-4o-mini")
+print(ai("Explain neural networks in one sentence."))
+print("cost USD:", ai.cost)     # cumulative cost since instantiation
 ```
 
 ## Supported providers
 
-| Provider     | `provider=`     | Notes                                        |
-| ------------ | --------------- | -------------------------------------------- |
-| OpenAI       | `"openai"`      | Requires `OPENAI_API_KEY`.                   |
-| Anthropic    | `"anthropic"`   | Requires `ANTHROPIC_API_KEY`.                |
-| Google       | `"google"`      | Gemini family. Requires `GOOGLE_API_KEY`.    |
-| Groq         | `"groq"`        | Fast OSS-model inference. `GROQ_API_KEY`.    |
-| DeepSeek     | `"deepseek"`    | OpenAI-compatible API.                       |
-| Perplexity   | `"perplexity"`  | Search-augmented generation.                 |
-| Llama        | `"llama"`       | Local / self-hosted Llama servers.           |
+The provider is inferred from the model name via `scitex_genai.llm._PARAMS.MODELS`.
+
+| Provider     | API-key env             | Notes                                        |
+| ------------ | ----------------------- | -------------------------------------------- |
+| OpenAI       | `OPENAI_API_KEY`        | GPT-4 / GPT-4o / o-series.                   |
+| Anthropic    | `ANTHROPIC_API_KEY`     | Claude family.                               |
+| Google       | `GOOGLE_API_KEY`        | Gemini family.                               |
+| Groq         | `GROQ_API_KEY`          | Fast OSS-model inference.                    |
+| DeepSeek     | `DEEPSEEK_API_KEY`      | OpenAI-compatible API.                       |
+| Perplexity   | `PERPLEXITY_API_KEY`    | Search-augmented generation.                 |
+| Llama        | (none — local)          | Local / self-hosted Llama servers.           |
 
 Provider classes themselves (`Anthropic`, `OpenAI`, …) live in
 `scitex_genai.llm` and inherit from `BaseGenAI`. Use `GenAI(...)` —
@@ -34,15 +36,15 @@ the factory — for all normal application code.
 
 ## Cost tracking
 
-Every call updates an internal accumulator. `get_cost_summary()` returns a
-human-readable string with prompt / completion token counts and the
-estimated USD spend per provider in the session.
+Every call updates internal token counters; `ai.cost` exposes the
+cumulative USD estimate. `ai.input_tokens` / `ai.output_tokens` give the
+raw counts.
 
 ## Conversation history
 
-Each `GenAI` instance carries a conversation buffer; consecutive
-`.complete()` calls re-send the running history. Reset with
-`ai.clear_history()`.
+Each `GenAI` instance carries a conversation buffer (`ai.history`);
+consecutive `ai(prompt)` calls re-send the running history (controlled
+by `n_keep` at construction). Reset with `ai.reset()`.
 
 ## What's coming
 

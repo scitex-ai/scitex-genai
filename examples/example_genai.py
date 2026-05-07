@@ -25,11 +25,10 @@ def main() -> int:
         print(f"scitex-genai not installed: {e}", file=sys.stderr)
         return 1
 
-    ai = GenAI(provider="openai", model="gpt-4o-mini")
-    response = ai.complete("Summarise neural networks in one sentence.")
+    ai = GenAI(model="gpt-4o-mini")
+    response = ai("Summarise neural networks in one sentence.")
     print(response)
-    summary = ai.get_cost_summary()
-    print(summary)
+    print("cost (USD):", ai.cost)
     return 0
 
 
