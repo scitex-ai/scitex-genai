@@ -4,10 +4,10 @@
 
 """Tests for scitex_genai.llm._Groq module."""
 
-import pytest
-
 import os
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
+
+import pytest
 
 from scitex_genai.llm import Groq
 
@@ -48,9 +48,9 @@ class TestGroq:
             groq_ai = Groq(api_key="explicit-key", model="llama3-8b-8192")
             assert groq_ai.api_key == "explicit-key"
 
-    def test_init_without_api_key(self):
-        """Test initialization fails without API key."""
-        # Pass api_key=None explicitly since default arg is evaluated at import time
+    def test_init_without_api_key(self, monkeypatch):
+        """Test initialization fails without API key (and no env var)."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
         with pytest.raises(
             ValueError, match="GROQ_API_KEY environment variable not set"
         ):
