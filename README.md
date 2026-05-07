@@ -62,6 +62,64 @@ ai.complete("Same call, different provider.")
 
 For a runnable walk-through see [`examples/01_genai.ipynb`](examples/01_genai.ipynb).
 
+## Demo
+
+A runnable provider walk-through (init `GenAI`, single completion, cost
+summary, provider switch) lives in
+[`examples/01_genai.ipynb`](examples/01_genai.ipynb). Each cell skips
+gracefully when the relevant API key is unset.
+
+```mermaid
+flowchart LR
+    User[your code] -->|GenAI&#40;provider, model&#41;| Factory[scitex_genai.llm.GenAI]
+    Factory -->|dispatch| OpenAI[OpenAI]
+    Factory --> Anthropic[Anthropic]
+    Factory --> Google[Google]
+    Factory --> Groq[Groq]
+    Factory --> DeepSeek[DeepSeek]
+    Factory --> Perplexity[Perplexity]
+    Factory --> Llama[Llama]
+    OpenAI -.->|tokens / cost| Tracker[BaseGenAI<br/>cost + history]
+    Anthropic -.-> Tracker
+    Google -.-> Tracker
+    Groq -.-> Tracker
+    Tracker --> Out[ai.complete&#40;...&#41; · ai.get_cost_summary&#40;&#41;]
+```
+
+A second `examples/example_genai.py` runs the same flow as a script and
+is wired into `tests/examples/test_example_genai.py` for CI smoke
+coverage.
+
+## Architecture
+
+`scitex-genai` is organised top-down by **modality**, not by provider:
+
+```
+scitex-python (umbrella)
+    └── scitex.genai ── thin sys.modules-aliasing shim
+                        └── scitex_genai (this package)
+                              ├── llm/         provider factory ``GenAI``
+                              │                 ├── _BaseGenAI         common interface
+                              │                 ├── _OpenAI / _Anthropic / _Google /
+                              │                 │   _Groq / _DeepSeek / _Perplexity / _Llama
+                              │                 ├── _PARAMS            model catalogue
+                              │                 ├── _calc_cost         token-cost accounting
+                              │                 └── _format_output_func text/markdown formatting
+                              ├── agent/        reserved (claude-agent-sdk wrapper planned)
+                              ├── image/        reserved
+                              ├── audio/        reserved
+                              ├── video/        reserved
+                              ├── embed/        reserved
+                              └── multimodal/   reserved
+```
+
+Reserved modality namespaces import successfully but raise
+`NotImplementedError` on attribute access, so the public import paths
+are stable as features land. Provider SDKs (`openai`, `anthropic`,
+`google-genai`, `groq`) are eager core dependencies today; a follow-up
+will route `llm/` through [litellm](https://github.com/BerriAI/litellm)
+to demote them to optional and add Ollama out of the box.
+
 ## Modality layout
 
 | Submodule                   | Status        | Notes                                                |

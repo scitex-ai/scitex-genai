@@ -1,0 +1,6 @@
+scitex\_genai.multimodal
+========================
+
+.. automodule:: scitex_genai.multimodal
+
+   

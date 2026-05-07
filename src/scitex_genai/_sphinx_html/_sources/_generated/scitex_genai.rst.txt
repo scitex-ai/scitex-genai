@@ -1,0 +1,19 @@
+﻿scitex\_genai
+=============
+
+.. automodule:: scitex_genai
+
+   
+.. rubric:: Modules
+
+.. autosummary::
+   :toctree:
+   :recursive:
+
+   agent
+   audio
+   embed
+   image
+   llm
+   multimodal
+   video

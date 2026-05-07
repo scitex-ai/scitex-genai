@@ -1,0 +1,6 @@
+scitex\_genai.embed
+===================
+
+.. automodule:: scitex_genai.embed
+
+   
