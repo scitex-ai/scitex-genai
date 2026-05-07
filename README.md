@@ -52,7 +52,7 @@ pip install scitex-genai[ollama]    # + local ollama
 pip install scitex-genai[all]       # everything available today
 ```
 
-## Quick start
+## Python API ⭐⭐⭐
 
 ```python
 from scitex_genai import GenAI
@@ -61,6 +61,20 @@ ai = GenAI(provider="openai", model="gpt-4o")
 print(ai.complete("Explain neural networks in one sentence."))
 print(ai.get_cost_summary())
 ```
+
+## CLI ⭐ — none
+
+No dedicated CLI. Drive completions from Python or the umbrella `scitex`
+CLI session.
+
+## MCP ⭐ — none
+
+No MCP server today. The umbrella ships LLM-related MCP tools
+separately.
+
+## Skills ⭐⭐
+
+Skill index lives at `src/scitex_genai/_skills/scitex-genai/SKILL.md`.
 
 ## Roadmap
 
