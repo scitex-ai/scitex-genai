@@ -73,7 +73,7 @@ dev = [
     "pytest-xdist>=3.0.0",
     "pytest-timeout",
     "ruff",
-    "scitex-dev>=0.11.5",
+    "scitex-dev>=0.11.7",
     # Notebook execution for tests/examples/test_01_*.py (PS505).
     "nbconvert",
     "nbformat",
