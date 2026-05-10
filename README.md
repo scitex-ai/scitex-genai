@@ -9,7 +9,7 @@
 <p align="center"><b>Modality-organised generative-AI provider abstraction for scientific research.</b></p>
 
 <p align="center">
-  <a href="https://scitex-genai.readthedocs.io/">Full Documentation</a> · <code>pip install scitex-genai</code>
+  <a href="https://scitex-genai.readthedocs.io/">Full Documentation</a> · <code>uv pip install scitex-genai[all]</code>
 </p>
 
 <!-- scitex-badges:start -->
