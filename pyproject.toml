@@ -47,6 +47,7 @@ dependencies = [
     "Pillow",
     "tqdm",
     # SciTeX standalone deps (only those actually imported by src/)
+    "scitex-dev>=0.11.7",
     "scitex-io>=0.2.0",
     "scitex-str>=0.1.0",
 ]
@@ -78,6 +79,11 @@ dev = [
     "nbconvert",
     "nbformat",
     "ipykernel",
+    # Used directly by test suite (tests/scitex_genai/llm/test__Google.py).
+    "numpy",
+    # Used directly by tests/scitex_genai/llm/test__calc_cost.py and
+    # tests/scitex_genai/llm/test__genai_factory.py.
+    "pandas",
 ]
 docs = [
     "sphinx>=7.0",
@@ -111,6 +117,11 @@ packages = ["src/scitex_genai"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+
+[tool.coverage.run]
+parallel = true
+source = ["scitex_genai"]
+concurrency = ["multiprocessing", "thread"]
 
 [tool.ruff]
 line-length = 88

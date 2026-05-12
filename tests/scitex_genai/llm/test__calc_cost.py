@@ -15,7 +15,7 @@ import pytest
 
 from unittest.mock import patch
 
-import pandas as pd
+pd = pytest.importorskip("pandas")
 
 from scitex_genai.llm import calc_cost
 

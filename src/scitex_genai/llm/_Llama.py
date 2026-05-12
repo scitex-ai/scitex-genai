@@ -11,12 +11,13 @@ from typing import List, Optional
 
 import matplotlib.pyplot as plt
 
+from scitex_dev import try_import_optional
 
-try:
-    from llama import Dialog
-    from llama import Llama as _Llama
-except:
-    pass
+# `llama` is not declared as an extra (no upstream PyPI release tracks
+# this name reliably), so callers install it out-of-band before using
+# the Llama backend. Omit extra=/pkg= per the lazy-imports skill leaf.
+Dialog = try_import_optional("llama", "Dialog")
+_Llama = try_import_optional("llama", "Llama")
 
 from ._BaseGenAI import BaseGenAI
 

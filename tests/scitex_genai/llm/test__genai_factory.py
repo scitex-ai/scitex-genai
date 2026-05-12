@@ -13,8 +13,9 @@ __DIR__ = os.path.dirname(__FILE__)
 
 from unittest.mock import Mock, patch
 
-import pandas as pd
 import pytest
+
+pd = pytest.importorskip("pandas")
 
 from scitex_genai.llm._genai_factory import genai_factory
 

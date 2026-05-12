@@ -13,8 +13,9 @@ import sys
 from io import BytesIO
 from unittest.mock import MagicMock, Mock, call, patch
 
-import numpy as np
 import pytest
+
+np = pytest.importorskip("numpy")
 from PIL import Image
 
 
