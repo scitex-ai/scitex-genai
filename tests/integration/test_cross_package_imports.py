@@ -23,6 +23,10 @@ CROSS_PACKAGE_IMPORTS = [
 
 
 @pytest.mark.parametrize("module_name", CROSS_PACKAGE_IMPORTS)
-def test_cross_package_import(module_name):
+def test_cross_package_import_resolves_to_real_module(module_name):
     """Importing scitex-genai's declared cross-package dependency must succeed."""
-    pytest.importorskip(module_name)
+    # Arrange
+    # Act
+    mod = pytest.importorskip(module_name)
+    # Assert
+    assert mod.__name__ == module_name

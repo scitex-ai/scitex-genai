@@ -13,14 +13,29 @@ pytest.importorskip("scitex_genai")
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "example_genai.py"
 
 
-def test_example_genai_runs():
+def test_example_genai_runs_example_is_file():
+    # Arrange
+    # Act
+    # Assert
+    # Arrange
+    # Act
+    # Assert
     assert EXAMPLE.is_file(), f"missing example: {EXAMPLE}"
+
+
+def test_example_genai_runs_r_returncode_equals_n_0():
+    # Arrange
+    # Arrange
+    # Act
     r = subprocess.run(
         [sys.executable, str(EXAMPLE)],
         capture_output=True,
         text=True,
         timeout=120,
     )
-    # Example exits 0 cleanly whether or not the API key is present
-    # (it skips gracefully when missing).
+    # Act
+    # Assert
+    # Assert
     assert r.returncode == 0, r.stderr
+
+
