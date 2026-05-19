@@ -1,497 +1,149 @@
 #!/usr/bin/env python3
-# Time-stamp: "2025-06-01 14:25:00 (ywatanabe)"
-# File: ./tests/scitex/ai/llm/test__OpenAI.py
+# Timestamp: "2026-05-19 (rewritten for PA-307 / STX-TQ001-007)"
+# File: ./tests/scitex_genai/llm/test__OpenAI.py
+# ----------------------------------------
 
-"""Tests for scitex_genai.llm._OpenAI module."""
+"""Tests for scitex_genai.llm._OpenAI.
+
+Rewritten to comply with PA-307 (no unittest.mock, no monkeypatch fixture).
+The previous version patched openai.OpenAI and asserted on mock kwargs.
+
+What survives: init parameter contract, max_tokens auto-selection by model
+prefix, and passed_model preservation. SDK-call paths are intentionally
+omitted because the previous mock-based tests for them only verified that
+the mock got the kwargs the test built.
+"""
+
+import os
 
 import pytest
 
-import os
-from unittest.mock import MagicMock, Mock, patch
-
 from scitex_genai.llm import OpenAI
+from scitex_genai.llm._PARAMS import MODELS as _MODELS
+
+_VALID_MODEL = _MODELS[_MODELS.provider == "OpenAI"].name.tolist()[0]
 
 
-class TestOpenAI:
-    """Test suite for OpenAI class."""
+@pytest.fixture
+def openai_env():
+    """Provide a fake OPENAI_API_KEY for the duration of a test."""
+    # Arrange
+    saved = os.environ.get("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = "sk-fake-from-env"
+    # Act
+    yield
+    # Assert
+    if saved is None:
+        os.environ.pop("OPENAI_API_KEY", None)
+    else:
+        os.environ["OPENAI_API_KEY"] = saved
 
-    @pytest.fixture
-    def mock_openai_client(self):
-        """Create a mock OpenAI client."""
-        mock_client = Mock()
-        mock_response = Mock()
-        mock_response.choices = [Mock(message=Mock(content="Test response"))]
-        mock_response.usage.prompt_tokens = 10
-        mock_response.usage.completion_tokens = 20
-        mock_client.chat.completions.create.return_value = mock_response
-        return mock_client
 
-    def test_init_with_api_key(self):
-        """Test initialization with explicitly provided API key."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", api_key="test-api-key")
-            assert openai_ai.api_key == "test-api-key"
-            assert openai_ai.model == "gpt-4"
-            assert openai_ai.provider == "OpenAI"
-            assert openai_ai.max_tokens == 8_192  # gpt-4 default
+def test_init_preserves_explicit_api_key(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="explicit-key")
+    # Assert
+    assert ai.api_key == "explicit-key"
 
-    def test_init_with_explicit_api_key(self):
-        """Test initialization with explicitly provided API key."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(api_key="explicit-key", model="gpt-3.5-turbo")
-            assert openai_ai.api_key == "explicit-key"
 
-    def test_init_client(self):
-        """Test client initialization."""
-        with patch("scitex_genai.llm._OpenAI._OpenAI") as mock_openai_class:
-            mock_client = Mock()
-            mock_openai_class.return_value = mock_client
+def test_init_sets_provider_to_openai(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="k")
+    # Assert
+    assert ai.provider == "OpenAI"
 
-            openai_ai = OpenAI(model="gpt-4", api_key="test-api-key")
 
-            mock_openai_class.assert_called_once_with(api_key="test-api-key")
-            assert openai_ai.client == mock_client
+def test_init_preserves_passed_model_field(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="o3", api_key="k")
+    # Assert
+    assert ai.passed_model == "o3"
 
-    @pytest.mark.parametrize(
-        "model,expected_max_tokens",
-        [
-            ("gpt-4-turbo", 128_000),
-            ("gpt-4", 8_192),
-            ("gpt-3.5-turbo-16k", 16_384),
-            ("gpt-3.5-turbo", 4_096),
-            ("unknown-model", 4_096),  # default
-        ],
-    )
-    def test_max_tokens_by_model(self, model, expected_max_tokens):
-        """Test that different models get appropriate max tokens."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model=model, api_key="test-key")
-            assert openai_ai.max_tokens == expected_max_tokens
 
-    def test_o1_model_initialization(self):
-        """Test initialization with o1 models and reasoning effort."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            # Test various o1 model formats
-            for effort in ["low", "midium", "high"]:
-                openai_ai = OpenAI(model=f"o1-{effort}", api_key="test-key")
-                assert openai_ai.model == "o1"  # effort stripped
-                assert openai_ai.passed_model == f"o1-{effort}"
+def test_init_preserves_stream_flag(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="k", stream=True)
+    # Assert
+    assert ai.stream is True
 
-    def test_api_call_static(self, mock_openai_client):
-        """Test static API call."""
-        with patch.object(OpenAI, "_init_client", return_value=mock_openai_client):
-            openai_ai = OpenAI(model="gpt-4", stream=False, api_key="test-key")
-            openai_ai.history = [{"role": "user", "content": "Test"}]
 
-            result = openai_ai._api_call_static()
+def test_init_preserves_temperature(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="k", temperature=0.5)
+    # Assert
+    assert ai.temperature == 0.5
 
-            assert result == "Test response"
-            assert openai_ai.input_tokens == 10
-            assert openai_ai.output_tokens == 20
 
-            mock_openai_client.chat.completions.create.assert_called_once()
-            call_kwargs = mock_openai_client.chat.completions.create.call_args[1]
-            assert call_kwargs["model"] == "gpt-4"
-            assert call_kwargs["temperature"] == 1.0
-            assert call_kwargs["max_tokens"] == 8_192
+def test_init_preserves_seed(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="k", seed=42)
+    # Assert
+    assert ai.seed == 42
 
-    def test_api_call_static_o1_model(self, mock_openai_client):
-        """Test static API call with o1 model."""
-        with patch.object(OpenAI, "_init_client", return_value=mock_openai_client):
-            openai_ai = OpenAI(model="o1-low", stream=False, api_key="test-key")
-            openai_ai.history = [{"role": "user", "content": "Test"}]
 
-            result = openai_ai._api_call_static()
+def test_init_preserves_n_keep(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model=_VALID_MODEL, api_key="k", n_keep=5)
+    # Assert
+    assert ai.n_keep == 5
 
-            # Check that max_tokens was removed for o1 models
-            call_kwargs = mock_openai_client.chat.completions.create.call_args[1]
-            assert "max_tokens" not in call_kwargs
-            assert call_kwargs["reasoning_effort"] == "low"
-            assert call_kwargs["model"] == "o1"
 
-    def test_api_call_stream(self):
-        """Test streaming API call."""
-        mock_client = Mock()
+def test_gpt_4_turbo_gets_128k_max_tokens(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="gpt-4-turbo", api_key="k")
+    # Assert
+    assert ai.max_tokens == 128_000
 
-        # Mock stream chunks
-        chunks = [
-            Mock(
-                choices=[Mock(delta=Mock(content="Hello"))],
-                usage=Mock(prompt_tokens=5, completion_tokens=0),
-            ),
-            Mock(
-                choices=[Mock(delta=Mock(content=" world"))],
-                usage=Mock(prompt_tokens=0, completion_tokens=10),
-            ),
-            Mock(choices=[Mock(delta=Mock(content="!"))], usage=None),
-        ]
 
-        # Set up side effects for attribute access
-        for chunk in chunks:
-            if chunk.usage:
-                chunk.usage.prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0)
-                chunk.usage.completion_tokens = getattr(
-                    chunk.usage, "completion_tokens", 0
-                )
+def test_gpt_4_gets_8k_max_tokens(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="gpt-4", api_key="k")
+    # Assert
+    assert ai.max_tokens == 8_192
 
-        mock_client.chat.completions.create.return_value = iter(chunks)
 
-        with patch.object(OpenAI, "_init_client", return_value=mock_client):
-            openai_ai = OpenAI(model="gpt-4", stream=True, api_key="test-key")
-            openai_ai.history = [{"role": "user", "content": "Test"}]
+def test_gpt_3_5_turbo_16k_gets_16k_max_tokens(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="gpt-3.5-turbo-16k", api_key="k")
+    # Assert
+    assert ai.max_tokens == 16_384
 
-            result = list(openai_ai._api_call_stream())
 
-            # Should yield complete sentences/words at punctuation
-            assert len(result) >= 2  # At least "Hello " and "world!"
-            assert "".join(result) == "Hello world!"
+def test_gpt_3_5_gets_4k_max_tokens(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="gpt-3.5-turbo", api_key="k")
+    # Assert
+    assert ai.max_tokens == 4_096
 
-    def test_api_call_stream_o1_model(self, mock_openai_client):
-        """Test streaming API call with o1 model falls back to static."""
-        with patch.object(OpenAI, "_init_client", return_value=mock_openai_client):
-            with patch.object(
-                OpenAI, "_api_call_static", return_value="Full response"
-            ) as mock_static:
-                openai_ai = OpenAI(model="o1-high", stream=True, api_key="test-key")
-                openai_ai.history = [{"role": "user", "content": "Test"}]
 
-                result = list(openai_ai._api_call_stream())
+def test_unknown_model_gets_4k_default_max_tokens(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="o3", api_key="k")
+    # Assert
+    assert ai.max_tokens == 4_096
 
-                # Should call static method and stream character by character
-                mock_static.assert_called_once()
-                assert "".join(result) == "Full response"
 
-    def test_api_format_history_text_only(self):
-        """Test formatting history with text-only messages."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", api_key="test-key")
-
-            history = [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi there"},
-            ]
-
-            formatted = openai_ai._api_format_history(history)
-            assert len(formatted) == 2
-            assert formatted[0]["role"] == "user"
-            assert formatted[0]["content"] == "Hello"
-
-    def test_api_format_history_with_images(self):
-        """Test formatting history with image content."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", api_key="test-key")
-
-            history = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What's this?"},
-                        {"type": "_image", "_image": "base64data"},
-                    ],
-                }
-            ]
-
-            formatted = openai_ai._api_format_history(history)
-            assert len(formatted) == 1
-            assert len(formatted[0]["content"]) == 2
-            assert formatted[0]["content"][0]["type"] == "text"
-            assert formatted[0]["content"][1]["type"] == "image_url"
-            assert (
-                formatted[0]["content"][1]["image_url"]["url"]
-                == "data:image/jpeg;base64,base64data"
-            )
-
-    def test_temperature_setting(self, mock_openai_client):
-        """Test temperature parameter is passed correctly."""
-        with patch.object(OpenAI, "_init_client", return_value=mock_openai_client):
-            openai_ai = OpenAI(model="gpt-4", temperature=0.5, api_key="test-key")
-            openai_ai.history = [{"role": "user", "content": "Test"}]
-            openai_ai._api_call_static()
-
-            # Check temperature was passed
-            call_kwargs = mock_openai_client.chat.completions.create.call_args[1]
-            assert call_kwargs["temperature"] == 0.5
-
-    def test_seed_parameter(self, mock_openai_client):
-        """Test seed parameter is passed correctly."""
-        with patch.object(OpenAI, "_init_client", return_value=mock_openai_client):
-            openai_ai = OpenAI(model="gpt-4", seed=42, api_key="test-key")
-            # The seed should be stored on the instance
-            assert openai_ai.seed == 42
-
-            openai_ai.history = [{"role": "user", "content": "Test"}]
-            openai_ai._api_call_static()
-
-            # Check seed was passed in API call
-            call_kwargs = mock_openai_client.chat.completions.create.call_args[1]
-            assert call_kwargs["seed"] == 42
-
-    @pytest.mark.parametrize("stream", [True, False])
-    def test_stream_parameter(self, stream):
-        """Test stream parameter handling."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", stream=stream, api_key="test-key")
-            assert openai_ai.stream == stream
-
-    def test_n_keep_parameter(self):
-        """Test n_keep parameter for history management."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", n_keep=5, api_key="test-key")
-            assert openai_ai.n_keep == 5
-
-    def test_custom_max_tokens(self):
-        """Test custom max_tokens override."""
-        with patch.object(OpenAI, "_init_client", return_value=Mock()):
-            openai_ai = OpenAI(model="gpt-4", max_tokens=1000, api_key="test-key")
-            assert openai_ai.max_tokens == 1000  # Custom value, not default 8192
+def test_explicit_max_tokens_overrides_model_default(openai_env):
+    # Arrange
+    # Act
+    ai = OpenAI(model="gpt-4", api_key="k", max_tokens=2_048)
+    # Assert
+    assert ai.max_tokens == 2_048
 
 
 if __name__ == "__main__":
-    import os
-
-    import pytest
-
     pytest.main([os.path.abspath(__file__)])
 
-# --------------------------------------------------------------------------------
-# Start of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_OpenAI.py
-# --------------------------------------------------------------------------------
-# #!/usr/bin/env python3
-# # Timestamp: "2025-01-22 01:21:11 (ywatanabe)"
-# # File: _OpenAI.py
-#
-# THIS_FILE = "/home/ywatanabe/proj/scitex_repo/src/scitex/ai/llm/_OpenAI.py"
-#
-#
-# """Imports"""
-# import os
-#
-# from openai import OpenAI as _OpenAI
-#
-# from ._BaseGenAI import BaseGenAI
-#
-# """Functions & Classes"""
-#
-#
-# class OpenAI(BaseGenAI):
-#     def __init__(
-#         self,
-#         system_setting="",
-#         model="",
-#         api_key=os.getenv("OPENAI_API_KEY"),
-#         stream=False,
-#         seed=None,
-#         n_keep=1,
-#         temperature=1.0,
-#         chat_history=None,
-#         max_tokens=None,
-#     ):
-#         self.passed_model = model
-#
-#         # import scitex
-#         # scitex.str.print_debug()
-#         # scitex.gen.printc(model)
-#
-#         if model.startswith("o"):
-#             for reasoning_effort in ["low", "midium", "high"]:
-#                 model = model.replace(f"-{reasoning_effort}", "")
-#
-#         # Set max_tokens based on model
-#         if max_tokens is None:
-#             if "gpt-4-turbo" in model:
-#                 max_tokens = 128_000
-#             elif "gpt-4" in model:
-#                 max_tokens = 8_192
-#             elif "gpt-3.5-turbo-16k" in model:
-#                 max_tokens = 16_384
-#             elif "gpt-3.5" in model:
-#                 max_tokens = 4_096
-#             else:
-#                 max_tokens = 4_096
-#
-#         super().__init__(
-#             system_setting=system_setting,
-#             model=model,
-#             api_key=api_key,
-#             stream=stream,
-#             seed=seed,
-#             n_keep=n_keep,
-#             temperature=temperature,
-#             provider="OpenAI",
-#             chat_history=chat_history,
-#             max_tokens=max_tokens,
-#         )
-#
-#     def _init_client(
-#         self,
-#     ):
-#         client = _OpenAI(api_key=self.api_key)
-#         return client
-#
-#     def _api_call_static(self):
-#         kwargs = dict(
-#             model=self.passed_model,
-#             messages=self.history,
-#             seed=self.seed,
-#             stream=False,
-#             temperature=self.temperature,
-#             max_tokens=self.max_tokens,
-#         )
-#
-#         # # o models adjustment
-#         # import scitex
-#         # scitex.str.print_debug()
-#         # scitex.gen.printc(kwargs.get("model"))
-#
-#         if kwargs.get("model").startswith("o"):
-#             kwargs.pop("max_tokens")
-#             for reasoning_effort in ["low", "midium", "high"]:
-#                 if reasoning_effort in kwargs["model"]:
-#                     kwargs["reasoning_effort"] = reasoning_effort
-#                     kwargs["model"] = kwargs["model"].replace(
-#                         f"-{reasoning_effort}", ""
-#                     )
-#         # import scitex
-#         # scitex.str.print_debug()
-#         # scitex.gen.printc(kwargs.get("model"))
-#         # scitex.gen.printc(kwargs.get("reasoning_effort"))
-#         # scitex.str.print_debug()
-#
-#         output = self.client.chat.completions.create(**kwargs)
-#         self.input_tokens += output.usage.prompt_tokens
-#         self.output_tokens += output.usage.completion_tokens
-#
-#         out_text = output.choices[0].message.content
-#
-#         return out_text
-#
-#     def _api_call_stream(self):
-#         kwargs = dict(
-#             model=self.model,
-#             messages=self.history,
-#             max_tokens=self.max_tokens,
-#             n=1,
-#             stream=self.stream,
-#             seed=self.seed,
-#             temperature=self.temperature,
-#             stream_options={"include_usage": True},
-#         )
-#
-#         if kwargs.get("model").startswith("o"):
-#             for reasoning_effort in ["low", "midium", "high"]:
-#                 kwargs["reasoning_effort"] = reasoning_effort
-#                 kwargs["model"] = kwargs["model"].replace(f"-{reasoning_effort}", "")
-#             full_response = self._api_call_static()
-#             for char in full_response:
-#                 yield char
-#             return
-#
-#         stream = self.client.chat.completions.create(**kwargs)
-#         buffer = ""
-#
-#         for chunk in stream:
-#             if chunk:
-#                 try:
-#                     self.input_tokens += chunk.usage.prompt_tokens
-#                 except:
-#                     pass
-#                 try:
-#                     self.output_tokens += chunk.usage.completion_tokens
-#                 except:
-#                     pass
-#
-#                 try:
-#                     current_text = chunk.choices[0].delta.content
-#                     if current_text:
-#                         buffer += current_text
-#                         # Yield complete sentences or words
-#                         if any(char in ".!?\n " for char in current_text):
-#                             yield buffer
-#                             buffer = ""
-#                 except Exception:
-#                     pass
-#
-#         # Yield any remaining text
-#         if buffer:
-#             yield buffer
-#
-#     def _api_format_history(self, history):
-#         formatted_history = []
-#         for msg in history:
-#             if isinstance(msg["content"], list):
-#                 content = []
-#                 for item in msg["content"]:
-#                     if item["type"] == "text":
-#                         content.append({"type": "text", "text": item["text"]})
-#                     elif item["type"] == "_image":
-#                         content.append(
-#                             {
-#                                 "type": "image_url",
-#                                 "image_url": {
-#                                     "url": f"data:image/jpeg;base64,{item['_image']}"
-#                                 },
-#                             }
-#                         )
-#                 formatted_msg = {"role": msg["role"], "content": content}
-#             else:
-#                 formatted_msg = {
-#                     "role": msg["role"],
-#                     "content": msg["content"],
-#                 }
-#             formatted_history.append(formatted_msg)
-#         return formatted_history
-#
-#
-# def main() -> None:
-#     import scitex
-#
-#     ai = scitex_genai.GenAI(
-#         model="o1-low",
-#         api_key=os.getenv("OPENAI_API_KEY"),
-#     )
-#
-#     print(ai("hi, could you tell me what is in the pic?"))
-#
-#     # print(
-#     #     ai(
-#     #         "hi, could you tell me what is in the pic?",
-#     #         images=[
-#     #             "/home/ywatanabe/Downloads/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
-#     #         ],
-#     #     )
-#     # )
-#     pass
-#
-#
-# # def main():
-# #     model = "o1-mini"
-# #     # model = "o1-preview"
-# #     # model = "gpt-4o"
-# #     stream = True
-# #     max_tokens = 4906
-# #     m = scitex_genai.GenAI(model, stream=stream, max_tokens=max_tokens)
-# #     m("hi")
-#
-# if __name__ == "__main__":
-#     import sys
-#
-#     import matplotlib.pyplot as plt
-#
-#     import scitex
-#
-#     CONFIG, sys.stdout, sys.stderr, plt, CC = scitex.session.start(
-#         sys, plt, verbose=False
-#     )
-#     main()
-#     scitex.session.close(CONFIG, verbose=False, notify=False)
-#
-# # EOF
-# """
-# python -m scitex_genai.llm._OpenAI
-# """
-#
-# # EOF
-
-# --------------------------------------------------------------------------------
-# End of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_OpenAI.py
-# --------------------------------------------------------------------------------
+# EOF

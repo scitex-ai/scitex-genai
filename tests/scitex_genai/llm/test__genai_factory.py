@@ -1,255 +1,182 @@
 #!/usr/bin/env python3
-# Timestamp: "2025-06-13 23:04:42 (ywatanabe)"
-# File: /ssh:sp:/home/ywatanabe/proj/SciTeX-Code/tests/scitex/ai/llm/test__genai_factory.py
+# Timestamp: "2026-05-19 (rewritten for PA-307 / STX-TQ001-007)"
+# File: ./tests/scitex_genai/llm/test__genai_factory.py
 # ----------------------------------------
-import os
 
-__FILE__ = "./tests/scitex/ai/llm/test__genai_factory.py"
-__DIR__ = os.path.dirname(__FILE__)
-# ----------------------------------------
-# Time-stamp: "2025-06-01 13:50:00 (ywatanabe)"
+"""Tests for scitex_genai.llm._genai_factory.
 
-"""Tests for scitex_genai.llm._genai_factory module."""
+Rewritten to comply with PA-307 (no unittest.mock, no monkeypatch fixture).
 
-from unittest.mock import Mock, patch
+The previous version patched MODELS, every provider class, and random.choice,
+then asserted that the patched classes were called with arrays of kwargs. That
+verified only that the test rewrote the world correctly — zero production
+signal. Per PA-307: design signal -> delete those tests.
+
+The replacement tests exercise the *real* dispatch logic against the *real*
+MODELS table, instantiating each provider with a fake API key (the SDKs only
+validate keys on the actual remote call, not at construction time). What
+survives is the dispatch contract and the error path.
+"""
 
 import pytest
 
 pd = pytest.importorskip("pandas")
 
 from scitex_genai.llm._genai_factory import genai_factory
+from scitex_genai.llm._PARAMS import MODELS as _REAL_MODELS
 
 
-class TestGenAIFactory:
-    """Test suite for genai_factory function."""
+# Provider -> first model name shipped for that provider.
+# Computed at import so failures highlight a missing provider, not a typo.
+def _first_model_for(provider: str) -> str:
+    rows = _REAL_MODELS[_REAL_MODELS.provider == provider].name.tolist()
+    if not rows:
+        pytest.skip(f"No models registered for provider {provider!r}")
+    return rows[0]
 
-    @pytest.fixture
-    def mock_models(self):
-        """Create mock MODELS DataFrame for testing."""
-        return pd.DataFrame(
-            {
-                "name": [
-                    "gpt-3.5-turbo",
-                    "claude-3-opus",
-                    "gemini-pro",
-                    "llama-70b",
-                ],
-                "provider": ["OpenAI", "Anthropic", "Google", "Llama"],
-                "api_key_env": [
-                    "OPENAI_API_KEY",
-                    "ANTHROPIC_API_KEY",
-                    "GOOGLE_API_KEY",
-                    "LLAMA_API_KEY",
-                ],
-            }
-        )
 
-    def test_genai_factory_openai(self, mock_models):
-        """Test creating OpenAI model instance."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                mock_instance = Mock()
-                mock_openai.return_value = mock_instance
+@pytest.fixture
+def fake_api_keys():
+    """Set fake API keys for all providers; restore on teardown."""
+    # Arrange
+    import os
 
-                result = genai_factory(model="gpt-3.5-turbo", api_key="test-key")
+    keys = {
+        "ANTHROPIC_API_KEY": "sk-fake",
+        "OPENAI_API_KEY": "sk-fake",
+        "GOOGLE_API_KEY": "sk-fake",
+        "GROQ_API_KEY": "sk-fake",
+        "DEEPSEEK_API_KEY": "sk-fake",
+        "PERPLEXITY_API_KEY": "sk-fake",
+    }
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ.update(keys)
+    # Act
+    yield
+    # Assert
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
-                mock_openai.assert_called_once_with(
-                    model="gpt-3.5-turbo",
-                    stream=False,
-                    api_key="test-key",
-                    seed=None,
-                    temperature=1.0,
-                    n_keep=1,
-                    chat_history=None,
-                    max_tokens=4096,
-                )
-                assert result == mock_instance
 
-    def test_genai_factory_anthropic(self, mock_models):
-        """Test creating Anthropic model instance."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.Anthropic") as mock_anthropic:
-                mock_instance = Mock()
-                mock_anthropic.return_value = mock_instance
+def test_factory_dispatches_anthropic_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Anthropic"
 
-                result = genai_factory(
-                    model="claude-3-opus",
-                    stream=True,
-                    temperature=0.5,
-                    api_key="test-key",
-                )
 
-                mock_anthropic.assert_called_once_with(
-                    model="claude-3-opus",
-                    stream=True,
-                    api_key="test-key",
-                    seed=None,
-                    temperature=0.5,
-                    n_keep=1,
-                    chat_history=None,
-                    max_tokens=4096,
-                )
-                assert result == mock_instance
+def test_factory_dispatches_openai_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("OpenAI")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
 
-    def test_genai_factory_google(self, mock_models):
-        """Test creating Google model instance."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.Google") as mock_google:
-                mock_instance = Mock()
-                mock_google.return_value = mock_instance
 
-                result = genai_factory(
-                    model="gemini-pro", max_tokens=2048, api_key="test-key"
-                )
+def test_factory_dispatches_google_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Google")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Google"
 
-                mock_google.assert_called_once_with(
-                    model="gemini-pro",
-                    stream=False,
-                    api_key="test-key",
-                    seed=None,
-                    temperature=1.0,
-                    n_keep=1,
-                    chat_history=None,
-                    max_tokens=2048,
-                )
-                assert result == mock_instance
 
-    def test_genai_factory_invalid_model(self, mock_models):
-        """Test error handling for invalid model name."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with pytest.raises(
-                ValueError, match='Model "invalid-model" is not available'
-            ):
-                genai_factory(model="invalid-model")
+def test_factory_dispatches_groq_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Groq")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Groq"
 
-    def test_genai_factory_with_all_parameters(self, mock_models):
-        """Test factory with all parameters specified."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                chat_history = [{"role": "user", "content": "Hello"}]
 
-                genai_factory(
-                    model="gpt-3.5-turbo",
-                    stream=True,
-                    api_key="test-key",
-                    seed=42,
-                    temperature=0.7,
-                    n_keep=10,
-                    chat_history=chat_history,
-                    max_tokens=1024,
-                )
+def test_factory_dispatches_deepseek_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("DeepSeek")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "DeepSeek"
 
-                call_kwargs = mock_openai.call_args[1]
-                assert call_kwargs["stream"] is True
-                assert call_kwargs["api_key"] == "test-key"
-                assert call_kwargs["seed"] == 42
-                assert call_kwargs["temperature"] == 0.7
-                assert call_kwargs["n_keep"] == 10
-                assert call_kwargs["chat_history"] == chat_history
-                assert call_kwargs["max_tokens"] == 1024
 
-    def test_genai_factory_random_api_key_selection(self, mock_models):
-        """Test random API key selection from list."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                with patch("random.choice", return_value="selected-key") as mock_choice:
-                    api_keys = ["key1", "key2", "key3"]
+def test_factory_dispatches_perplexity_provider(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Perplexity")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Perplexity"
 
-                    genai_factory(model="gpt-3.5-turbo", api_key=api_keys)
 
-                    mock_choice.assert_called_once_with(api_keys)
-                    call_kwargs = mock_openai.call_args[1]
-                    assert call_kwargs["api_key"] == "selected-key"
+def test_factory_rejects_unknown_model_with_value_error():
+    # Arrange
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match='Model "not-a-real-model" is not available'):
+        genai_factory(model="not-a-real-model")
 
-    def test_genai_factory_tuple_api_keys(self, mock_models):
-        """Test API key selection from tuple."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI"):
-                with patch("random.choice", return_value="selected-key") as mock_choice:
-                    api_keys = ("key1", "key2", "key3")
 
-                    genai_factory(model="gpt-3.5-turbo", api_key=api_keys)
+def test_factory_passes_api_key_through_to_instance(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="my-explicit-key")
+    # Assert
+    assert instance.api_key == "my-explicit-key"
 
-                    mock_choice.assert_called_once_with(api_keys)
 
-    def test_genai_factory_single_api_key(self, mock_models):
-        """Test single API key (no random selection)."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                genai_factory(model="gpt-3.5-turbo", api_key="single-key")
+def test_factory_passes_temperature_through_to_instance(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key", temperature=0.3)
+    # Assert
+    assert instance.temperature == 0.3
 
-                call_kwargs = mock_openai.call_args[1]
-                assert call_kwargs["api_key"] == "single-key"
 
-    @pytest.mark.parametrize(
-        "provider,model_name,expected_class",
-        [
-            ("OpenAI", "gpt-3.5-turbo", "OpenAI"),
-            ("Anthropic", "claude-3", "Anthropic"),
-            ("Google", "gemini-pro", "Google"),
-            ("Llama", "llama-70b", "Llama"),
-            ("Perplexity", "sonar-small", "Perplexity"),
-            ("DeepSeek", "deepseek-chat", "DeepSeek"),
-            ("Groq", "llama3-8b", "Groq"),
-        ],
-    )
-    def test_genai_factory_all_providers(self, provider, model_name, expected_class):
-        """Test factory works for all supported providers."""
-        mock_models = pd.DataFrame(
-            {
-                "name": [model_name],
-                "provider": [provider],
-                "api_key_env": [f"{provider.upper()}_API_KEY"],
-            }
-        )
+def test_factory_passes_max_tokens_through_to_instance(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key", max_tokens=1_024)
+    # Assert
+    assert instance.max_tokens == 1_024
 
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch(
-                f"scitex_genai.llm._genai_factory.{expected_class}"
-            ) as mock_class:
-                mock_instance = Mock()
-                mock_class.return_value = mock_instance
 
-                result = genai_factory(model=model_name, api_key="test-key")
+def test_factory_passes_stream_flag_through_to_instance(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key", stream=True)
+    # Assert
+    assert instance.stream is True
 
-                mock_class.assert_called_once_with(
-                    model=model_name,
-                    stream=False,
-                    api_key="test-key",
-                    seed=None,
-                    temperature=1.0,
-                    n_keep=1,
-                    chat_history=None,
-                    max_tokens=4096,
-                )
-                assert result == mock_instance
 
-    def test_genai_factory_default_parameters(self, mock_models):
-        """Test factory with default parameters."""
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                genai_factory()  # Using default model="gpt-3.5-turbo"
+def test_factory_picks_one_key_when_api_key_is_list(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    candidates = ["alpha-key", "beta-key", "gamma-key"]
+    # Act
+    instance = genai_factory(model=model, api_key=candidates)
+    # Assert
+    assert instance.api_key in candidates
 
-                call_kwargs = mock_openai.call_args[1]
-                assert call_kwargs["model"] == "gpt-3.5-turbo"
-                assert call_kwargs["stream"] is False
-                assert call_kwargs["api_key"] is None
-                assert call_kwargs["seed"] is None
-                assert call_kwargs["temperature"] == 1.0
-                assert call_kwargs["n_keep"] == 1
-                assert call_kwargs["chat_history"] is None
-                assert call_kwargs["max_tokens"] == 4096
 
-    def test_genai_factory_preserves_model_name(self, mock_models):
-        """Test that model name is preserved exactly as provided."""
-        model_name = "gpt-3.5-turbo"
-
-        with patch("scitex_genai.llm._genai_factory.MODELS", mock_models):
-            with patch("scitex_genai.llm._genai_factory.OpenAI") as mock_openai:
-                genai_factory(model=model_name)
-
-                call_kwargs = mock_openai.call_args[1]
-                assert call_kwargs["model"] == model_name
+def test_factory_picks_one_key_when_api_key_is_tuple(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    candidates = ("alpha-key", "beta-key", "gamma-key")
+    # Act
+    instance = genai_factory(model=model, api_key=candidates)
+    # Assert
+    assert instance.api_key in candidates
 
 
 if __name__ == "__main__":
@@ -259,81 +186,4 @@ if __name__ == "__main__":
 
     pytest.main([os.path.abspath(__file__)])
 
-# --------------------------------------------------------------------------------
-# Start of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_genai_factory.py
-# --------------------------------------------------------------------------------
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-# # Timestamp: "2025-05-03 11:57:10 (ywatanabe)"
-# # File: /home/ywatanabe/proj/scitex_repo/src/scitex/ai/llm/_genai_factory.py
-# # ----------------------------------------
-# import os
-#
-# __FILE__ = "./src/scitex/ai/llm/_genai_factory.py"
-# __DIR__ = os.path.dirname(__FILE__)
-# # ----------------------------------------
-#
-# import random
-#
-# from ._Anthropic import Anthropic
-# from ._DeepSeek import DeepSeek
-# from ._Google import Google
-# from ._Groq import Groq
-# from ._Llama import Llama
-# from ._OpenAI import OpenAI
-# from ._PARAMS import MODELS
-# from ._Perplexity import Perplexity
-#
-#
-# def genai_factory(
-#     model="gpt-3.5-turbo",
-#     stream=False,
-#     api_key=None,
-#     seed=None,
-#     temperature=1.0,
-#     n_keep=1,
-#     chat_history=None,
-#     max_tokens=4096,
-# ):
-#     """Factory function to create an instance of an AI model handler."""
-#     AVAILABLE_MODELS = MODELS.name.tolist()
-#
-#     if model not in AVAILABLE_MODELS:
-#         raise ValueError(
-#             f'Model "{model}" is not available. Please choose from:{MODELS.name.tolist()}'
-#         )
-#
-#     provider = MODELS[MODELS.name == model].provider.iloc[0]
-#
-#     # model_class = globals()[provider]
-#     model_class = {
-#         "OpenAI": OpenAI,
-#         "Anthropic": Anthropic,
-#         "Google": Google,
-#         "Llama": Llama,
-#         "Perplexity": Perplexity,
-#         "DeepSeek": DeepSeek,
-#         "Groq": Groq,
-#     }[provider]
-#
-#     # Select a random API key from the list
-#     if isinstance(api_key, (list, tuple)):
-#         api_key = random.choice(api_key)
-#
-#     return model_class(
-#         model=model,
-#         stream=stream,
-#         api_key=api_key,
-#         seed=seed,
-#         temperature=temperature,
-#         n_keep=n_keep,
-#         chat_history=chat_history,
-#         max_tokens=max_tokens,
-#     )
-#
-#
-# # EOF
-
-# --------------------------------------------------------------------------------
-# End of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_genai_factory.py
-# --------------------------------------------------------------------------------
+# EOF

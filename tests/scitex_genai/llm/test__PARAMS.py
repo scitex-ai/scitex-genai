@@ -12,6 +12,10 @@ be lazy-imported inside the function bodies — not at module top.
 import importlib
 
 
-def test_module_imports():
-    """Smoke: target module imports without error."""
-    importlib.import_module('scitex_genai.llm._PARAMS')
+def test_params_module_exposes_models_dataframe():
+    """Smoke: target module imports and exposes a populated MODELS table."""
+    # Arrange
+    # Act
+    mod = importlib.import_module("scitex_genai.llm._PARAMS")
+    # Assert
+    assert len(mod.MODELS) > 0
