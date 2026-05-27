@@ -19,9 +19,9 @@
   <a href="https://scitex-genai.readthedocs.io/en/latest/"><img src="https://img.shields.io/readthedocs/scitex-genai?label=docs" alt="docs"></a>
 </p>
 <p align="center">
-  <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/ywatanabe1989/scitex-genai/test.yml?branch=develop&label=tests" alt="tests"></a>
+  <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/pytest-matrix-on-ubuntu-py3-11-3-12-3-13.yml"><img src="https://img.shields.io/github/actions/workflow/status/ywatanabe1989/scitex-genai/pytest-matrix-on-ubuntu-py3-11-3-12-3-13.yml?branch=develop&label=tests" alt="tests"></a>
   <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/import-smoke-on-ubuntu-py3-12.yml"><img src="https://img.shields.io/github/actions/workflow/status/ywatanabe1989/scitex-genai/import-smoke-on-ubuntu-py3-12.yml?branch=develop&label=install-check" alt="install-check"></a>
-  <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/scitex-dev-quality-audit-on-ubuntu-latest.yml"><img src="https://img.shields.io/github/actions/workflow/status/ywatanabe1989/scitex-genai/scitex-dev-quality-audit-on-ubuntu-latest.yml?branch=develop&label=quality" alt="quality"></a>
+  <a href="https://github.com/ywatanabe1989/scitex-genai/actions/workflows/scitex-genai-quality-audit-on-ubuntu-latest.yml"><img src="https://img.shields.io/github/actions/workflow/status/ywatanabe1989/scitex-genai/scitex-genai-quality-audit-on-ubuntu-latest.yml?branch=develop&label=quality" alt="quality"></a>
   <a href="https://codecov.io/gh/ywatanabe1989/scitex-genai"><img src="https://img.shields.io/codecov/c/github/ywatanabe1989/scitex-genai/develop?label=cov" alt="cov"></a>
 </p>
 <!-- scitex-badges:end -->
