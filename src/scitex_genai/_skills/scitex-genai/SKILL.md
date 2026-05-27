@@ -10,7 +10,7 @@ description: |
   [WHEN] Calling LLMs from research code; switching providers without per-provider
   glue; budget-tracking grant-funded experiments; building agents that need
   consistent client semantics across vendors.
-  [HOW] `pip install scitex-genai[openai]` (or your provider extra). Read
+  [HOW] `pip install scitex-genai` (provider SDKs included in core). Read
   `01_installation.md` for the per-provider env-var matrix, `02_quick-start.md`
   for one-call examples, `03_python-api.md` for the `GenAI` class signature, and
   `10_llm.md` for the full provider-routing table.
@@ -68,10 +68,6 @@ scitex.genai.GenAI  # same object as scitex_genai.GenAI
 
 | Extra        | Purpose                                                    |
 | ------------ | ---------------------------------------------------------- |
-| `[openai]`   | `openai` SDK                                               |
-| `[anthropic]`| `anthropic` SDK                                            |
-| `[google]`   | `google-genai` SDK (Gemini)                                |
-| `[groq]`     | `groq` SDK                                                 |
 | `[agent]`    | `claude-agent-sdk` for the (forthcoming) `agent` submodule |
 | `[litellm]`  | `litellm` router (future `llm/` backend)                   |
 | `[ollama]`   | Local `ollama` provider                                    |

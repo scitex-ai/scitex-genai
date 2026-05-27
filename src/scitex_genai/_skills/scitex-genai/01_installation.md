@@ -1,7 +1,7 @@
 ---
 description: |
   [TOPIC] Installation
-  [DETAILS] `pip install scitex-genai`. Modality-organised generative-AI provider abstraction. Core install is provider-agnostic; install the matching provider extra (`openai`, `anthropic`, `google`, `groq`) for each LLM you call. Or install `scitex-genai[all]` for every provider.
+  [DETAILS] `pip install scitex-genai`. Modality-organised generative-AI provider abstraction. Provider SDKs (OpenAI, Anthropic, Google, Groq) are included in the core install. Or install `scitex-genai[all]` for everything.
 tags: [scitex-genai-installation]
 ---
 
@@ -13,23 +13,18 @@ tags: [scitex-genai-installation]
 pip install scitex-genai
 ```
 
-Pulls `scitex-config>=0.3.0` (for env-var resolution) and core glue.
-The provider SDKs are **opt-in extras** — installing each only when you
-need it keeps cold-start light.
+Pulls `scitex-dev>=0.11.7` (for env-var resolution, audit, and path
+management) and the major provider SDKs (`openai`, `anthropic`,
+`google-genai`, `groq`) as core dependencies.
 
-## Provider extras
+## Optional extras
 
 ```bash
-pip install scitex-genai[openai]      # openai SDK
-pip install scitex-genai[anthropic]   # anthropic SDK
-pip install scitex-genai[google]      # google-genai SDK (Gemini)
-pip install scitex-genai[groq]        # groq SDK
-pip install scitex-genai[all]         # every provider above
+pip install scitex-genai[agent]     # + claude-agent-sdk (forthcoming `agent` submodule)
+pip install scitex-genai[litellm]   # + litellm router (preview)
+pip install scitex-genai[ollama]    # + local ollama
+pip install scitex-genai[all]       # agent + litellm + ollama
 ```
-
-Reserved-but-not-implemented modalities (`agent`, `image`, `audio`,
-`video`, `embed`, `multimodal`) have no extras yet — installing them
-errors with `NotImplementedError` on attribute access.
 
 ## API keys
 
@@ -54,7 +49,7 @@ errors when you actually invoke that provider.
 python -c "import scitex_genai; print(scitex_genai.__version__)"
 ```
 
-Should print `0.1.0` or later.
+Should print `0.1.1` or later.
 
 ## Umbrella shim
 
