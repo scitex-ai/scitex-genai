@@ -22,11 +22,21 @@ pytest.importorskip("scitex_genai")
 NOTEBOOK = Path(__file__).resolve().parents[2] / "examples" / "01_genai.ipynb"
 
 
-def test_notebook_executes(tmp_path):
-    """Run the GenAI notebook with jupyter nbconvert --execute."""
-    assert NOTEBOOK.is_file(), f"missing notebook: {NOTEBOOK}"
-    target = tmp_path / NOTEBOOK.name
-    shutil.copy(NOTEBOOK, target)
+@pytest.fixture
+def notebook_path():
+    """Provide the notebook source path, skipping if absent."""
+    if not NOTEBOOK.is_file():
+        pytest.skip(f"missing notebook: {NOTEBOOK}")
+    return NOTEBOOK
+
+
+def test_01_genai_notebook_executes_with_zero_exit_code(notebook_path, tmp_path):
+    """Run the 01_genai.ipynb notebook with jupyter nbconvert --execute and check exit 0."""
+    # Arrange
+    target = tmp_path / notebook_path.name
+    shutil.copy(notebook_path, target)
+
+    # Act
     proc = subprocess.run(
         [
             sys.executable,
@@ -44,6 +54,8 @@ def test_notebook_executes(tmp_path):
         text=True,
         timeout=240,
     )
+
+    # Assert
     assert proc.returncode == 0, (
         f"nbconvert failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     )

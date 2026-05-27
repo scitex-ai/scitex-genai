@@ -17,14 +17,19 @@ Prerequisites:
     - pandas package
 """
 
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import pandas as pd
 
 from ._PARAMS import MODELS
 
 
-def calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+def calc_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    models: Optional[pd.DataFrame] = None,
+) -> float:
     """Calculates API usage cost based on token count.
 
     Example
@@ -41,6 +46,11 @@ def calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         Number of input tokens used
     output_tokens : int
         Number of output tokens used
+    models : pandas.DataFrame, optional
+        Pricing table with columns ``name``, ``input_cost``, ``output_cost``.
+        When omitted, the package-level ``MODELS`` table is used. The
+        parameter exists to support deterministic unit tests without
+        monkeypatching module globals.
 
     Returns
     -------
@@ -52,7 +62,7 @@ def calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     ValueError
         If model is not found in MODELS
     """
-    models_df = pd.DataFrame(MODELS)
+    models_df = pd.DataFrame(MODELS if models is None else models)
     indi = models_df["name"] == model
 
     if not indi.any():

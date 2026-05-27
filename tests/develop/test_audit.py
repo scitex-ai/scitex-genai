@@ -16,7 +16,8 @@ import shutil
 import pytest
 
 
-def test_audit_all_clean():
+@pytest.fixture
+def audit_all_for_package_callable():
     if shutil.which("scitex-dev") is None:
         pytest.skip(
             "scitex-dev not installed — add `scitex-dev[cli-audit]` "
@@ -24,4 +25,20 @@ def test_audit_all_clean():
         )
     from scitex_dev.testing import audit_all_for_package
 
-    audit_all_for_package('scitex-genai')
+    return audit_all_for_package
+
+
+def test_audit_all_for_package_returns_without_raising(
+    audit_all_for_package_callable,
+):
+    # Arrange
+    package_name = "scitex-genai"
+
+    # Act
+    # audit_all_for_package raises pytest.fail on any violation. Reaching the
+    # next line at all means the audit corpus is clean for this package.
+    audit_all_for_package_callable(package_name)
+    completed = True
+
+    # Assert
+    assert completed is True

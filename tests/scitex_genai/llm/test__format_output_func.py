@@ -2,7 +2,14 @@
 # Time-stamp: "2025-06-01 14:15:00 (ywatanabe)"
 # File: ./tests/scitex/ai/llm/test__format_output_func.py
 
-"""Tests for scitex_genai.llm._format_output_func module."""
+"""Tests for scitex_genai.llm._format_output_func module.
+
+Each test exercises one observable behaviour of ``format_output_func``
+with Arrange / Act / Assert markers and a single assertion. The
+function under test is a pure string transformer (markdown2 + a regex
+for URL anchoring), so no test-doubles are needed — we feed real input
+and inspect real output.
+"""
 
 import pytest
 
@@ -12,147 +19,306 @@ from scitex_genai.llm import format_output_func
 class TestFormatOutputFunc:
     """Test suite for format_output_func function."""
 
-    def test_basic_text_unchanged(self):
-        """Test that plain text without URLs is processed (markdown2 adds newline)."""
+    def test_plain_text_without_urls_is_returned_with_trailing_newline(self):
+        """Plain text passes through markdown2 and gains a single trailing newline."""
+        # Arrange
         text = "This is a simple text without any URLs."
+
+        # Act
         result = format_output_func(text)
-        # markdown2 adds a newline character
+
+        # Assert
         assert result == text + "\n"
 
-    def test_http_url_wrapping(self):
-        """Test that HTTP URLs are wrapped in anchor tags."""
+    def test_http_url_is_wrapped_in_anchor_tag(self):
+        """HTTP URLs are wrapped in <a href="..."> anchor tags."""
+        # Arrange
         text = "Visit http://example.com for more info"
-        result = format_output_func(text)
-        assert '<a href="http://example.com">http://example.com</a>' in result
+        expected_anchor = '<a href="http://example.com">http://example.com</a>'
 
-    def test_https_url_wrapping(self):
-        """Test that HTTPS URLs are wrapped in anchor tags."""
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_https_url_is_wrapped_in_anchor_tag(self):
+        """HTTPS URLs are wrapped in <a href="..."> anchor tags."""
+        # Arrange
         text = "Secure site: https://secure.example.com"
-        result = format_output_func(text)
-        assert (
+        expected_anchor = (
             '<a href="https://secure.example.com">https://secure.example.com</a>'
-            in result
         )
 
-    def test_doi_url_conversion(self):
-        """Test that DOI URLs are converted and wrapped."""
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_doi_url_is_converted_to_https_doi_org_anchor(self):
+        """``doi:`` URLs are normalised to https://doi.org/... before wrapping."""
+        # Arrange
         text = "Research paper: doi:10.1234/example"
-        result = format_output_func(text)
-        assert (
-            '<a href="https://doi.org/10.1234/example">https://doi.org/10.1234/example</a>'
-            in result
+        expected_anchor = (
+            '<a href="https://doi.org/10.1234/example">'
+            "https://doi.org/10.1234/example</a>"
         )
 
-    def test_multiple_urls(self):
-        """Test handling of multiple URLs in text."""
-        text = "Visit https://site1.com and http://site2.com"
+        # Act
         result = format_output_func(text)
-        assert '<a href="https://site1.com">https://site1.com</a>' in result
-        assert '<a href="http://site2.com">http://site2.com</a>' in result
 
-    def test_already_wrapped_urls_unchanged(self):
-        """Test that already wrapped URLs get double-wrapped (current behavior)."""
-        text = 'Already wrapped: <a href="https://example.com">https://example.com</a>'
+        # Assert
+        assert expected_anchor in result
+
+    def test_multiple_urls_first_is_wrapped(self):
+        """When two URLs appear, the first https URL is wrapped."""
+        # Arrange
+        text = "Visit https://site1.com and http://site2.com"
+        expected_anchor = '<a href="https://site1.com">https://site1.com</a>'
+
+        # Act
         result = format_output_func(text)
-        # The regex pattern does not prevent double-wrapping; it only checks for the prefix
-        # The URL inside the existing anchor tag still matches and gets wrapped again
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_multiple_urls_second_is_wrapped(self):
+        """When two URLs appear, the second http URL is also wrapped."""
+        # Arrange
+        text = "Visit https://site1.com and http://site2.com"
+        expected_anchor = '<a href="http://site2.com">http://site2.com</a>'
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_already_wrapped_urls_get_double_wrapped(self):
+        """Pre-wrapped URLs are double-wrapped (current regex limitation, documented behaviour)."""
+        # Arrange
+        text = 'Already wrapped: <a href="https://example.com">https://example.com</a>'
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert result.count('<a href="https://example.com">') == 2
 
-    def test_markdown_bold_conversion(self):
-        """Test markdown bold syntax conversion."""
+    def test_markdown_bold_is_converted_to_strong_tag(self):
+        """``**bold**`` becomes ``<strong>bold</strong>``."""
+        # Arrange
         text = "This is **bold** text"
+
+        # Act
         result = format_output_func(text)
+
+        # Assert
         assert "<strong>bold</strong>" in result
 
-    def test_markdown_italic_conversion(self):
-        """Test markdown italic syntax conversion."""
+    def test_markdown_italic_is_converted_to_em_tag(self):
+        """``*italic*`` becomes ``<em>italic</em>``."""
+        # Arrange
         text = "This is *italic* text"
+
+        # Act
         result = format_output_func(text)
+
+        # Assert
         assert "<em>italic</em>" in result
 
-    def test_markdown_code_conversion(self):
-        """Test markdown code syntax conversion."""
+    def test_markdown_inline_code_is_converted_to_code_tag(self):
+        r"""``\`code\``` becomes ``<code>code</code>``."""
+        # Arrange
         text = "Use `code` for inline code"
+
+        # Act
         result = format_output_func(text)
+
+        # Assert
         assert "<code>code</code>" in result
 
-    def test_paragraph_tag_removal(self):
-        """Test that wrapping paragraph tags are removed."""
+    def test_wrapping_paragraph_open_tag_is_stripped(self):
+        """Simple paragraphs do not start with ``<p>``."""
+        # Arrange
         text = "Simple paragraph"
+
+        # Act
         result = format_output_func(text)
-        # The regex should remove wrapping <p> tags
+
+        # Assert
         assert not result.startswith("<p>")
+
+    def test_wrapping_paragraph_close_tag_is_stripped(self):
+        """Simple paragraphs do not end with ``</p>``."""
+        # Arrange
+        text = "Simple paragraph"
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert not result.endswith("</p>")
 
-    def test_url_with_query_parameters(self):
-        """Test URLs with query parameters are handled correctly."""
+    def test_url_with_query_parameters_is_wrapped_with_amp_entity(self):
+        """``&`` in URL query string is HTML-escaped to ``&amp;`` in the anchor."""
+        # Arrange
         text = "Search: https://example.com/search?q=test&page=1"
-        result = format_output_func(text)
-        # markdown2 escapes & to &amp; in HTML output
-        assert (
-            '<a href="https://example.com/search?q=test&amp;page=1">https://example.com/search?q=test&amp;page=1</a>'
-            in result
+        expected_anchor = (
+            '<a href="https://example.com/search?q=test&amp;page=1">'
+            "https://example.com/search?q=test&amp;page=1</a>"
         )
 
-    def test_url_with_anchors(self):
-        """Test URLs with anchor fragments are handled correctly."""
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_url_with_anchor_fragment_is_wrapped_intact(self):
+        """URLs with ``#section`` fragments are wrapped without losing the fragment."""
+        # Arrange
         text = "Section link: https://example.com/page#section"
-        result = format_output_func(text)
-        assert (
-            '<a href="https://example.com/page#section">https://example.com/page#section</a>'
-            in result
+        expected_anchor = (
+            '<a href="https://example.com/page#section">'
+            "https://example.com/page#section</a>"
         )
 
-    def test_url_at_end_of_sentence(self):
-        """Test URLs at the end of sentences are handled correctly."""
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_url_at_end_of_sentence_includes_trailing_period(self):
+        """The regex stops at whitespace, so a trailing period is captured into the URL."""
+        # Arrange
         text = "Visit https://example.com."
-        result = format_output_func(text)
-        # The regex includes the period in the URL (regex stops at whitespace, not punctuation)
-        assert '<a href="https://example.com.">https://example.com.</a>' in result
+        expected_anchor = '<a href="https://example.com.">https://example.com.</a>'
 
-    def test_url_in_parentheses(self):
-        """Test URLs in parentheses are handled correctly."""
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_url_in_parentheses_captures_trailing_paren(self):
+        """The regex stops at whitespace, so a trailing ``)`` is captured into the URL."""
+        # Arrange
         text = "(see https://example.com)"
-        result = format_output_func(text)
-        # The regex includes the closing parenthesis in the URL (regex stops at whitespace, not parenthesis)
-        assert '(see <a href="https://example.com)">https://example.com)</a>' in result
+        expected_substring = (
+            '(see <a href="https://example.com)">https://example.com)</a>'
+        )
 
-    def test_mixed_content(self):
-        """Test mixed markdown and URLs."""
-        text = "Check **this site**: https://example.com for *more info*"
+        # Act
         result = format_output_func(text)
+
+        # Assert
+        assert expected_substring in result
+
+    def test_mixed_content_emits_strong_tag(self):
+        """Mixed markdown+URL input still produces the ``<strong>`` tag for bold text."""
+        # Arrange
+        text = "Check **this site**: https://example.com for *more info*"
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert "<strong>this site</strong>" in result
-        assert '<a href="https://example.com">https://example.com</a>' in result
+
+    def test_mixed_content_emits_anchor_tag(self):
+        """Mixed markdown+URL input still produces the URL anchor."""
+        # Arrange
+        text = "Check **this site**: https://example.com for *more info*"
+        expected_anchor = '<a href="https://example.com">https://example.com</a>'
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_mixed_content_emits_em_tag(self):
+        """Mixed markdown+URL input still produces the ``<em>`` tag for italic text."""
+        # Arrange
+        text = "Check **this site**: https://example.com for *more info*"
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert "<em>more info</em>" in result
 
-    def test_empty_string(self):
-        """Test empty string input."""
-        result = format_output_func("")
-        # markdown2 adds a newline even for empty strings
+    def test_empty_string_yields_single_newline(self):
+        """markdown2 appends a newline even for empty input."""
+        # Arrange
+        text = ""
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert result == "\n"
 
-    def test_whitespace_only(self):
-        """Test whitespace-only input."""
-        result = format_output_func("   \n\t   ")
+    def test_whitespace_only_input_strips_to_empty_string(self):
+        """Whitespace-only input round-trips to a string whose strip() is empty."""
+        # Arrange
+        text = "   \n\t   "
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
         assert result.strip() == ""
 
-    def test_multiline_text(self):
-        """Test multiline text with URLs."""
-        text = """Line 1 with https://url1.com
-Line 2 with https://url2.com
-Line 3 without URL"""
-        result = format_output_func(text)
-        assert '<a href="https://url1.com">https://url1.com</a>' in result
-        assert '<a href="https://url2.com">https://url2.com</a>' in result
-
-    def test_complex_doi_format(self):
-        """Test complex DOI formats."""
-        text = "Article: doi:10.1038/s41586-020-2649-2"
-        result = format_output_func(text)
-        assert (
-            '<a href="https://doi.org/10.1038/s41586-020-2649-2">https://doi.org/10.1038/s41586-020-2649-2</a>'
-            in result
+    def test_multiline_text_wraps_first_url(self):
+        """In multiline input, the first per-line URL is anchored."""
+        # Arrange
+        text = (
+            "Line 1 with https://url1.com\n"
+            "Line 2 with https://url2.com\n"
+            "Line 3 without URL"
         )
+        expected_anchor = '<a href="https://url1.com">https://url1.com</a>'
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_multiline_text_wraps_second_url(self):
+        """In multiline input, the second per-line URL is also anchored."""
+        # Arrange
+        text = (
+            "Line 1 with https://url1.com\n"
+            "Line 2 with https://url2.com\n"
+            "Line 3 without URL"
+        )
+        expected_anchor = '<a href="https://url2.com">https://url2.com</a>'
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
+
+    def test_complex_doi_format_with_hyphens_and_digits_is_normalised(self):
+        """A real-world DOI (with hyphens and digits) is rewritten as https://doi.org/..."""
+        # Arrange
+        text = "Article: doi:10.1038/s41586-020-2649-2"
+        expected_anchor = (
+            '<a href="https://doi.org/10.1038/s41586-020-2649-2">'
+            "https://doi.org/10.1038/s41586-020-2649-2</a>"
+        )
+
+        # Act
+        result = format_output_func(text)
+
+        # Assert
+        assert expected_anchor in result
 
     @pytest.mark.parametrize(
         "url,expected_wrapped",
@@ -171,18 +337,29 @@ Line 3 without URL"""
             ),
         ],
     )
-    def test_various_url_formats(self, url, expected_wrapped):
-        """Test various URL formats are wrapped correctly."""
+    def test_various_url_formats_are_wrapped_in_anchor_tags(
+        self, url, expected_wrapped
+    ):
+        """http, https and doi URLs all produce the expected anchor tag."""
+        # Arrange
         text = f"Check out {url}"
+
+        # Act
         result = format_output_func(text)
+
+        # Assert
         assert expected_wrapped in result
 
-    def test_special_characters_in_text(self):
-        """Test text with special characters."""
+    def test_special_characters_in_text_return_nonempty_output(self):
+        """Text containing HTML special characters does not crash and returns a non-empty string."""
+        # Arrange
         text = "Special chars: < > & ' \""
+
+        # Act
         result = format_output_func(text)
-        # Markdown2 should handle HTML escaping
-        assert result  # Just ensure it doesn't crash
+
+        # Assert
+        assert isinstance(result, str) and len(result) > 0
 
 
 if __name__ == "__main__":
@@ -191,196 +368,3 @@ if __name__ == "__main__":
     import pytest
 
     pytest.main([os.path.abspath(__file__)])
-
-# --------------------------------------------------------------------------------
-# Start of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_format_output_func.py
-# --------------------------------------------------------------------------------
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-# # Time-stamp: "2024-11-04 01:39:25 (ywatanabe)"
-# # File: ./scitex_repo/src/scitex/ai/llm/_format_output_func.py
-#
-# """
-# Functionality:
-#     - Formats AI model output text
-#     - Wraps URLs in HTML anchor tags
-#     - Converts markdown to HTML
-#     - Handles DOI links specially
-# Input:
-#     - Raw text output from AI models
-#     - Optional API key for masking
-# Output:
-#     - Formatted HTML text with proper link handling
-# Prerequisites:
-#     - markdown2 package
-#     - Regular expressions support
-# """
-#
-# """Imports"""
-# import re
-# import sys
-# from typing import List, Optional
-#
-# import markdown2
-# import matplotlib.pyplot as plt
-# import scitex
-#
-# """Functions & Classes"""
-#
-#
-# def format_output_func(out_text: str) -> str:
-#     """Formats AI output text with proper link handling and markdown conversion.
-#
-#     Example
-#     -------
-#     >>> text = "Check https://example.com or doi:10.1234/abc"
-#     >>> print(format_output_func(text))
-#     Check <a href="https://example.com">https://example.com</a> or <a href="https://doi.org/10.1234/abc">https://doi.org/10.1234/abc</a>
-#
-#     Parameters
-#     ----------
-#     out_text : str
-#         Raw text output from AI model
-#
-#     Returns
-#     -------
-#     str
-#         HTML formatted text with proper link handling
-#     """
-#
-#     def find_unwrapped_urls(text: str) -> List[str]:
-#         url_pattern = r'(?<!<a href=")(https?://|doi:|http://doi.org/)[^\s,<>"]+'
-#         return re.findall(url_pattern, text)
-#
-#     def add_a_href_tag(text: str) -> str:
-#         def replace_url(match) -> str:
-#             url = match.group(0)
-#             if url.startswith("doi:"):
-#                 url = "https://doi.org/" + url[4:]
-#             return f'<a href="{url}">{url}</a>'
-#
-#         url_pattern = r'(?<!<a href=")(https?://|doi:|http://doi.org/)[^\s,<>"]+'
-#         return re.sub(url_pattern, replace_url, text)
-#
-#     def add_masked_api_key(text: str, api_key: str) -> str:
-#         masked_key = f"{api_key[:4]}****{api_key[-4:]}"
-#         return text + f"\n(API Key: {masked_key}"
-#
-#     formatted_text = markdown2.markdown(out_text)
-#     formatted_text = add_a_href_tag(formatted_text)
-#     formatted_text = re.sub(r"^<p>(.*)</p>$", r"\1", formatted_text, flags=re.DOTALL)
-#     return formatted_text
-#
-#
-# def main() -> None:
-#     pass
-#
-#
-# if __name__ == "__main__":
-#     CONFIG, sys.stdout, sys.stderr, plt, CC = scitex.session.start(
-#         sys, plt, verbose=False
-#     )
-#     main()
-#     scitex.session.close(CONFIG, verbose=False, notify=False)
-#
-# # EOF
-# # #!/usr/bin/env python3
-# # # -*- coding: utf-8 -*-
-# # # Time-stamp: "2024-11-04 01:32:10 (ywatanabe)"
-# # # File: ./scitex_repo/src/scitex/ai/llm/_format_output_func.py
-#
-# # """This script does XYZ."""
-#
-#
-# # """Imports"""
-# # import re
-# # import sys
-#
-# # import markdown2
-# # import matplotlib.pyplot as plt
-# # import scitex
-#
-# # """
-# # Warnings
-# # """
-# # # warnings.simplefilter("ignore", UserWarning)
-#
-#
-# # """
-# # Config
-# # """
-# # # CONFIG = scitex.gen.load_configs()
-#
-#
-# # """
-# # Functions & Classes
-# # """
-#
-#
-# # def format_output_func(out_text):
-# #     def find_unwrapped_urls(text):
-# #         # Regex to find URLs that are not already within <a href> tags
-# #         url_pattern = (
-# #             r'(?<!<a href=")(https?://|doi:|http://doi.org/)[^\s,<>"]+'
-# #         )
-#
-# #         # Find all matches that are not already wrapped
-# #         unwrapped_urls = re.findall(url_pattern, text)
-#
-# #         return unwrapped_urls
-#
-# #     def add_a_href_tag(text):
-# #         # Function to replace each URL with its wrapped version
-# #         def replace_url(match):
-# #             url = match.group(0)
-# #             # Normalize DOI URLs
-# #             if url.startswith("doi:"):
-# #                 url = "https://doi.org/" + url[4:]
-# #             return f'<a href="{url}">{url}</a>'
-#
-# #         # Regex pattern to match URLs not already wrapped in <a> tags
-# #         url_pattern = (
-# #             r'(?<!<a href=")(https?://|doi:|http://doi.org/)[^\s,<>"]+'
-# #         )
-#
-# #         # Replace all occurrences of unwrapped URLs in the text
-# #         updated_text = re.sub(url_pattern, replace_url, text)
-#
-# #         return updated_text
-#
-# #     def add_masked_api_key(text, api_key):
-# #         masked_api_key = f"{api_key[:4]}****{api_key[-4:]}"
-# #         return text + f"\n(API Key: {masked_api_key}"
-#
-# #     out_text = markdown2.markdown(out_text)
-# #     out_text = add_a_href_tag(out_text)
-# #     out_text = re.sub(r"^<p>(.*)</p>$", r"\1", out_text, flags=re.DOTALL)
-# #     return out_text
-#
-#
-# # def main():
-# #     pass
-#
-#
-# # if __name__ == "__main__":
-# #     # # Argument Parser
-# #     # import argparse
-# #     # parser = argparse.ArgumentParser(description='')
-# #     # parser.add_argument('--var', '-v', type=int, default=1, help='')
-# #     # parser.add_argument('--flag', '-f', action='store_true', default=False, help='')
-# #     # args = parser.parse_args()
-#
-# #     # Main
-# #     CONFIG, sys.stdout, sys.stderr, plt, CC = scitex.session.start(
-# #         sys, plt, verbose=False
-# #     )
-# #     main()
-# #     scitex.session.close(CONFIG, verbose=False, notify=False)
-#
-# #
-#
-# # EOF
-
-# --------------------------------------------------------------------------------
-# End of Source Code from: /home/ywatanabe/proj/scitex-code/src/scitex/ai/llm/_format_output_func.py
-# --------------------------------------------------------------------------------

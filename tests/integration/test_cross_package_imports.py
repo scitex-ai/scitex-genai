@@ -10,6 +10,8 @@ in its source tree. Two outcomes:
   (which installs every peer) catches cross-package renames.
 """
 
+import importlib
+
 import pytest
 
 # ===== AUTO-GENERATED: cross-package imports =====
@@ -23,6 +25,13 @@ CROSS_PACKAGE_IMPORTS = [
 
 
 @pytest.mark.parametrize("module_name", CROSS_PACKAGE_IMPORTS)
-def test_cross_package_import(module_name):
-    """Importing scitex-genai's declared cross-package dependency must succeed."""
+def test_cross_package_module_imports_successfully(module_name):
+    """Importing scitex-genai's declared cross-package dependency must produce a real module."""
+    # Arrange
     pytest.importorskip(module_name)
+
+    # Act
+    mod = importlib.import_module(module_name)
+
+    # Assert
+    assert mod.__name__ == module_name
