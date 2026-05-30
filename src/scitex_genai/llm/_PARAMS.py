@@ -537,6 +537,27 @@ GROQ_MODELS = [
     },
 ]
 
+# vLLM — OpenAI-compatible LOCAL server (no remote cost; vLLM ignores
+# the API key). The base URL is selected at runtime via the env var
+# `SCITEX_GENAI_VLLM_BASE_URL` (default `http://127.0.0.1:8765/v1`),
+# resolved in `_VLLM.py`, NOT here — so the model row stays a pure
+# identity / routing record.
+#
+# `api_key_env` is set to a string containing "vllm" so
+# `BaseGenAI._get_available_models()` (which filters by case-insensitive
+# substring match on api_key_env) matches these rows for the provider
+# class. It is NOT a hard requirement that the env var actually exist —
+# `_VLLM.py` substitutes the placeholder "EMPTY" when unset.
+VLLM_MODELS = [
+    {
+        "name": "qwen36-35b-fp8",
+        "input_cost": 0.00,
+        "output_cost": 0.00,
+        "api_key_env": "SCITEX_GENAI_VLLM_API_KEY",
+        "provider": "vLLM",
+    },
+]
+
 MODELS = pd.DataFrame(
     OPENAI_MODELS
     + ANTHROPIC_MODELS
@@ -545,6 +566,7 @@ MODELS = pd.DataFrame(
     + LLAMA_MODELS
     + DEEPSEEK_MODELS
     + GROQ_MODELS
+    + VLLM_MODELS
 )
 
 

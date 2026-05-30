@@ -19,6 +19,7 @@ from ._Llama import Llama
 from ._OpenAI import OpenAI
 from ._PARAMS import MODELS
 from ._Perplexity import Perplexity
+from ._VLLM import VLLM
 
 
 def genai_factory(
@@ -50,6 +51,7 @@ def genai_factory(
         "Perplexity": Perplexity,
         "DeepSeek": DeepSeek,
         "Groq": Groq,
+        "vLLM": VLLM,
     }[provider]
 
     # Select a random API key from the list
