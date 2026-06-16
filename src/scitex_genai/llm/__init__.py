@@ -24,6 +24,7 @@ from ._Llama import Llama
 from ._OpenAI import OpenAI
 from ._PARAMS import MODELS
 from ._Perplexity import Perplexity
+from ._VLLM import VLLM
 
 __all__ = [
     "GenAI"
