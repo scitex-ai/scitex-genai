@@ -135,5 +135,5 @@ ignore = ["E501", "E402"]
 "src/scitex_genai/__init__.py" = ["E402", "F401"]
 "src/scitex_genai/**/__init__.py" = ["F401"]
 
-[tool.scitex-linter]
+[tool.scitex-dev.linter]
 library_dirs = ["src", "tests", "examples"]
