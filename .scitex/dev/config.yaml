@@ -1,0 +1,11 @@
+# scitex-dev project-type config
+# Drives which rule families the auditor applies.
+# See: scitex-dev ecosystem audit-project --help
+
+project-type:
+  - pip
+
+audit:
+  root-whitelist:
+    files:
+      - codecov.yml

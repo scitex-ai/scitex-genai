@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scitex-genai"
-version = "0.1.0"
+version = "0.1.1"
 description = "SciTeX GenAI — modality-organised generative-AI provider abstraction (LLM, agents, image/audio/video stubs)"
 readme = "README.md"
 license = "AGPL-3.0-only"
 requires-python = ">=3.10"
 authors = [
-    { name = "Yusuke Watanabe", email = "ywatanabe@scitex.ai" },
+    { name = "Yusuke Watanabe", email = "noreply@scitex.ai" },
 ]
 keywords = [
     "genai",
@@ -42,13 +42,14 @@ dependencies = [
     "anthropic",
     "google-genai",
     "groq",
+    "markdown2",
     "matplotlib",
     "Pillow",
     "tqdm",
-    # SciTeX standalone deps
-    "scitex-logging>=0.1.3",
+    # SciTeX standalone deps (only those actually imported by src/)
+    "scitex-dev>=0.11.7",
+    "scitex-io>=0.2.0",
     "scitex-str>=0.1.0",
-    "scitex-types>=0.1.3",
 ]
 
 [project.optional-dependencies]
@@ -73,7 +74,16 @@ dev = [
     "pytest-xdist>=3.0.0",
     "pytest-timeout",
     "ruff",
-    "scitex-dev",
+    "scitex-dev>=0.11.7",
+    # Notebook execution for tests/examples/test_01_*.py (PS505).
+    "nbconvert",
+    "nbformat",
+    "ipykernel",
+    # Used directly by test suite (tests/scitex_genai/llm/test__Google.py).
+    "numpy",
+    # Used directly by tests/scitex_genai/llm/test__calc_cost.py and
+    # tests/scitex_genai/llm/test__genai_factory.py.
+    "pandas",
 ]
 docs = [
     "sphinx>=7.0",
@@ -108,6 +118,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
 
+[tool.coverage.run]
+parallel = true
+source = ["scitex_genai"]
+concurrency = ["multiprocessing", "thread"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py310"
@@ -120,5 +135,5 @@ ignore = ["E501", "E402"]
 "src/scitex_genai/__init__.py" = ["E402", "F401"]
 "src/scitex_genai/**/__init__.py" = ["F401"]
 
-[tool.scitex-linter]
+[tool.scitex-dev.linter]
 library_dirs = ["src", "tests", "examples"]

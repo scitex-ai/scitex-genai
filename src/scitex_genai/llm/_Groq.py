@@ -34,7 +34,7 @@ class Groq(BaseGenAI):
     def __init__(
         self,
         system_setting: str = "",
-        api_key: Optional[str] = os.getenv("GROQ_API_KEY"),
+        api_key: Optional[str] = None,
         model: str = "llama3-8b-8192",
         stream: bool = False,
         seed: Optional[int] = None,
@@ -44,6 +44,11 @@ class Groq(BaseGenAI):
         max_tokens: int = 8000,
     ) -> None:
         max_tokens = min(max_tokens, 8000)
+        # Resolve api_key at call time, not at import time — see
+        # _Anthropic / _Google for the same pattern. The default-arg
+        # form `api_key=os.getenv(...)` froze the value at module load,
+        # which broke pytest fixtures that patch the env variable.
+        api_key = api_key or os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable not set")
 
