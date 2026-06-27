@@ -42,6 +42,13 @@ def genai_factory(
     else:
         # Unknown model: only allowed when targeting a self-hosted /
         # OpenAI-compatible endpoint via base_url, or an explicit provider.
+        # Fall back to fleet-injected env for endpoint + key (explicit args
+        # win); engages only on this passthrough path, so known provider
+        # models keep using their own *_API_KEY.
+        if base_url is None:
+            base_url = os.getenv("SCITEX_GENAI_BASE_URL")
+        if api_key is None:
+            api_key = os.getenv("SCITEX_GENAI_API_KEY")
         if not base_url and not provider:
             raise ValueError(
                 f'Model "{model}" is not available. Please choose from:{MODELS.name.tolist()}'

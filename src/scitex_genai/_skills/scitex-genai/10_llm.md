@@ -37,10 +37,23 @@ The provider is inferred from the model name via `scitex_genai.llm._PARAMS.MODEL
 | DeepSeek     | `DEEPSEEK_API_KEY`      | OpenAI-compatible API.                       |
 | Perplexity   | `PERPLEXITY_API_KEY`    | Search-augmented generation.                 |
 | Llama        | (none — local)          | Local / self-hosted Llama servers.           |
+| Self-hosted  | `SCITEX_GENAI_API_KEY`  | OpenAI-compatible endpoint via `SCITEX_GENAI_BASE_URL` (e.g. vLLM behind LiteLLM). |
 
 Provider classes themselves (`Anthropic`, `OpenAI`, …) live in
 `scitex_genai.llm` and inherit from `BaseGenAI`. Use `GenAI(...)` —
 the factory — for all normal application code.
+
+For a self-hosted, OpenAI-compatible model, pass an unknown model name
+plus `base_url` (and `api_key`), or set `SCITEX_GENAI_BASE_URL` +
+`SCITEX_GENAI_API_KEY` and just give the model name:
+
+```python
+GenAI(model="qwen36-35b-a3b", base_url="http://host:4000/v1", api_key="sk-...")
+```
+
+The factory skips the MODELS lookup for unknown names when a `base_url`
+(or explicit `provider`) is given; explicit args win over the env
+fallback, which engages only on this passthrough path.
 
 ## Cost tracking
 

@@ -153,6 +153,54 @@ def test_factory_self_hosted_unknown_model_does_not_raise():
     assert instance.base_url == "http://some-host:4000/v1"
 
 
+@pytest.fixture
+def self_hosted_env():
+    """Set the fleet-injected self-hosted env vars; restore on teardown."""
+    # Arrange
+    import os
+
+    env = {
+        "SCITEX_GENAI_BASE_URL": "http://env-host:4000/v1",
+        "SCITEX_GENAI_API_KEY": "sk-env-local",
+    }
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    # Act
+    yield env
+    # Assert
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def test_factory_self_hosted_reads_base_url_and_key_from_env(self_hosted_env):
+    # Arrange
+    # With SCITEX_GENAI_BASE_URL/API_KEY injected (e.g. fleet-wide), an unknown
+    # model needs no explicit base_url/api_key — the passthrough path reads env.
+    # Act
+    instance = genai_factory(model="qwen36-35b-a3b")
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+    assert instance.base_url == self_hosted_env["SCITEX_GENAI_BASE_URL"]
+    assert instance.api_key == self_hosted_env["SCITEX_GENAI_API_KEY"]
+
+
+def test_factory_explicit_args_override_self_hosted_env(self_hosted_env):
+    # Arrange
+    # Explicit args must win over the injected env fallback.
+    # Act
+    instance = genai_factory(
+        model="qwen36-35b-a3b",
+        base_url="http://explicit-host:4000/v1",
+        api_key="sk-explicit",
+    )
+    # Assert
+    assert instance.base_url == "http://explicit-host:4000/v1"
+    assert instance.api_key == "sk-explicit"
+
+
 def test_factory_unknown_model_without_base_url_or_provider_raises():
     # Arrange
     # Regression guard: an unknown model with neither base_url nor an explicit
