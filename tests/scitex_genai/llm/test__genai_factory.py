@@ -123,6 +123,58 @@ def test_factory_rejects_unknown_model_with_value_error():
         genai_factory(model="not-a-real-model")
 
 
+def test_factory_self_hosted_base_url_constructs_openai_handler():
+    # Arrange
+    # An unknown model name plus a base_url targets a self-hosted,
+    # OpenAI-compatible endpoint (e.g. a vLLM model behind a LiteLLM proxy).
+    base_url = "http://localhost:1/v1"
+    # Act
+    instance = genai_factory(
+        model="some-local-model",
+        base_url=base_url,
+        api_key="sk-x",
+    )
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+    assert instance.base_url == base_url
+    # The openai SDK normalizes base_url; it must still reflect the host we passed.
+    assert str(instance.client.base_url).rstrip("/") == base_url.rstrip("/")
+
+
+def test_factory_self_hosted_unknown_model_does_not_raise():
+    # Arrange
+    # Act
+    instance = genai_factory(
+        model="qwen36-35b-a3b",
+        base_url="http://some-host:4000/v1",
+        api_key="sk-clew-local",
+    )
+    # Assert
+    assert instance.base_url == "http://some-host:4000/v1"
+
+
+def test_factory_unknown_model_without_base_url_or_provider_raises():
+    # Arrange
+    # Regression guard: an unknown model with neither base_url nor an explicit
+    # provider must still raise, exactly as before this feature.
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match='Model "not-a-real-model" is not available'):
+        genai_factory(model="not-a-real-model")
+
+
+def test_factory_known_model_still_resolves_without_base_url(fake_api_keys):
+    # Arrange
+    # Regression guard: a real registered OpenAI model resolves exactly as
+    # before, with no base_url threaded through.
+    model = _first_model_for("OpenAI")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+    assert instance.base_url is None
+
+
 def test_factory_passes_api_key_through_to_instance(fake_api_keys):
     # Arrange
     model = _first_model_for("Anthropic")

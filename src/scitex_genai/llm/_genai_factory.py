@@ -30,16 +30,25 @@ def genai_factory(
     n_keep=1,
     chat_history=None,
     max_tokens=4096,
+    base_url=None,
+    provider=None,
 ):
     """Factory function to create an instance of an AI model handler."""
     AVAILABLE_MODELS = MODELS.name.tolist()
 
-    if model not in AVAILABLE_MODELS:
-        raise ValueError(
-            f'Model "{model}" is not available. Please choose from:{MODELS.name.tolist()}'
-        )
-
-    provider = MODELS[MODELS.name == model].provider.iloc[0]
+    if model in AVAILABLE_MODELS:
+        # Known model: resolve provider from the MODELS table (today's behavior).
+        provider = MODELS[MODELS.name == model].provider.iloc[0]
+    else:
+        # Unknown model: only allowed when targeting a self-hosted /
+        # OpenAI-compatible endpoint via base_url, or an explicit provider.
+        if not base_url and not provider:
+            raise ValueError(
+                f'Model "{model}" is not available. Please choose from:{MODELS.name.tolist()}'
+            )
+        # Default to an OpenAI-compatible passthrough; skip the MODELS lookup.
+        if provider is None:
+            provider = "OpenAI"
 
     # model_class = globals()[provider]
     model_class = {
@@ -56,7 +65,7 @@ def genai_factory(
     if isinstance(api_key, (list, tuple)):
         api_key = random.choice(api_key)
 
-    return model_class(
+    kwargs = dict(
         model=model,
         stream=stream,
         api_key=api_key,
@@ -66,6 +75,13 @@ def genai_factory(
         chat_history=chat_history,
         max_tokens=max_tokens,
     )
+
+    # Only the OpenAI(-compatible) handler accepts base_url; other handler
+    # constructors do not, so add it conditionally.
+    if provider == "OpenAI":
+        kwargs["base_url"] = base_url
+
+    return model_class(**kwargs)
 
 
 # EOF

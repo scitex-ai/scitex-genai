@@ -29,6 +29,7 @@ class OpenAI(BaseGenAI):
         temperature=1.0,
         chat_history=None,
         max_tokens=None,
+        base_url=None,
     ):
         self.passed_model = model
 
@@ -64,12 +65,13 @@ class OpenAI(BaseGenAI):
             provider="OpenAI",
             chat_history=chat_history,
             max_tokens=max_tokens,
+            base_url=base_url,
         )
 
     def _init_client(
         self,
     ):
-        client = _OpenAI(api_key=self.api_key)
+        client = _OpenAI(api_key=self.api_key, base_url=self.base_url)
         return client
 
     def _api_call_static(self):

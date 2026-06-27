@@ -36,11 +36,13 @@ class BaseGenAI(ABC):
         provider: str = "",
         chat_history: Optional[List[Dict[str, str]]] = None,
         max_tokens: int = 4_096,
+        base_url: Optional[str] = None,
     ) -> None:
         self.provider = provider
         self.system_setting = system_setting
         self.model = model
         self.api_key = api_key
+        self.base_url = base_url
         self.stream = stream
         self.seed = seed
         self.n_keep = n_keep
@@ -289,6 +291,10 @@ class BaseGenAI(ABC):
         self.history = self._api_format_history(self.history)
 
     def verify_model(self) -> None:
+        # Self-hosted / OpenAI-compatible endpoints legitimately serve models
+        # that are not in the MODELS table; skip the membership check for them.
+        if getattr(self, "base_url", None):
+            return
         if self.model not in self.available_models:
             message = (
                 f"Specified model {self.model} is not supported for the API Key ({self.masked_api_key}). "
