@@ -123,22 +123,43 @@ def test_factory_rejects_unknown_model_with_value_error():
         genai_factory(model="not-a-real-model")
 
 
-def test_factory_self_hosted_base_url_constructs_openai_handler():
-    # Arrange
-    # An unknown model name plus a base_url targets a self-hosted,
-    # OpenAI-compatible endpoint (e.g. a vLLM model behind a LiteLLM proxy).
-    base_url = "http://localhost:1/v1"
-    # Act
-    instance = genai_factory(
+# An unknown model name plus a base_url targets a self-hosted,
+# OpenAI-compatible endpoint (e.g. a vLLM model behind a LiteLLM proxy).
+_SELF_HOSTED_BASE_URL = "http://localhost:1/v1"
+
+
+def _self_hosted_instance():
+    return genai_factory(
         model="some-local-model",
-        base_url=base_url,
+        base_url=_SELF_HOSTED_BASE_URL,
         api_key="sk-x",
     )
+
+
+def test_factory_self_hosted_base_url_dispatches_openai_handler():
+    # Arrange
+    # Act
+    instance = _self_hosted_instance()
     # Assert
     assert type(instance).__name__ == "OpenAI"
-    assert instance.base_url == base_url
-    # The openai SDK normalizes base_url; it must still reflect the host we passed.
-    assert str(instance.client.base_url).rstrip("/") == base_url.rstrip("/")
+
+
+def test_factory_self_hosted_base_url_sets_instance_base_url():
+    # Arrange
+    # Act
+    instance = _self_hosted_instance()
+    # Assert
+    assert instance.base_url == _SELF_HOSTED_BASE_URL
+
+
+def test_factory_self_hosted_base_url_reaches_client():
+    # Arrange
+    # Act
+    instance = _self_hosted_instance()
+    # Assert: the openai SDK normalizes base_url; it must still reflect the host.
+    assert (
+        str(instance.client.base_url).rstrip("/") == _SELF_HOSTED_BASE_URL.rstrip("/")
+    )
 
 
 def test_factory_self_hosted_unknown_model_does_not_raise():
@@ -175,21 +196,26 @@ def self_hosted_env():
             os.environ[k] = v
 
 
-def test_factory_self_hosted_reads_base_url_and_key_from_env(self_hosted_env):
+# With SCITEX_GENAI_BASE_URL/API_KEY injected (e.g. fleet-wide), an unknown
+# model needs no explicit base_url/api_key — the passthrough path reads env.
+def test_factory_self_hosted_reads_base_url_from_env(self_hosted_env):
     # Arrange
-    # With SCITEX_GENAI_BASE_URL/API_KEY injected (e.g. fleet-wide), an unknown
-    # model needs no explicit base_url/api_key — the passthrough path reads env.
     # Act
     instance = genai_factory(model="qwen36-35b-a3b")
     # Assert
-    assert type(instance).__name__ == "OpenAI"
     assert instance.base_url == self_hosted_env["SCITEX_GENAI_BASE_URL"]
+
+
+def test_factory_self_hosted_reads_api_key_from_env(self_hosted_env):
+    # Arrange
+    # Act
+    instance = genai_factory(model="qwen36-35b-a3b")
+    # Assert
     assert instance.api_key == self_hosted_env["SCITEX_GENAI_API_KEY"]
 
 
-def test_factory_explicit_args_override_self_hosted_env(self_hosted_env):
-    # Arrange
-    # Explicit args must win over the injected env fallback.
+def test_factory_explicit_base_url_overrides_env(self_hosted_env):
+    # Arrange: explicit args must win over the injected env fallback.
     # Act
     instance = genai_factory(
         model="qwen36-35b-a3b",
@@ -198,6 +224,17 @@ def test_factory_explicit_args_override_self_hosted_env(self_hosted_env):
     )
     # Assert
     assert instance.base_url == "http://explicit-host:4000/v1"
+
+
+def test_factory_explicit_api_key_overrides_env(self_hosted_env):
+    # Arrange: explicit args must win over the injected env fallback.
+    # Act
+    instance = genai_factory(
+        model="qwen36-35b-a3b",
+        base_url="http://explicit-host:4000/v1",
+        api_key="sk-explicit",
+    )
+    # Assert
     assert instance.api_key == "sk-explicit"
 
 
@@ -211,15 +248,23 @@ def test_factory_unknown_model_without_base_url_or_provider_raises():
         genai_factory(model="not-a-real-model")
 
 
-def test_factory_known_model_still_resolves_without_base_url(fake_api_keys):
+# Regression guard: a real registered OpenAI model resolves exactly as before,
+# with no base_url threaded through.
+def test_factory_known_model_still_dispatches_openai(fake_api_keys):
     # Arrange
-    # Regression guard: a real registered OpenAI model resolves exactly as
-    # before, with no base_url threaded through.
     model = _first_model_for("OpenAI")
     # Act
     instance = genai_factory(model=model, api_key="fake-key")
     # Assert
     assert type(instance).__name__ == "OpenAI"
+
+
+def test_factory_known_model_has_no_base_url(fake_api_keys):
+    # Arrange
+    model = _first_model_for("OpenAI")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
     assert instance.base_url is None
 
 
