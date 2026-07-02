@@ -46,6 +46,7 @@ on attribute access — import paths are stable as features land.
 - [02_quick-start.md](02_quick-start.md) — three-line LLM call, provider switching, conversation history.
 - [03_python-api.md](03_python-api.md) — `GenAI` class signature, instance state, errors.
 - [10_llm.md](10_llm.md) — full provider table, cost tracking internals, future litellm backend.
+- [20_env-vars.md](20_env-vars.md) — `SCITEX_GENAI_*` env-var surface (vLLM base URL, etc.).
 
 ## Quick Reference
 
