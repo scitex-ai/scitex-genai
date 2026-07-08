@@ -28,3 +28,4 @@ docs/sphinx/_static/
 !.scitex/dev/
 .scitex/dev/*
 !.scitex/dev/config.yaml
+.worktrees/
