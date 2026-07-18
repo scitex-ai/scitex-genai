@@ -35,6 +35,35 @@ def _first_model_for(provider: str) -> str:
     return rows[0]
 
 
+@pytest.fixture(autouse=True)
+def isolate_scitex_genai_env():
+    """Clear fleet-injected SCITEX_GENAI_* vars for every test in this module.
+
+    Agent containers inject SCITEX_GENAI_BASE_URL / SCITEX_GENAI_API_KEY
+    fleet-wide. Without this isolation the factory's env fallback silently
+    supplies a base_url, so the unknown-model guard tests stop exercising the
+    raise path and fail — green in CI (vars unset), red in any injected
+    container. Tests must assert the factory's logic, not the ambient env;
+    fixtures that need these vars set them explicitly on top of this.
+    """
+    import os
+
+    names = (
+        "SCITEX_GENAI_BASE_URL",
+        "SCITEX_GENAI_API_KEY",
+        "SCITEX_GENAI_BACKEND",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
+        os.environ.pop(name, None)
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 @pytest.fixture
 def fake_api_keys():
     """Set fake API keys for all providers; restore on teardown."""
@@ -322,6 +351,39 @@ def test_factory_picks_one_key_when_api_key_is_tuple(fake_api_keys):
     instance = genai_factory(model=model, api_key=candidates)
     # Assert
     assert instance.api_key in candidates
+
+
+# Regression guards for the opt-in litellm backend (see test__LiteLLM.py for
+# the backend itself): with no backend arg and no SCITEX_GENAI_BACKEND env,
+# dispatch must keep using the per-provider classes.
+def test_factory_default_backend_still_dispatches_anthropic(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Anthropic"
+
+
+def test_factory_backend_default_is_explicit_no_op(fake_api_keys):
+    # Arrange
+    model = _first_model_for("OpenAI")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key", backend="default")
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+
+
+def test_factory_default_backend_self_hosted_keeps_openai_handler():
+    # Arrange
+    # Act
+    instance = genai_factory(
+        model="some-local-model",
+        base_url=_SELF_HOSTED_BASE_URL,
+        api_key="sk-x",
+    )
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
 
 
 if __name__ == "__main__":

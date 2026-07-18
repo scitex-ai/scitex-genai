@@ -1,8 +1,9 @@
 ---
 description: |
   [TOPIC] Environment Variables
-  [DETAILS] Per-provider API keys and the self-hosted SCITEX_GENAI_* endpoint
-  vars read by GenAI() at call time.
+  [DETAILS] Per-provider API keys, the self-hosted SCITEX_GENAI_* endpoint
+  vars, and the SCITEX_GENAI_BACKEND dispatch switch read by GenAI() at call
+  time.
 tags: [scitex-genai-env-vars]
 ---
 
@@ -41,6 +42,16 @@ GenAI(model="qwen36-35b-a3b")
 # or explicit (explicit args win over env):
 GenAI(model="qwen36-35b-a3b", base_url="http://host:4000/v1", api_key="sk-...")
 ```
+
+## Dispatch backend
+
+| Variable | Purpose | Default | Type |
+|---|---|---|---|
+| `SCITEX_GENAI_BACKEND` | Dispatch backend for `GenAI()`. `litellm` routes ANY provider through the single litellm-backed handler (experimental, opt-in). | `default` (per-provider classes) | `default` \| `litellm` |
+
+Explicit `GenAI(backend=...)` wins over the env var; `backend="default"`
+forces the classic dispatch even when the env is set. Unknown values raise
+`ValueError` (typos fail loudly).
 
 ## Notes
 
