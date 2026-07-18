@@ -29,7 +29,7 @@ umbrella `scitex-python` exposes this package as `scitex.genai`.
 
 | Submodule                    | Status      | Notes                                                            |
 | ---------------------------- | ----------- | ---------------------------------------------------------------- |
-| `scitex_genai.llm`           | implemented | Unified provider factory `GenAI`. Litellm-backed in a follow-up. |
+| `scitex_genai.llm`           | implemented | Unified provider factory `GenAI`. Opt-in litellm backend via `backend="litellm"`. |
 | `scitex_genai.agent`         | reserved    | Wrapper over `claude-agent-sdk` and friends.                     |
 | `scitex_genai.image`         | reserved    | Image generation / editing.                                      |
 | `scitex_genai.audio`         | reserved    | TTS / STT / music.                                               |
@@ -45,8 +45,8 @@ on attribute access — import paths are stable as features land.
 - [01_installation.md](01_installation.md) — `pip install`, provider extras, env-var matrix.
 - [02_quick-start.md](02_quick-start.md) — three-line LLM call, provider switching, conversation history.
 - [03_python-api.md](03_python-api.md) — `GenAI` class signature, instance state, errors.
-- [10_llm.md](10_llm.md) — full provider table, cost tracking internals, future litellm backend.
-- [20_env-vars.md](20_env-vars.md) — provider API keys + self-hosted `SCITEX_GENAI_*` endpoint vars.
+- [10_llm.md](10_llm.md) — full provider table, cost tracking internals, opt-in litellm backend.
+- [20_env-vars.md](20_env-vars.md) — provider API keys, self-hosted `SCITEX_GENAI_*` endpoint vars, `SCITEX_GENAI_BACKEND` switch.
 
 ## Quick Reference
 
@@ -70,6 +70,6 @@ scitex.genai.GenAI  # same object as scitex_genai.GenAI
 | Extra        | Purpose                                                    |
 | ------------ | ---------------------------------------------------------- |
 | `[agent]`    | `claude-agent-sdk` for the (forthcoming) `agent` submodule |
-| `[litellm]`  | `litellm` router (future `llm/` backend)                   |
+| `[litellm]`  | No-op alias (litellm is now a core dep for `backend="litellm"`) |
 | `[ollama]`   | Local `ollama` provider                                    |
 | `[all]`      | Everything available today                                 |
