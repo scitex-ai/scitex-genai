@@ -27,6 +27,32 @@ def _first_model_for(provider: str) -> str:
     return rows[0]
 
 
+@pytest.fixture(autouse=True)
+def isolate_scitex_genai_env():
+    """Clear fleet-injected SCITEX_GENAI_* vars for every test in this module.
+
+    Agent containers inject SCITEX_GENAI_BASE_URL / SCITEX_GENAI_API_KEY
+    fleet-wide, which would otherwise leak a base_url (and a backend) into
+    these tests. Fixtures that need them set them explicitly on top of this.
+    """
+    import os
+
+    names = (
+        "SCITEX_GENAI_BASE_URL",
+        "SCITEX_GENAI_API_KEY",
+        "SCITEX_GENAI_BACKEND",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
+        os.environ.pop(name, None)
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 @pytest.fixture
 def fake_api_keys():
     """Set fake API keys for all providers; restore on teardown."""
