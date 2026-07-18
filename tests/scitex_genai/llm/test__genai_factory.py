@@ -324,6 +324,39 @@ def test_factory_picks_one_key_when_api_key_is_tuple(fake_api_keys):
     assert instance.api_key in candidates
 
 
+# Regression guards for the opt-in litellm backend (see test__LiteLLM.py for
+# the backend itself): with no backend arg and no SCITEX_GENAI_BACKEND env,
+# dispatch must keep using the per-provider classes.
+def test_factory_default_backend_still_dispatches_anthropic(fake_api_keys):
+    # Arrange
+    model = _first_model_for("Anthropic")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key")
+    # Assert
+    assert type(instance).__name__ == "Anthropic"
+
+
+def test_factory_backend_default_is_explicit_no_op(fake_api_keys):
+    # Arrange
+    model = _first_model_for("OpenAI")
+    # Act
+    instance = genai_factory(model=model, api_key="fake-key", backend="default")
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+
+
+def test_factory_default_backend_self_hosted_keeps_openai_handler():
+    # Arrange
+    # Act
+    instance = genai_factory(
+        model="some-local-model",
+        base_url=_SELF_HOSTED_BASE_URL,
+        api_key="sk-x",
+    )
+    # Assert
+    assert type(instance).__name__ == "OpenAI"
+
+
 if __name__ == "__main__":
     import os
 
