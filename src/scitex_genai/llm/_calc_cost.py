@@ -45,18 +45,15 @@ def calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     Returns
     -------
     float
-        Total cost in USD
-
-    Raises
-    ------
-    ValueError
-        If model is not found in MODELS
+        Total cost in USD. Returns 0.0 for unknown models (e.g. self-hosted
+        or OpenAI-compatible endpoints that have no pricing row).
     """
     models_df = pd.DataFrame(MODELS)
     indi = models_df["name"] == model
 
     if not indi.any():
-        raise ValueError(f"Model '{model}' not found in pricing table")
+        # Self-hosted / unknown models have no pricing data; treat as free.
+        return 0.0
 
     costs = models_df[["input_cost", "output_cost"]][indi]
     cost = (

@@ -5,8 +5,9 @@ description: |
   Anthropic / Google / Groq / DeepSeek / Perplexity / Llama, with cost tracking
   and conversation history. Provider is inferred from the model name via the
   internal `_PARAMS.MODELS` table; provider SDKs are opt-in extras to keep
-  cold-start light. Future direction: litellm-backed routing to consolidate the
-  provider dispatch layer.
+  cold-start light. Opt-in litellm-backed routing (backend="litellm" or
+  SCITEX_GENAI_BACKEND=litellm) consolidates the dispatch layer; the default
+  stays the per-provider classes for now.
 tags: [scitex-genai-llm]
 ---
 
@@ -37,10 +38,23 @@ The provider is inferred from the model name via `scitex_genai.llm._PARAMS.MODEL
 | DeepSeek     | `DEEPSEEK_API_KEY`      | OpenAI-compatible API.                       |
 | Perplexity   | `PERPLEXITY_API_KEY`    | Search-augmented generation.                 |
 | Llama        | (none — local)          | Local / self-hosted Llama servers.           |
+| Self-hosted  | `SCITEX_GENAI_API_KEY`  | OpenAI-compatible endpoint via `SCITEX_GENAI_BASE_URL` (e.g. vLLM behind LiteLLM). |
 
 Provider classes themselves (`Anthropic`, `OpenAI`, …) live in
 `scitex_genai.llm` and inherit from `BaseGenAI`. Use `GenAI(...)` —
 the factory — for all normal application code.
+
+For a self-hosted, OpenAI-compatible model, pass an unknown model name
+plus `base_url` (and `api_key`), or set `SCITEX_GENAI_BASE_URL` +
+`SCITEX_GENAI_API_KEY` and just give the model name:
+
+```python
+GenAI(model="qwen36-35b-a3b", base_url="http://host:4000/v1", api_key="sk-...")
+```
+
+The factory skips the MODELS lookup for unknown names when a `base_url`
+(or explicit `provider`) is given; explicit args win over the env
+fallback, which engages only on this passthrough path.
 
 ## Cost tracking
 
@@ -54,9 +68,37 @@ Each `GenAI` instance carries a conversation buffer (`ai.history`);
 consecutive `ai(prompt)` calls re-send the running history (controlled
 by `n_keep` at construction). Reset with `ai.reset()`.
 
+## litellm backend (landed — experimental, opt-in)
+
+Dispatch can route through [litellm](https://github.com/BerriAI/litellm):
+ONE OpenAI-compatible code path serves every provider and self-hosted
+endpoints, instead of one handler class per provider SDK. Opt in per call
+or fleet-wide via env:
+
+```python
+GenAI(model="claude-3-5-haiku-20241022", backend="litellm")  # per call
+# or: export SCITEX_GENAI_BACKEND=litellm                    # fleet-wide
+```
+
+- The **default backend is unchanged** (per-provider classes); flipping the
+  default is a later step once the litellm path is battle-tested.
+- Explicit `backend=` wins over `SCITEX_GENAI_BACKEND`; pass
+  `backend="default"` to force the classic dispatch under that env.
+- Same instance contract: `ai(prompt)`, `.cost`, `.history`, `.reset()`,
+  `.stream`, `.input_tokens` / `.output_tokens`.
+- Provider selection uses litellm model-string prefixes internally
+  (`anthropic/claude-*`, `gemini/gemini-*`, `groq/...`, `deepseek/...`,
+  `perplexity/...`); `ai.model` stays the plain name you passed.
+- Self-hosted works through both backends: an unknown model + `base_url`
+  maps to litellm's `openai/<model>` OpenAI-compatible convention.
+- litellm is imported lazily — the default backend does not pay its
+  import cost.
+
 ## What's coming
 
-- **litellm backend.** Move dispatch under [litellm](https://github.com/BerriAI/litellm) for one OpenAI-compatible interface, lazy provider imports, free streaming/retry/cost-tracking, and out-of-the-box Ollama support (just `model="ollama/llama3"`).
+- **Flip the default to litellm** and demote per-provider SDKs to optional
+  extras (lazy provider imports, lighter cold start, out-of-the-box Ollama
+  via `model="ollama/llama3"`).
 - **Native Ollama path.** Direct `scitex_genai.llm` integration for users who don't want litellm.
 
 ## Related

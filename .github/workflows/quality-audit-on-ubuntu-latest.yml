@@ -1,0 +1,33 @@
+name: quality
+
+# Reusable-workflow caller (scitex-ai/.github, 2026-07-10 fleet migration).
+# Renamed from scitex-genai-quality-audit-on-ubuntu-latest.yml (dropping
+# the per-repo prefix, matching the fleet-standard filename) as part of
+# this conversion. Triggers preserved verbatim (push-paths filter updated
+# to reference this file's new name). Job body now comes from
+# scitex-ai/.github's quality-audit.yml (derives the package name from
+# this repo's own pyproject.toml). Behavior change: drops the local
+# `--new-only` baseline-diff flag, the `git fetch origin main:main` step,
+# and the `scitex-dev[cli-audit]>=0.17.14` version pin — the reusable
+# audit always runs the full (non-diffed) version-checked audit against
+# an unpinned scitex-dev.
+# New required-status-check context: "quality-audit / audit"
+
+on:
+  schedule:
+    - cron: "0 18 * * *"  # 18:00 UTC (~03:00 JST), after Test
+  workflow_dispatch:
+  push:
+    branches: [develop]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/quality-audit-on-ubuntu-latest.yml"
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  quality-audit:
+    uses: scitex-ai/.github/.github/workflows/quality-audit.yml@main
+    secrets: inherit

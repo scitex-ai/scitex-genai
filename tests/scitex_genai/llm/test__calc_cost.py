@@ -104,14 +104,14 @@ def test_calc_cost_only_output_tokens_charges_output_rate():
     assert cost == pytest.approx(expected)
 
 
-def test_calc_cost_invalid_model_raises_value_error():
+def test_calc_cost_unknown_model_returns_zero():
     # Arrange
+    # A self-hosted / unknown model has no pricing row, so cost is 0.0
+    # rather than raising (BaseGenAI.cost relies on this for local models).
     # Act
+    cost = calc_cost("invalid-model", 100, 100)
     # Assert
-    with pytest.raises(
-        ValueError, match="Model 'invalid-model' not found in pricing table"
-    ):
-        calc_cost("invalid-model", 100, 100)
+    assert cost == 0.0
 
 
 def test_calc_cost_scales_linearly_with_input_tokens():
