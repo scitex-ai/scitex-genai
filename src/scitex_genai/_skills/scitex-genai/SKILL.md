@@ -16,7 +16,7 @@ description: |
   `10_llm.md` for the full provider-routing table.
 tags: [scitex-genai]
 primary_interface: python
-interfaces: {python: 3, cli: 0, mcp: 0, skills: 1, hook: 0, http: 0}
+interfaces: {python: 3, cli: 1, mcp: 0, skills: 1, hook: 0, http: 1}
 ---
 
 # scitex-genai
@@ -30,6 +30,7 @@ umbrella `scitex-python` exposes this package as `scitex.genai`.
 | Submodule                    | Status      | Notes                                                            |
 | ---------------------------- | ----------- | ---------------------------------------------------------------- |
 | `scitex_genai.llm`           | implemented | Unified provider factory `GenAI`. Opt-in litellm backend via `backend="litellm"`. |
+| `scitex_genai.gateway`       | implemented | Anthropic Messages endpoint backed by Codex subscription accounts. |
 | `scitex_genai.agent`         | reserved    | Wrapper over `claude-agent-sdk` and friends.                     |
 | `scitex_genai.image`         | reserved    | Image generation / editing.                                      |
 | `scitex_genai.audio`         | reserved    | TTS / STT / music.                                               |
@@ -45,6 +46,8 @@ on attribute access — import paths are stable as features land.
 - [01_installation.md](01_installation.md) — `pip install`, provider extras, env-var matrix.
 - [02_quick-start.md](02_quick-start.md) — three-line LLM call, provider switching, conversation history.
 - [03_python-api.md](03_python-api.md) — `GenAI` class signature, instance state, errors.
+- [04_cli-reference.md](04_cli-reference.md) — gateway command, options, and environment requirements.
+- [06_http-api.md](06_http-api.md) — Claude Code-compatible endpoint, Codex OAuth accounts, quota-aware routing.
 - [10_llm.md](10_llm.md) — full provider table, cost tracking internals, opt-in litellm backend.
 - [20_env-vars.md](20_env-vars.md) — provider API keys, self-hosted `SCITEX_GENAI_*` endpoint vars, `SCITEX_GENAI_BACKEND` switch.
 
@@ -72,4 +75,5 @@ scitex.genai.GenAI  # same object as scitex_genai.GenAI
 | `[agent]`    | `claude-agent-sdk` for the (forthcoming) `agent` submodule |
 | `[litellm]`  | No-op alias (litellm is now a core dep for `backend="litellm"`) |
 | `[ollama]`   | Local `ollama` provider                                    |
+| `[gateway]`  | FastAPI, HTTPX, and Uvicorn for the model gateway          |
 | `[all]`      | Everything available today                                 |

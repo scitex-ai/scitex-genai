@@ -43,11 +43,42 @@
 pip install scitex-genai            # core (LLM providers)
 pip install scitex-genai[agent]     # + claude-agent-sdk (forthcoming `agent` submodule)
 pip install scitex-genai[litellm]   # + litellm router (preview)
+pip install scitex-genai[gateway]   # + Anthropic-compatible model gateway
 pip install scitex-genai[ollama]    # + local ollama
 pip install scitex-genai[all]       # everything available today
 ```
 
 Through the umbrella: `pip install scitex[genai]`. Requires Python ≥ 3.10.
+
+### Claude Code with a Codex subscription backend
+
+The gateway keeps Claude Code as the agent harness. It translates only the
+model protocol and never executes tools returned by Codex.
+
+```bash
+export SCITEX_GENAI_CODEX_HOMES="$HOME/.codex-alpha:$HOME/.codex-beta"
+export SCITEX_GENAI_GATEWAY_API_KEY="$(openssl rand -hex 32)"
+scitex-genai-gateway --host 127.0.0.1 --port 8765
+```
+
+Each configured directory contains an `auth.json` created by `codex login`.
+Tokens remain in those files and are refreshed atomically. Account selection
+is sticky per session, ranks accounts by Codex usage-window headroom, spreads
+concurrent sessions, and rotates away from rate-limited accounts.
+
+Point Claude Code at the service without changing its hooks, skills, tools, or
+project instructions:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
+export ANTHROPIC_API_KEY="$SCITEX_GENAI_GATEWAY_API_KEY"
+export ANTHROPIC_MODEL="gpt-5.4"
+claude
+```
+
+This integration uses the Codex client subscription transport rather than the
+separately billed OpenAI API. See the gateway skill for its protocol coverage
+and operational limitations.
 
 ## Quick Start
 
@@ -108,6 +139,7 @@ scitex-python (umbrella)
                               │                 ├── _PARAMS            model catalogue
                               │                 ├── _calc_cost         token-cost accounting
                               │                 └── _format_output_func text/markdown formatting
+                              ├── gateway/     structured Anthropic ↔ Codex protocol bridge
                               ├── agent/        reserved (claude-agent-sdk wrapper planned)
                               ├── image/        reserved
                               ├── audio/        reserved
@@ -154,9 +186,10 @@ print("cost USD:", ai.cost)
 </details>
 
 <details>
-<summary><strong>CLI ⭐ — none</strong></summary>
+<summary><strong>CLI ⭐ — gateway</strong></summary>
 
-`scitex-genai` ships no dedicated CLI. Drive completions from Python or use the umbrella `scitex` CLI.
+`scitex-genai-gateway` serves an authenticated Anthropic-compatible endpoint
+backed by one or more Codex subscription accounts.
 </details>
 
 <details>

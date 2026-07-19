@@ -21,9 +21,10 @@ management) and the major provider SDKs (`openai`, `anthropic`,
 
 ```bash
 pip install scitex-genai[agent]     # + claude-agent-sdk (forthcoming `agent` submodule)
+pip install scitex-genai[gateway]   # + Anthropic-compatible Codex gateway
 pip install scitex-genai[litellm]   # + litellm router (preview)
 pip install scitex-genai[ollama]    # + local ollama
-pip install scitex-genai[all]       # agent + litellm + ollama
+pip install scitex-genai[all]       # agent + gateway + litellm + ollama
 ```
 
 ## API keys
