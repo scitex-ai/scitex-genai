@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-19
+
 ### Added
+
+- Opt-in LiteLLM dispatch backend for unified provider and self-hosted model
+  routing.
+- Authenticated Anthropic Messages gateway that keeps Claude Code as the agent
+  harness while using Codex subscription accounts as the model backend.
+- Multi-account Codex OAuth refresh, quota-aware scheduling, sticky sessions,
+  concurrent load spreading, and 401/429/5xx failover.
+- Streaming text, image, and tool-call translation between Anthropic Messages
+  and Codex Responses protocols.
 
 - Modality-organised package layout: `llm` (implemented), `agent`, `image`,
   `audio`, `video`, `embed`, `multimodal` (reserved namespaces).

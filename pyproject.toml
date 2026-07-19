@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scitex-genai"
-version = "0.1.1"
+version = "0.1.2"
 description = "SciTeX GenAI — modality-organised generative-AI provider abstraction (LLM, agents, image/audio/video stubs)"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -42,6 +42,9 @@ dependencies = [
     "anthropic",
     "google-genai",
     "groq",
+    # Dispatch backend for GenAI(..., backend="litellm") / SCITEX_GENAI_BACKEND.
+    # Imported lazily (only when that backend is selected).
+    "litellm",
     "markdown2",
     "matplotlib",
     "Pillow",
@@ -63,18 +66,27 @@ litellm = [
 ollama = [
     "ollama",
 ]
+gateway = [
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "uvicorn>=0.29",
+]
 image = []
 audio = []
 video = []
 embed = []
 multimodal = []
 dev = [
+    "fastapi>=0.110",
+    "httpx>=0.27",
     "pytest>=7.0.0",
+    "pytest-asyncio",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
     "pytest-timeout",
     "ruff",
     "scitex-dev>=0.11.7",
+    "uvicorn>=0.29",
     # Notebook execution for tests/examples/test_01_*.py (PS505).
     "nbconvert",
     "nbformat",
@@ -94,9 +106,13 @@ docs = [
 ]
 all = [
     "scitex-genai[agent]",
+    "scitex-genai[gateway]",
     "scitex-genai[litellm]",
     "scitex-genai[ollama]",
 ]
+
+[project.scripts]
+scitex-genai-gateway = "scitex_genai.gateway._cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ywatanabe1989/scitex-genai"

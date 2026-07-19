@@ -20,6 +20,7 @@ from ._format_output_func import format_output_func
 from ._genai_factory import genai_factory as GenAI
 from ._Google import Google
 from ._Groq import Groq
+from ._LiteLLM import LiteLLM
 from ._Llama import Llama
 from ._OpenAI import OpenAI
 from ._PARAMS import MODELS
