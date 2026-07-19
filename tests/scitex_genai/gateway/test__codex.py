@@ -27,7 +27,7 @@ def _account(alias: str) -> CodexAccount:
 async def test_backend_rotates_after_rate_limit() -> None:
     # Arrange
     accounts = [_account("alpha"), _account("beta")]
-    pool = CodexAccountPool(accounts)
+    pool = CodexAccountPool(accounts, choose=lambda candidates: candidates[0])
 
     class Transport:
         calls: list[str] = []
@@ -91,7 +91,7 @@ async def test_backend_refreshes_once_after_unauthorized() -> None:
 async def test_backend_rotates_after_transient_upstream_error() -> None:
     # Arrange
     accounts = [_account("alpha"), _account("beta")]
-    pool = CodexAccountPool(accounts)
+    pool = CodexAccountPool(accounts, choose=lambda candidates: candidates[0])
 
     class Transport:
         calls: list[str] = []
@@ -127,6 +127,7 @@ async def test_transport_reads_streamed_error_body_before_decoding() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(reject))
     transport = CodexTransport(client=client)
+
     # Act
     async def consume() -> None:
         async for _ in transport.stream({}, _account("alpha")):

@@ -71,7 +71,7 @@ jobs:
             v="${{ inputs.version }}"
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ steps.ver.outputs.version }}
           fetch-depth: 0
@@ -99,7 +99,7 @@ jobs:
             v="${{ inputs.version }}"
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ steps.ver.outputs.version }}
           fetch-depth: 0
@@ -109,7 +109,7 @@ jobs:
       - name: Build wheel + sdist in the CI SIF (apptainer exec)
         run: bash .github/ci/exec-in-sif.sh build-in-sif.sh 3.12
       # upload-artifact is a JS action — runs fine on the self-hosted runner.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist
           path: dist/
@@ -127,8 +127,8 @@ jobs:
     steps:
       # Need the repo checked out so .github/ci/exec-in-sif.sh +
       # publish-in-sif.sh are on disk (the build job uploaded only dist/).
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist
@@ -146,10 +146,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.build.outputs.version }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist
