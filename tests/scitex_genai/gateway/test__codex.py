@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from scitex_genai.gateway._accounts import CodexAccount, CodexAccountPool
-from scitex_genai.gateway._codex import CodexBackend
+from scitex_genai.gateway._codex import CodexBackend, CodexTransport
 from scitex_genai.gateway._credentials import CodexCredential
 from scitex_genai.gateway._errors import RateLimitError, UpstreamError
 
@@ -111,4 +111,59 @@ async def test_backend_rotates_after_transient_upstream_error() -> None:
         ["alpha", "beta"],
         "response.completed",
         True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_transport_reads_streamed_error_body_before_decoding() -> None:
+    # Arrange
+    httpx = pytest.importorskip("httpx")
+
+    async def reject(request):
+        return httpx.Response(
+            400,
+            json={"error": {"message": "unsupported request field"}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(reject))
+    transport = CodexTransport(client=client)
+    # Act
+    async def consume() -> None:
+        async for _ in transport.stream({}, _account("alpha")):
+            pass
+
+    # Assert
+    with pytest.raises(UpstreamError, match="unsupported request field"):
+        await consume()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transport_hashes_oversized_session_header() -> None:
+    # Arrange
+    httpx = pytest.importorskip("httpx")
+    observed_session_id = ""
+
+    async def accept(request):
+        nonlocal observed_session_id
+        observed_session_id = request.headers["session_id"]
+        return httpx.Response(
+            200,
+            text='data: {"type":"response.completed","response":{}}\n\n',
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(accept))
+    transport = CodexTransport(client=client)
+    # Act
+    events = [
+        event
+        async for event in transport.stream(
+            {}, _account("alpha"), session_id="claude-session-" * 10
+        )
+    ]
+    await client.aclose()
+    # Assert
+    assert (len(observed_session_id), events[0]["type"]) == (
+        64,
+        "response.completed",
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any
 
 from ._errors import GatewayError
@@ -135,6 +136,13 @@ def _tool_results(content: Any) -> tuple[list[dict[str, Any]], list[dict[str, An
     return outputs, ordinary
 
 
+def _prompt_cache_key(session_id: str) -> str:
+    """Fit Claude session IDs into Codex's 64-character cache-key contract."""
+    if len(session_id) <= 64:
+        return session_id
+    return sha256(session_id.encode("utf-8")).hexdigest()
+
+
 def anthropic_to_codex(body: dict[str, Any], *, session_id: str = "") -> dict[str, Any]:
     """Build a Codex Responses request without executing any tools."""
     model = body.get("model")
@@ -201,7 +209,7 @@ def anthropic_to_codex(body: dict[str, Any], *, session_id: str = "") -> dict[st
         ),
     }
     if session_id:
-        request["prompt_cache_key"] = session_id
+        request["prompt_cache_key"] = _prompt_cache_key(session_id)
     if tools:
         request["tools"] = tools
     if "temperature" in body:

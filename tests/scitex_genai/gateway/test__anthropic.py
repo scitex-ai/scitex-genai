@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
 from scitex_genai.gateway._anthropic import (
     AnthropicStreamTranslator,
@@ -94,6 +95,16 @@ def test_anthropic_to_codex_preserves_tool_cycle_and_images() -> None:
     )
     # Assert
     assert observed == expected
+
+
+def test_anthropic_to_codex_hashes_oversized_prompt_cache_key() -> None:
+    # Arrange
+    session_id = "claude-session-" * 10
+    body = {"model": "gpt-5.6-sol", "messages": []}
+    # Act
+    payload = anthropic_to_codex(body, session_id=session_id)
+    # Assert
+    assert payload["prompt_cache_key"] == sha256(session_id.encode()).hexdigest()
 
 
 def test_stream_translator_emits_anthropic_tool_events_and_usage() -> None:
