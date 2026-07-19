@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,9 +43,19 @@ class CodexAccount:
 
 
 class CodexAccountPool:
-    """Select accounts per session and rotate around temporary failures."""
+    """Select accounts per session and rotate around temporary failures.
 
-    def __init__(self, accounts: list[CodexAccount]) -> None:
+    Every new session uses ``choose`` after quota and concurrent-load
+    filtering. This includes a one-account pool: the selector receives a
+    one-element list instead of bypassing rotation with a singleton shortcut.
+    """
+
+    def __init__(
+        self,
+        accounts: list[CodexAccount],
+        *,
+        choose: Callable[[list[CodexAccount]], CodexAccount] | None = None,
+    ) -> None:
         if not accounts:
             raise NoAccountAvailable("No Codex subscription accounts are configured")
         aliases = [account.alias for account in accounts]
@@ -52,6 +64,7 @@ class CodexAccountPool:
         self.accounts = accounts
         self._sessions: dict[str, str] = {}
         self._lock = asyncio.Lock()
+        self._choose = choose or random.SystemRandom().choice
 
     @classmethod
     def discover(cls, homes: list[Path | str] | None = None) -> "CodexAccountPool":
@@ -60,26 +73,58 @@ class CodexAccountPool:
             if configured:
                 homes = [Path(value) for value in configured.split(os.pathsep) if value]
             else:
-                homes = [Path(os.getenv("CODEX_HOME", Path.home() / ".codex"))]
+                account_root = Path(
+                    os.getenv(
+                        "SCITEX_GENAI_CODEX_ACCOUNTS_DIR",
+                        Path.home()
+                        / ".scitex"
+                        / "agent-container"
+                        / "accounts"
+                        / "openai",
+                    )
+                ).expanduser()
+                stored_homes = cls._stored_homes(account_root)
+                if account_root.exists() and not stored_homes:
+                    raise NoAccountAvailable(
+                        f"Codex account store contains no auth files: {account_root}"
+                    )
+                homes = stored_homes or [
+                    Path(os.getenv("CODEX_HOME", Path.home() / ".codex"))
+                ]
 
         accounts: list[CodexAccount] = []
-        errors: list[str] = []
+        expanded_homes: list[Path] = []
         for home_value in homes:
             home = Path(home_value).expanduser()
+            expanded_homes.extend(cls._stored_homes(home) or [home])
+        for home in expanded_homes:
             path = home if home.name == "auth.json" else home / "auth.json"
             try:
                 credential = CodexCredential.load(path)
             except CredentialError as exc:
-                errors.append(str(exc))
-                continue
+                raise NoAccountAvailable(
+                    f"Unusable Codex account credential: {path}"
+                ) from exc
             alias = home.parent.name if home.name == "auth.json" else home.name
             if alias == ".codex":
                 alias = "default"
             accounts.append(CodexAccount(alias=alias, credential=credential))
         if not accounts:
-            detail = "; ".join(errors) or "no auth.json files found"
-            raise NoAccountAvailable(f"No usable Codex accounts: {detail}")
+            raise NoAccountAvailable(
+                "No usable Codex accounts: no auth.json files found"
+            )
         return cls(accounts)
+
+    @staticmethod
+    def _stored_homes(root: Path) -> list[Path]:
+        """Return sorted account homes below a provider-qualified store root."""
+        if not root.is_dir() or (root / "auth.json").is_file():
+            return []
+        return sorted(
+            child
+            for child in root.iterdir()
+            if child.is_dir() and (child / "auth.json").is_file()
+        )
 
     async def acquire(
         self, session_id: str = "", *, exclude: set[str] | None = None
@@ -102,15 +147,21 @@ class CodexAccountPool:
             ]
             if not candidates:
                 raise NoAccountAvailable("All Codex accounts are cooling down")
-            selected = min(
-                candidates,
-                key=lambda account: (
-                    account.usage_score,
-                    account.in_flight,
-                    account.last_used_at,
-                    account.alias,
-                ),
-            )
+            best_usage = min(account.usage_score for account in candidates)
+            quota_candidates = [
+                account for account in candidates if account.usage_score == best_usage
+            ]
+            best_load = min(account.in_flight for account in quota_candidates)
+            rotation_candidates = [
+                account
+                for account in quota_candidates
+                if account.in_flight == best_load
+            ]
+            selected = self._choose(rotation_candidates)
+            if all(selected is not candidate for candidate in rotation_candidates):
+                raise ValueError(
+                    "Codex account selector returned an ineligible account"
+                )
             selected.in_flight += 1
             selected.last_used_at = now
             if session_id:
@@ -124,7 +175,9 @@ class CodexAccountPool:
     async def cool_down(self, account: CodexAccount, seconds: float) -> None:
         async with self._lock:
             account.cooldown_until = max(account.cooldown_until, time.time() + seconds)
-            stale = [key for key, value in self._sessions.items() if value == account.alias]
+            stale = [
+                key for key, value in self._sessions.items() if value == account.alias
+            ]
             for key in stale:
                 self._sessions.pop(key, None)
 
@@ -141,4 +194,6 @@ class CodexAccountPool:
             account.usage_refreshed_at = time.time()
 
     def _by_alias(self, alias: str) -> CodexAccount | None:
-        return next((account for account in self.accounts if account.alias == alias), None)
+        return next(
+            (account for account in self.accounts if account.alias == alias), None
+        )

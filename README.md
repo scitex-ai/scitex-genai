@@ -56,15 +56,18 @@ The gateway keeps Claude Code as the agent harness. It translates only the
 model protocol and never executes tools returned by Codex.
 
 ```bash
-export SCITEX_GENAI_CODEX_HOMES="$HOME/.codex-alpha:$HOME/.codex-beta"
 export SCITEX_GENAI_GATEWAY_API_KEY="$(openssl rand -hex 32)"
 scitex-genai-gateway --host 127.0.0.1 --port 8765
 ```
 
-Each configured directory contains an `auth.json` created by `codex login`.
+By default the gateway discovers
+`~/.scitex/agent-container/accounts/openai/*/auth.json`. Set the
+path-separated `SCITEX_GENAI_CODEX_HOMES` only to override that store. Each
+configured directory contains an `auth.json` created by `codex login`.
 Tokens remain in those files and are refreshed atomically. Account selection
 is sticky per session, ranks accounts by Codex usage-window headroom, spreads
-concurrent sessions, and rotates away from rate-limited accounts.
+concurrent sessions, and rotates away from rate-limited accounts. The rotation
+selector is invoked even for a one-account pool.
 
 Point Claude Code at the service without changing its hooks, skills, tools, or
 project instructions:

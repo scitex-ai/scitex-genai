@@ -17,15 +17,15 @@ manage a second agent loop.
 ```bash
 pip install 'scitex-genai[gateway]'
 
-export SCITEX_GENAI_CODEX_HOMES="$HOME/.codex-alpha:$HOME/.codex-beta"
 export SCITEX_GENAI_GATEWAY_API_KEY="<random local relay key>"
 scitex-genai-gateway --host 127.0.0.1 --port 8765
 ```
 
-Each directory in `SCITEX_GENAI_CODEX_HOMES` must contain an `auth.json`
-created by `codex login`. Do not put tokens in a spec, `.env.example`, test, or
-package file. The directory basename is used as the account alias; public
-identity is provider-qualified as `openai:<alias>`.
+The default store is
+`~/.scitex/agent-container/accounts/openai/<alias>/auth.json`.
+`SCITEX_GENAI_CODEX_HOMES` can explicitly override it. Do not put tokens in a
+spec, `.env.example`, test, or package file. The directory basename is used as
+the account alias; public identity is provider-qualified as `openai:<alias>`.
 
 Configure Claude Code:
 
@@ -43,7 +43,8 @@ claude
 - tool declarations, `tool_use`, and `tool_result` round trips
 - Codex OAuth refresh with atomic `auth.json` replacement
 - sticky sessions and prompt-cache keys
-- quota-window polling, least-used selection, concurrent spreading
+- quota-window polling, least-used selection, concurrent spreading, and a
+  random rotation tie-break that is also invoked for one-account pools
 - 429 cooldown and retry through another configured account
 - authenticated inbound requests; health response exposes no identities
 

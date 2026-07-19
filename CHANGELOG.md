@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-19
+
+### Added
+
+- Provider-qualified Codex account discovery from the SAC account store at
+  `~/.scitex/agent-container/accounts/openai/*/auth.json`.
+
+### Changed
+
+- New Codex sessions always pass through quota-aware, least-loaded random
+  account selection, including a one-account candidate pool.
+- A present but empty or invalid provider account store now fails gateway
+  startup loudly instead of silently skipping credentials or changing source.
+
 ## [0.1.3] - 2026-07-19
 
 ### Fixed
