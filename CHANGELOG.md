@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-19
+
+### Fixed
+
+- Claude Code streamed requests now preserve full internal session stickiness
+  while satisfying Codex's 64-character cache-key and session-header limits.
+- Streamed Codex HTTP errors now surface their actual upstream status and
+  message instead of raising `httpx.ResponseNotRead` and leaving the harness
+  retrying an opaque broken stream.
+
 ## [0.1.2] - 2026-07-19
 
 ### Added

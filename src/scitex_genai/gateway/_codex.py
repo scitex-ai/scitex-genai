@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from hashlib import sha256
 from typing import Any
 
 from ._accounts import CodexAccount, CodexAccountPool
@@ -39,6 +40,13 @@ def _retry_after(response: Any) -> float:
         return max(1.0, float(value))
     except (TypeError, ValueError):
         return 60.0
+
+
+def _transport_session_id(session_id: str) -> str:
+    """Fit a harness session ID into the Codex transport header contract."""
+    if len(session_id) <= 64:
+        return session_id
+    return sha256(session_id.encode("utf-8")).hexdigest()
 
 
 async def _parse_sse(response: Any) -> AsyncIterator[dict[str, Any]]:
@@ -91,7 +99,7 @@ class CodexTransport:
             "content-type": "application/json",
         }
         if session_id:
-            headers["session_id"] = session_id
+            headers["session_id"] = _transport_session_id(session_id)
 
         if self._client is None:
             try:
@@ -117,6 +125,11 @@ class CodexTransport:
         async with client.stream(
             "POST", codex_url(self.base_url), headers=headers, json=payload
         ) as response:
+            if response.status_code >= 400:
+                # ``client.stream`` leaves the body unread. Error decoding must
+                # consume it explicitly or httpx raises ResponseNotRead and the
+                # Anthropic SSE client retries an opaque broken stream.
+                await response.aread()
             if response.status_code == 429:
                 raise RateLimitError(
                     _response_error(response), retry_after=_retry_after(response)
