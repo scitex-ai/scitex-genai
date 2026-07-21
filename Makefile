@@ -16,8 +16,8 @@ help:
 install:
 	pip install -e .
 
-# `[_dev]` is an internal (underscore-prefixed) extra; PEP 508 forbids
-# requesting it (`pip install -e ".[_dev]"` fails to parse), so install
+# `[dev]` is an internal (underscore-prefixed) extra; PEP 508 forbids
+# requesting it (`pip install -e ".[dev]"` fails to parse), so install
 # bare + the dev toolchain read straight out of pyproject.toml's `_dev`.
 install-dev:
 	pip install -e .

@@ -26,8 +26,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install package + docs deps
-        # `[_docs]` is an internal (underscore-prefixed) extra; PEP 508
-        # forbids requesting it (`pip install -e ".[_docs]"` fails to
+        # `[docs]` is an internal (underscore-prefixed) extra; PEP 508
+        # forbids requesting it (`pip install -e ".[docs]"` fails to
         # parse), so install bare + the docs toolchain explicitly.
         # Keep this list in sync with `_docs` in pyproject.toml.
         run: |
