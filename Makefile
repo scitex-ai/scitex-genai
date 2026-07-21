@@ -5,7 +5,7 @@
 
 help:
 	@echo "make install       Editable install (no extras)"
-	@echo "make install-dev   Editable install + dev toolchain (_dev deps)"
+	@echo "make install-dev   Editable install with [dev] extras"
 	@echo "make test          Run pytest with coverage"
 	@echo "make test-fast     Run pytest -x -q (stop on first failure)"
 	@echo "make lint          Run ruff check"
@@ -16,12 +16,8 @@ help:
 install:
 	pip install -e .
 
-# `[dev]` is an internal (underscore-prefixed) extra; PEP 508 forbids
-# requesting it (`pip install -e ".[dev]"` fails to parse), so install
-# bare + the dev toolchain read straight out of pyproject.toml's `_dev`.
 install-dev:
-	pip install -e .
-	python -c "import tomllib,subprocess,sys; deps=tomllib.load(open('pyproject.toml','rb'))['project']['optional-dependencies']['_dev']; sys.exit(subprocess.run([sys.executable,'-m','pip','install',*deps]).returncode)"
+	pip install -e ".[dev]"
 
 test:
 	pytest tests/ --cov=src/scitex_genai --cov-report=term-missing

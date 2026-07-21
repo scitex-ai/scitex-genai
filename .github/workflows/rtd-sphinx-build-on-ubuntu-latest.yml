@@ -26,13 +26,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install package + docs deps
-        # `[docs]` is an internal (underscore-prefixed) extra; PEP 508
-        # forbids requesting it (`pip install -e ".[docs]"` fails to
-        # parse), so install bare + the docs toolchain explicitly.
-        # Keep this list in sync with `_docs` in pyproject.toml.
-        run: |
-          pip install -e .
-          pip install "sphinx>=7.0" "sphinx-rtd-theme>=2.0" "myst-parser>=2.0" "sphinx-copybutton>=0.5" "sphinx-autodoc-typehints>=1.25"
+        run: pip install -e ".[docs]"
 
       - name: Build Sphinx HTML (warnings fail PRs only)
         run: |
