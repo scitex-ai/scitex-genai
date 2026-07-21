@@ -6,6 +6,10 @@ import httpx
 import pytest
 import pytest_asyncio
 
+# The gateway app is FastAPI-based (`create_app` resolves fastapi lazily);
+# skip cleanly on installs without the [gateway] extra.
+pytest.importorskip("fastapi")
+
 from scitex_genai.gateway._server import create_app
 
 
@@ -124,3 +128,13 @@ async def test_count_tokens_is_authenticated_and_positive(client) -> None:
     )
     # Assert
     assert (response.status_code, response.json()["input_tokens"] > 0) == (200, True)
+
+
+def test_created_app_is_accepted_by_uvicorn_config(app) -> None:
+    """The gateway CLI hands ``create_app``'s result straight to uvicorn."""
+    # Arrange
+    uvicorn = pytest.importorskip("uvicorn")
+    # Act
+    config = uvicorn.Config(app)
+    # Assert
+    assert config.app is app
