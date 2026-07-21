@@ -25,6 +25,7 @@ def test_audit_all_clean():
             "scitex-dev not installed — add `scitex-dev[cli-audit]` "
             "to [project.optional-dependencies.dev]"
         )
+    pytest.importorskip("scitex_dev")
     from scitex_dev.testing import audit_all_for_package
 
     audit_all_for_package('scitex-genai')

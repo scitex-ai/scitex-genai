@@ -106,6 +106,8 @@ docs = [
 ]
 all = [
     "scitex-genai[agent]",
+    "scitex-genai[dev]",
+    "scitex-genai[docs]",
     "scitex-genai[gateway]",
     "scitex-genai[litellm]",
     "scitex-genai[ollama]",
