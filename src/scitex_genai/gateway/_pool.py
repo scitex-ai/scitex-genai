@@ -80,6 +80,7 @@ class StickyPool(Generic[M]):
         members: list[M],
         *,
         choose: Callable[[list[M]], M] | None = None,
+        max_sessions: int | None = None,
     ) -> None:
         if not members:
             raise NoAccountAvailable(self.empty_message)
@@ -88,6 +89,12 @@ class StickyPool(Generic[M]):
             raise ValueError(self.duplicate_message)
         self.members = members
         self._sessions: dict[str, str] = {}
+        # ``None`` keeps the table unbounded, which is what every existing
+        # caller had. A bound evicts the OLDEST placement first: the hoist
+        # proxy capped its route table at 512 because a long-lived process
+        # must not grow without limit, and losing a placement only costs a
+        # prefix-cache miss on that session's next turn, never correctness.
+        self._max_sessions = max_sessions
         self._lock = asyncio.Lock()
         self._choose = choose or random.SystemRandom().choice
 
@@ -124,6 +131,12 @@ class StickyPool(Generic[M]):
             selected.in_flight += 1
             selected.last_used_at = now
             if session_id:
+                if (
+                    self._max_sessions is not None
+                    and session_id not in self._sessions
+                    and len(self._sessions) >= self._max_sessions
+                ):
+                    self._sessions.pop(next(iter(self._sessions)))
                 self._sessions[session_id] = selected.alias
             return selected
 

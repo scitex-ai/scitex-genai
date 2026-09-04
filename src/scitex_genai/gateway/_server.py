@@ -16,6 +16,7 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
+from ._inference import InferenceBackend
 
 
 def _request_token(request: Any) -> str:
@@ -51,8 +52,19 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
     return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
 
 
-def create_app(backend: CodexBackend, *, api_key: str | None = None) -> Any:
-    """Create the FastAPI app without importing server dependencies at import time."""
+def create_app(
+    backend: CodexBackend | InferenceBackend, *, api_key: str | None = None
+) -> Any:
+    """Create the FastAPI app without importing server dependencies at import time.
+
+    Two kinds of backend, one surface. A :class:`CodexBackend` has
+    ``/v1/messages`` translated to the Codex Responses protocol; an
+    :class:`InferenceBackend` has it relayed verbatim (after the system hoist)
+    to a pool of Anthropic-compatible inference upstreams, and additionally
+    relays ``GET /v1/*`` so ``/v1/models`` and the like reach the upstream as
+    they did through the hoist proxy. Authentication, ``/health`` and
+    ``/v1/messages/count_tokens`` are the same for both.
+    """
     try:
         from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -62,6 +74,8 @@ def create_app(backend: CodexBackend, *, api_key: str | None = None) -> Any:
     expected_key = api_key or os.getenv("SCITEX_GENAI_GATEWAY_API_KEY", "")
     if not expected_key:
         raise RuntimeError("SCITEX_GENAI_GATEWAY_API_KEY must be set")
+
+    relaying = isinstance(backend, InferenceBackend)
 
     @asynccontextmanager
     async def lifespan(app: Any) -> AsyncIterator[None]:
@@ -84,7 +98,8 @@ def create_app(backend: CodexBackend, *, api_key: str | None = None) -> Any:
         title="SciTeX GenAI Gateway",
         docs_url=None,
         redoc_url=None,
-        lifespan=lifespan,
+        # An inference pool has no quota to poll; only Codex accounts do.
+        lifespan=None if relaying else lifespan,
     )
 
     def authorized(request: Request) -> bool:
@@ -92,6 +107,12 @@ def create_app(backend: CodexBackend, *, api_key: str | None = None) -> Any:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        if relaying:
+            return {
+                "status": "ok",
+                "provider": backend.provider,
+                "upstreams": [upstream.alias for upstream in backend.pool.upstreams],
+            }
         return {
             "status": "ok",
             "provider": "openai-codex",
@@ -104,6 +125,43 @@ def create_app(backend: CodexBackend, *, api_key: str | None = None) -> Any:
             return JSONResponse(_anthropic_error("Invalid API key", "authentication_error"), 401)
         body = await request.json()
         return {"input_tokens": _estimate_tokens(body)}
+
+    if relaying:
+
+        async def relay(request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _anthropic_error("Invalid API key", "authentication_error"), 401
+                )
+            # The query string travels with the path: Claude Code posts to
+            # ``/v1/messages?beta=true`` and the upstream sees exactly that.
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            body = await request.body()
+            try:
+                relayed = await backend.relay(
+                    request.method, target, body=body or None, headers=request.headers
+                )
+            except UpstreamError as exc:
+                return JSONResponse(
+                    _anthropic_error(str(exc), exc.error_type), exc.status_code
+                )
+            return StreamingResponse(
+                relayed.body,
+                status_code=relayed.status_code,
+                media_type=relayed.content_type,
+            )
+
+        @app.post("/v1/messages")
+        async def relay_messages(request: Request) -> Any:
+            return await relay(request)
+
+        @app.get("/v1/{path:path}")
+        async def relay_get(request: Request, path: str) -> Any:
+            return await relay(request)
+
+        return app
 
     @app.post("/v1/messages")
     async def messages(request: Request) -> Any:
