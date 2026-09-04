@@ -8,6 +8,12 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend, CodexTransport
 from ._credentials import CodexCredential
+from ._inference import (
+    InferenceBackend,
+    InferenceUpstream,
+    InferenceUpstreamPool,
+    hoist_system,
+)
 from ._server import create_app
 from ._usage import CodexUsageClient
 
@@ -19,7 +25,11 @@ __all__ = [
     "CodexCredential",
     "CodexTransport",
     "CodexUsageClient",
+    "InferenceBackend",
+    "InferenceUpstream",
+    "InferenceUpstreamPool",
     "anthropic_to_codex",
     "codex_events_to_anthropic",
     "create_app",
+    "hoist_system",
 ]
