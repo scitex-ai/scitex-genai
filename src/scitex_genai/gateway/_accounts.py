@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ._credentials import CodexCredential
 from ._errors import CredentialError, NoAccountAvailable
+from ._pool import StickyPool
 
 
 @dataclass
@@ -42,13 +43,26 @@ class CodexAccount:
         return f"openai:{self.alias}"
 
 
-class CodexAccountPool:
+class CodexAccountPool(StickyPool[CodexAccount]):
     """Select accounts per session and rotate around temporary failures.
+
+    The scheduling lives in :class:`~scitex_genai.gateway._pool.StickyPool` and
+    is shared with any other pool of interchangeable members. What stays here is
+    what is genuinely about Codex: discovering accounts on disk, and recording
+    the two quota percentages its usage API reports.
 
     Every new session uses ``choose`` after quota and concurrent-load
     filtering. This includes a one-account pool: the selector receives a
     one-element list instead of bypassing rotation with a singleton shortcut.
     """
+
+    # The wording is unchanged, and it is per-class for a reason: a pool of
+    # inference upstreams borrowing this scheduling must not refuse with
+    # "All Codex accounts are cooling down".
+    empty_message = "No Codex subscription accounts are configured"
+    duplicate_message = "Codex account aliases must be unique"
+    cooling_message = "All Codex accounts are cooling down"
+    ineligible_message = "Codex account selector returned an ineligible account"
 
     def __init__(
         self,
@@ -56,15 +70,17 @@ class CodexAccountPool:
         *,
         choose: Callable[[list[CodexAccount]], CodexAccount] | None = None,
     ) -> None:
-        if not accounts:
-            raise NoAccountAvailable("No Codex subscription accounts are configured")
-        aliases = [account.alias for account in accounts]
-        if len(set(aliases)) != len(aliases):
-            raise ValueError("Codex account aliases must be unique")
-        self.accounts = accounts
-        self._sessions: dict[str, str] = {}
-        self._lock = asyncio.Lock()
-        self._choose = choose or random.SystemRandom().choice
+        super().__init__(accounts, choose=choose)
+
+    @property
+    def accounts(self) -> list[CodexAccount]:
+        """The pool's members, under the name callers already use.
+
+        ``_usage``, ``_codex`` and ``_server`` all read ``pool.accounts``; the
+        base class stores ``members``. Kept as a property rather than renaming
+        the callers, so this refactor changes no behaviour anywhere else.
+        """
+        return self.members
 
     @classmethod
     def discover(cls, homes: list[Path | str] | None = None) -> "CodexAccountPool":
@@ -126,61 +142,6 @@ class CodexAccountPool:
             if child.is_dir() and (child / "auth.json").is_file()
         )
 
-    async def acquire(
-        self, session_id: str = "", *, exclude: set[str] | None = None
-    ) -> CodexAccount:
-        excluded = exclude or set()
-        async with self._lock:
-            now = time.time()
-            sticky_alias = self._sessions.get(session_id) if session_id else None
-            if sticky_alias and sticky_alias not in excluded:
-                sticky = self._by_alias(sticky_alias)
-                if sticky is not None and sticky.cooldown_until <= now:
-                    sticky.in_flight += 1
-                    sticky.last_used_at = now
-                    return sticky
-
-            candidates = [
-                account
-                for account in self.accounts
-                if account.alias not in excluded and account.cooldown_until <= now
-            ]
-            if not candidates:
-                raise NoAccountAvailable("All Codex accounts are cooling down")
-            best_usage = min(account.usage_score for account in candidates)
-            quota_candidates = [
-                account for account in candidates if account.usage_score == best_usage
-            ]
-            best_load = min(account.in_flight for account in quota_candidates)
-            rotation_candidates = [
-                account
-                for account in quota_candidates
-                if account.in_flight == best_load
-            ]
-            selected = self._choose(rotation_candidates)
-            if all(selected is not candidate for candidate in rotation_candidates):
-                raise ValueError(
-                    "Codex account selector returned an ineligible account"
-                )
-            selected.in_flight += 1
-            selected.last_used_at = now
-            if session_id:
-                self._sessions[session_id] = selected.alias
-            return selected
-
-    async def release(self, account: CodexAccount) -> None:
-        async with self._lock:
-            account.in_flight = max(0, account.in_flight - 1)
-
-    async def cool_down(self, account: CodexAccount, seconds: float) -> None:
-        async with self._lock:
-            account.cooldown_until = max(account.cooldown_until, time.time() + seconds)
-            stale = [
-                key for key, value in self._sessions.items() if value == account.alias
-            ]
-            for key in stale:
-                self._sessions.pop(key, None)
-
     async def update_usage(
         self,
         account: CodexAccount,
@@ -192,8 +153,3 @@ class CodexAccountPool:
             account.primary_used_percent = primary_used_percent
             account.secondary_used_percent = secondary_used_percent
             account.usage_refreshed_at = time.time()
-
-    def _by_alias(self, alias: str) -> CodexAccount | None:
-        return next(
-            (account for account in self.accounts if account.alias == alias), None
-        )
