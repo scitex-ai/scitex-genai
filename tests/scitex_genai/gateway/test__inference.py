@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
@@ -14,6 +15,7 @@ from scitex_genai.gateway._inference import (
     announce,
     conversation_key,
     hoist_system,
+    hoists_on,
     parse_upstreams,
     prefix_report,
     telemetry_enabled,
@@ -403,3 +405,100 @@ async def test_telemetry_sink_receives_a_size_only_report(upstream_factory) -> N
         True,
         False,
     )
+
+
+# ---------------------------------------------------------------------------
+# The OpenAI protocol (2026-09-05, Codex): one sticky key for three shapes,
+# and the hoist confined to the route whose shape asks for it.
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_key_is_unchanged_for_a_hoisted_anthropic_body() -> None:
+    # Arrange -- the fleet's existing bodies must hash exactly as before, or
+    # every sticky assignment flushes on deploy.
+    payload, _ = hoist_system(_request())
+    legacy_seed = json.dumps(
+        [payload.get("system"), payload["messages"][0]], sort_keys=True, default=str
+    )
+    # Act
+    key = conversation_key(payload)
+    # Assert
+    assert key == hashlib.sha256(legacy_seed.encode()).hexdigest()
+
+
+def test_conversation_key_reads_a_responses_body_with_a_string_input() -> None:
+    # Arrange -- Codex's shape: instructions + input, input allowed to be bare.
+    payload = {"model": "m", "instructions": "You are terse.", "input": "Hello"}
+    # Act
+    key = conversation_key(payload)
+    # Assert
+    assert key is not None
+
+
+def test_conversation_key_skips_the_shared_system_message_of_a_chat_body() -> None:
+    # Arrange -- two chat sessions of the same agent in the same cwd share
+    # messages[0]; keying on it would pin both to one replica.
+    shared = {"role": "system", "content": "Same instructions"}
+    one = {"messages": [shared, {"role": "user", "content": "first task"}]}
+    two = {"messages": [shared, {"role": "user", "content": "second task"}]}
+    # Act
+    keys = (conversation_key(one), conversation_key(two))
+    # Assert
+    assert keys[0] != keys[1]
+
+
+def test_hoists_on_is_true_only_for_the_messages_route() -> None:
+    # Arrange
+    paths = ("/v1/messages?beta=true", "/v1/chat/completions", "/v1/responses")
+    # Act
+    verdicts = tuple(hoists_on(path) for path in paths)
+    # Assert
+    assert verdicts == (True, False, False)
+
+
+def test_prepare_without_hoist_forwards_the_bytes_untouched() -> None:
+    # Arrange -- a chat/completions body whose system message must survive.
+    body = json.dumps(
+        {
+            "messages": [
+                {"role": "system", "content": "Keep me"},
+                {"role": "user", "content": "hi"},
+            ]
+        }
+    ).encode()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+    # Act
+    forwarded, _ = backend.prepare(body, hoist=False)
+    # Assert
+    assert forwarded == body
+
+
+@pytest.mark.asyncio
+async def test_relay_keeps_a_chat_completions_system_message_in_place(
+    upstream_factory,
+) -> None:
+    # Arrange -- measured 2026-09-05: hoisting this body made vLLM discard
+    # the instructions silently. The route must not hoist.
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    body = {
+        "messages": [
+            {"role": "system", "content": "Keep me"},
+            {"role": "user", "content": "hi"},
+        ]
+    }
+    # Act
+    relayed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+    await _collect(relayed.body)
+    sent = json.loads(upstream.requests[0]["body"])
+    # Assert
+    assert ("system" in sent, [m["role"] for m in sent["messages"]]) == (
+        False,
+        ["system", "user"],
+    )
+

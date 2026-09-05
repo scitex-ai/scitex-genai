@@ -42,6 +42,23 @@ def _anthropic_error(message: str, error_type: str = "api_error") -> dict[str, A
     return {"type": "error", "error": {"type": error_type, "message": message}}
 
 
+def _openai_error(message: str, error_type: str, status: int) -> dict[str, Any]:
+    """The OpenAI error envelope, for the routes an OpenAI-protocol client calls.
+
+    A gateway-generated refusal on ``/v1/chat/completions`` or
+    ``/v1/responses`` wrapped in the Anthropic envelope reaches Codex as an
+    opaque deserialisation failure instead of "Invalid API key" or the
+    worded upstream refusal. Upstream errors are relayed verbatim either way.
+    """
+    return {"error": {"message": message, "type": error_type, "code": status}}
+
+
+def _error_for(path: str, message: str, error_type: str, status: int) -> dict[str, Any]:
+    if path.startswith("/v1/messages"):
+        return _anthropic_error(message, error_type)
+    return _openai_error(message, error_type, status)
+
+
 def _estimate_tokens(body: dict[str, Any]) -> int:
     """Conservative fallback until a Codex tokenizer is exposed."""
     serialized = json.dumps(
@@ -60,10 +77,12 @@ def create_app(
     Two kinds of backend, one surface. A :class:`CodexBackend` has
     ``/v1/messages`` translated to the Codex Responses protocol; an
     :class:`InferenceBackend` has it relayed verbatim (after the system hoist)
-    to a pool of Anthropic-compatible inference upstreams, and additionally
-    relays ``GET /v1/*`` so ``/v1/models`` and the like reach the upstream as
-    they did through the hoist proxy. Authentication, ``/health`` and
-    ``/v1/messages/count_tokens`` are the same for both.
+    to a pool of inference upstreams that speak BOTH protocols, and
+    additionally relays ``POST /v1/chat/completions`` and ``POST
+    /v1/responses`` untouched (the OpenAI protocol, for Codex — no hoist, no
+    translation) plus ``GET /v1/*`` so ``/v1/models`` and the like reach the
+    upstream as they did through the hoist proxy. Authentication, ``/health``
+    and ``/v1/messages/count_tokens`` are the same for both.
     """
     try:
         from fastapi import FastAPI, Request
@@ -129,13 +148,15 @@ def create_app(
     if relaying:
 
         async def relay(request: Request) -> Any:
+            path = request.url.path
             if not authorized(request):
                 return JSONResponse(
-                    _anthropic_error("Invalid API key", "authentication_error"), 401
+                    _error_for(path, "Invalid API key", "authentication_error", 401),
+                    401,
                 )
             # The query string travels with the path: Claude Code posts to
             # ``/v1/messages?beta=true`` and the upstream sees exactly that.
-            target = request.url.path
+            target = path
             if request.url.query:
                 target = f"{target}?{request.url.query}"
             body = await request.body()
@@ -145,7 +166,8 @@ def create_app(
                 )
             except UpstreamError as exc:
                 return JSONResponse(
-                    _anthropic_error(str(exc), exc.error_type), exc.status_code
+                    _error_for(path, str(exc), exc.error_type, exc.status_code),
+                    exc.status_code,
                 )
             return StreamingResponse(
                 relayed.body,
@@ -155,6 +177,19 @@ def create_app(
 
         @app.post("/v1/messages")
         async def relay_messages(request: Request) -> Any:
+            return await relay(request)
+
+        # The OpenAI protocol, for Codex (2026-09-05). vLLM serves both
+        # routes natively, so the body passes through untouched — no
+        # translation, and no hoist (see ``_inference.hoists_on``). Explicit
+        # routes rather than a POST catch-all: every other POST path stays a
+        # 405 on purpose.
+        @app.post("/v1/chat/completions")
+        async def relay_chat_completions(request: Request) -> Any:
+            return await relay(request)
+
+        @app.post("/v1/responses")
+        async def relay_responses(request: Request) -> Any:
             return await relay(request)
 
         @app.get("/v1/{path:path}")

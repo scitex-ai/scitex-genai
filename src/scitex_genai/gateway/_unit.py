@@ -97,7 +97,7 @@ def render_unit(
         "# that command, so the next host gets the same unit from the same source.\n"
         "\n"
         "[Unit]\n"
-        f"Description=scitex-genai gateway (Anthropic-format relay; settings: {settings})\n"
+        f"Description=scitex-genai gateway (Anthropic + OpenAI protocol relay; settings: {settings})\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
         "\n"
