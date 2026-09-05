@@ -12,6 +12,7 @@ from scitex_genai.gateway._errors import NoAccountAvailable, UpstreamUnreachable
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
+    adapt_openai_roles,
     announce,
     conversation_key,
     hoist_system,
@@ -501,4 +502,76 @@ async def test_relay_keeps_a_chat_completions_system_message_in_place(
         False,
         ["system", "user"],
     )
+
+
+
+
+# ---------------------------------------------------------------------------
+# The developer role (2026-09-05, first live codex turn): vLLM answers 400
+# "Unexpected message role." to it, so the gateway rewrites it to system.
+# ---------------------------------------------------------------------------
+
+
+def test_developer_items_become_system_in_a_responses_body() -> None:
+    # Arrange -- Codex's shape: instructions as a developer item, then the turn.
+    payload = {
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "You are terse."},
+        ]
+    }
+    # Act
+    adapted, _ = adapt_openai_roles(payload)
+    # Assert -- rewritten AND moved first.
+    assert [m["role"] for m in adapted["input"]] == ["system", "user"]
+
+
+def test_developer_messages_become_system_in_a_chat_body() -> None:
+    # Arrange
+    payload = {
+        "messages": [
+            {"role": "developer", "content": "x"},
+            {"role": "user", "content": "y"},
+        ]
+    }
+    # Act
+    adapted, changed = adapt_openai_roles(payload)
+    # Assert
+    assert (adapted["messages"][0]["role"], changed) == ("system", True)
+
+
+def test_a_string_input_is_left_alone() -> None:
+    # Arrange -- the Responses schema allows a bare string.
+    payload = {"input": "hello"}
+    # Act
+    adapted, changed = adapt_openai_roles(payload)
+    # Assert
+    assert (adapted["input"], changed) == ("hello", False)
+
+
+@pytest.mark.asyncio
+async def test_relay_rewrites_the_developer_role_on_the_responses_route(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    body = {
+        "model": "m",
+        "input": [
+            {"role": "developer", "content": "You are terse."},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    # Act
+    relayed = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+    await _collect(relayed.body)
+    sent = json.loads(upstream.requests[0]["body"])
+    # Assert
+    assert [m["role"] for m in sent["input"]] == ["system", "user"]
 
