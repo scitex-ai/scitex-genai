@@ -50,6 +50,7 @@ dependencies = [
     "Pillow",
     "tqdm",
     # SciTeX standalone deps (only those actually imported by src/)
+    "scitex-config>=0.3.6",
     "scitex-dev>=0.11.7",
     "scitex-io>=0.2.0",
     "scitex-str>=0.1.0",

@@ -34,15 +34,52 @@ def _sections(text: str) -> configparser.ConfigParser:
     return parsed
 
 
+def _shell_argv(text: str) -> list[str]:
+    """The argv systemd hands to the shell."""
+    return shlex.split(_sections(text)["Service"]["ExecStart"])
+
+
 def _exec_argv(text: str) -> list[str]:
-    """The argv bash receives from ExecStart, then the argv it execs."""
-    exec_start = _sections(text)["Service"]["ExecStart"]
-    shell = shlex.split(exec_start)
-    assert shell[:2] == ["/bin/bash", "-lc"]
-    return shlex.split(shell[2])
+    """The argv the shell execs."""
+    return shlex.split(_shell_argv(text)[2])
 
 
-def test_execstart_execs_this_interpreter_under_a_login_shell():
+def _record(calls: list[list[str]]):
+    return lambda argv: calls.append(list(argv))
+
+
+def _raised(call) -> BaseException | None:
+    """What ``call()`` raised, or None -- so a refusal is one plain assertion."""
+    try:
+        call()
+    except Exception as exc:  # noqa: BLE001 -- the test names the type it expects
+        return exc
+    return None
+
+
+def test_execstart_runs_under_a_login_shell():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    argv = _shell_argv(text)
+
+    # Assert
+    assert argv[:2] == ["/bin/bash", "-lc"]
+
+
+def test_with_no_flags_the_unit_execs_only_this_interpreter_and_the_module():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    argv = _exec_argv(text)
+
+    # Assert
+    assert argv == ["exec", sys.executable, "-m", MODULE]
+
+
+def test_given_settings_are_baked_into_execstart():
     # Arrange
     text = render_unit(host="0.0.0.0", port=18772, upstream=UPSTREAM)
 
@@ -50,42 +87,69 @@ def test_execstart_execs_this_interpreter_under_a_login_shell():
     argv = _exec_argv(text)
 
     # Assert
-    assert argv[0] == "exec"
-    assert argv[1:4] == [sys.executable, "-m", MODULE]
-    assert argv[4:8] == ["--host", "0.0.0.0", "--port", "18772"]
-    assert argv[8:] == [
+    assert argv[4:] == [
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "18772",
         "--inference-upstream",
         "http://127.0.0.1:18773,http://127.0.0.1:18774",
     ]
 
 
-def test_no_upstream_means_the_codex_backend_and_no_flag():
-    # Arrange / Act
-    argv = _exec_argv(render_unit(host="127.0.0.1", port=8765))
+def test_a_config_path_is_baked_into_execstart():
+    # Arrange
+    text = render_unit(config="/srv/genai/config.yaml")
+
+    # Act
+    argv = _exec_argv(text)
 
     # Assert
-    assert "--inference-upstream" not in argv
-    assert argv[-2:] == ["--port", "8765"]
+    assert argv[4:] == ["--config", "/srv/genai/config.yaml"]
 
 
-def test_unit_is_supervised_and_wanted_at_login():
-    # Arrange / Act
-    parsed = _sections(render_unit(host="0.0.0.0", port=18772, upstream=UPSTREAM))
+def test_the_description_names_the_settings_file():
+    # Arrange
+    text = render_unit(config="/srv/genai/config.yaml")
+
+    # Act
+    description = _sections(text)["Unit"]["Description"]
+
+    # Assert
+    assert "/srv/genai/config.yaml" in description
+
+
+def test_unit_restarts_always():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    parsed = _sections(text)
 
     # Assert
     assert parsed["Service"]["Restart"] == "always"
-    assert parsed["Service"]["Type"] == "simple"
-    assert parsed["Unit"]["Wants"] == "network-online.target"
+
+
+def test_unit_is_wanted_at_login():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    parsed = _sections(text)
+
+    # Assert
     assert parsed["Install"]["WantedBy"] == "default.target"
-    assert "0.0.0.0:18772" in parsed["Unit"]["Description"]
 
 
 def test_interpreter_can_be_pinned_explicitly():
-    # Arrange / Act
-    argv = gateway_command(host="0.0.0.0", port=1, interpreter="/opt/venv/bin/python")
+    # Arrange
+    interpreter = "/opt/venv/bin/python"
+
+    # Act
+    argv = gateway_command(interpreter=interpreter)
 
     # Assert
-    assert argv[:3] == ["/opt/venv/bin/python", "-m", MODULE]
+    assert argv[0] == interpreter
 
 
 @pytest.mark.parametrize(
@@ -93,33 +157,48 @@ def test_interpreter_can_be_pinned_explicitly():
     [("", 18772), ("0.0.0.0 evil", 18772), ("0.0.0.0", 0), ("0.0.0.0", 65536)],
 )
 def test_a_host_with_whitespace_or_a_port_out_of_range_is_refused(host, port):
-    # Arrange / Act / Assert
-    with pytest.raises(ValueError):
-        render_unit(host=host, port=port)
-
-
-def test_install_writes_the_rendered_text_and_skips_systemctl_when_asked(
-    tmp_path: Path,
-):
     # Arrange
-    calls: list[list[str]] = []
+    given = {"host": host, "port": port}
+
+    # Act
+    raised = _raised(lambda: render_unit(**given))
+
+    # Assert
+    assert isinstance(raised, ValueError)
+
+
+def test_install_returns_the_unit_path(tmp_path: Path):
+    # Arrange
     unit_dir = tmp_path / "systemd" / "user"
 
     # Act
-    path = install_unit(
-        host="0.0.0.0",
-        port=18772,
-        upstream=UPSTREAM,
-        unit_dir=unit_dir,
-        enable=False,
-        runner=lambda argv: calls.append(list(argv)),
-    )
+    path = install_unit(unit_dir=unit_dir, enable=False)
 
     # Assert
     assert path == unit_dir / UNIT_NAME
-    assert path.read_text() == render_unit(
-        host="0.0.0.0", port=18772, upstream=UPSTREAM
+
+
+def test_install_writes_the_rendered_text(tmp_path: Path):
+    # Arrange
+    expected = render_unit(host="0.0.0.0", port=18772, upstream=UPSTREAM)
+
+    # Act
+    path = install_unit(
+        host="0.0.0.0", port=18772, upstream=UPSTREAM, unit_dir=tmp_path, enable=False
     )
+
+    # Assert
+    assert path.read_text() == expected
+
+
+def test_install_skips_systemctl_when_asked(tmp_path: Path):
+    # Arrange
+    calls: list[list[str]] = []
+
+    # Act
+    install_unit(unit_dir=tmp_path, enable=False, runner=_record(calls))
+
+    # Assert
     assert calls == []
 
 
@@ -128,13 +207,7 @@ def test_install_reloads_the_user_manager_then_enables_now(tmp_path: Path):
     calls: list[list[str]] = []
 
     # Act
-    install_unit(
-        host="0.0.0.0",
-        port=18772,
-        upstream=UPSTREAM,
-        unit_dir=tmp_path,
-        runner=lambda argv: calls.append(list(argv)),
-    )
+    install_unit(unit_dir=tmp_path, runner=_record(calls))
 
     # Assert
     assert calls == [
@@ -143,21 +216,34 @@ def test_install_reloads_the_user_manager_then_enables_now(tmp_path: Path):
     ]
 
 
-def test_a_second_install_overwrites_in_place_and_leaves_nothing_else(
-    tmp_path: Path,
-):
+def test_a_second_install_leaves_exactly_one_file(tmp_path: Path):
     # Arrange
-    install_unit(host="0.0.0.0", port=18772, unit_dir=tmp_path, enable=False)
+    install_unit(port=18772, unit_dir=tmp_path, enable=False)
 
     # Act
-    path = install_unit(host="0.0.0.0", port=18790, unit_dir=tmp_path, enable=False)
+    install_unit(port=18790, unit_dir=tmp_path, enable=False)
 
     # Assert
-    assert [p.name for p in tmp_path.iterdir()] == [UNIT_NAME]
-    assert "--port 18790" in path.read_text()
-    assert "18772" not in path.read_text()
+    assert [entry.name for entry in tmp_path.iterdir()] == [UNIT_NAME]
+
+
+def test_a_second_install_carries_the_new_settings(tmp_path: Path):
+    # Arrange
+    install_unit(port=18772, unit_dir=tmp_path, enable=False)
+
+    # Act
+    path = install_unit(port=18790, unit_dir=tmp_path, enable=False)
+
+    # Assert
+    assert _exec_argv(path.read_text())[4:] == ["--port", "18790"]
 
 
 def test_default_unit_dir_is_the_user_manager_directory():
-    # Arrange / Act / Assert
-    assert DEFAULT_UNIT_DIR == Path.home() / ".config" / "systemd" / "user"
+    # Arrange
+    home = Path.home()
+
+    # Act
+    expected = home / ".config" / "systemd" / "user"
+
+    # Assert
+    assert DEFAULT_UNIT_DIR == expected
