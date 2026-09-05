@@ -143,6 +143,7 @@ def main(argv: list[str] | None = None) -> None:
             pool,
             timeout_s=float(os.getenv(TIMEOUT_ENV, DEFAULT_TIMEOUT_S)),
             telemetry_sink=_telemetry_sink(),
+            journal=lambda line: print(line, flush=True),
         )
         print(announce(settings.host, settings.port, pool), flush=True)
     else:
