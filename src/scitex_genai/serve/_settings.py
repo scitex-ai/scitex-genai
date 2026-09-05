@@ -20,6 +20,8 @@ an error that names the file, not a silent launch into the wrong place.
       bastion_user: me
       proxy_command: "~/bin/cloudflared access ssh --hostname bastion.example.org"  # optional
       litellm_master_key: sk-local           # or SCITEX_SERVE_LITELLM_MASTER_KEY
+      serve_bin: /scratch/.../vllm-venv/bin/scitex-genai-serve   # default: beside vllm_bin
+      srun_bin: /apps/slurm/latest/bin/srun  # optional; pin it when srun is not on the batch PATH
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ class ServeSettings:
     litellm_master_key: str
     cuda_home: Path | None = None
     proxy_command: str = ""
+    serve_bin: Path | None = None
+    srun_bin: Path | None = None
     source: Path | None = None
 
     def __post_init__(self) -> None:
@@ -61,6 +65,14 @@ class ServeSettings:
         if self.cuda_home is not None and not Path(self.cuda_home).is_absolute():
             raise ValueError(
                 f"serve.cuda_home must be absolute, got {str(self.cuda_home)!r}"
+            )
+        for name in ("serve_bin", "srun_bin"):
+            value = getattr(self, name)
+            if value is not None and not Path(value).is_absolute():
+                raise ValueError(f"serve.{name} must be absolute, got {str(value)!r}")
+        if self.serve_bin is None:
+            object.__setattr__(
+                self, "serve_bin", Path(self.vllm_bin).parent / "scitex-genai-serve"
             )
         for name in ("bastion", "bastion_user", "litellm_master_key"):
             value = getattr(self, name)
@@ -97,5 +109,7 @@ def load_serve_settings(config_path: Path | str | None = None) -> ServeSettings:
         litellm_master_key=str(get("litellm_master_key") or ""),
         cuda_home=Path(str(get("cuda_home"))) if get("cuda_home") else None,
         proxy_command=str(get("proxy_command", "") or ""),
+        serve_bin=Path(str(get("serve_bin"))) if get("serve_bin") else None,
+        srun_bin=Path(str(get("srun_bin"))) if get("srun_bin") else None,
         source=path,
     )
