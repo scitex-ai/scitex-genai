@@ -218,6 +218,59 @@ def _item_text(item: Any) -> str:
     return ""
 
 
+def repair_tool_call_arguments(payload: Any) -> tuple[Any, int]:
+    """Make every tool-call ``arguments`` string parse as JSON before relaying.
+
+    Measured 2026-09-05 17:58Z (handyman-01, Codex CLI -> this gateway ->
+    vLLM 0.28.0 with ``--tool-call-parser qwen3_xml``): the model emitted one
+    function_call whose ``arguments`` was cut at 97 characters with a leaked
+    ``</parameter`` tag. Codex stores the item and re-sends the whole
+    conversation on every turn, and vLLM's Responses endpoint json-decodes
+    every ``function_call.arguments`` on input, so from then on EVERY request
+    of that conversation answered ``400 Expecting value: line 1 column 98``
+    and the session was dead for good. One bad tool call must not do that.
+
+    A string that is not JSON is replaced by a JSON object that carries it,
+    ``{"_invalid_arguments": "<original>"}`` — the model still sees what it
+    said, the upstream accepts the item, and the turn continues. Both the
+    Responses shape (``input[].type == "function_call"``) and the chat shape
+    (``messages[].tool_calls[].function``) are covered. Pure; returns
+    ``(payload, repaired_count)``. Never touches anything that already parses.
+    """
+    if not isinstance(payload, dict):
+        return payload, 0
+    repaired = 0
+
+    def _fix(args: Any) -> Any:
+        nonlocal repaired
+        if not isinstance(args, str):
+            return args
+        try:
+            json.loads(args)
+        except ValueError:
+            repaired += 1
+            return json.dumps({"_invalid_arguments": args})
+        return args
+
+    items = payload.get("input")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                if "arguments" in item:
+                    item["arguments"] = _fix(item["arguments"])
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and "arguments" in function:
+                    function["arguments"] = _fix(function["arguments"])
+    return payload, repaired
+
+
 def adapt_openai_roles(payload: Any) -> tuple[Any, bool]:
     """Leave the upstream exactly ONE system preamble, at the front.
 
@@ -479,7 +532,14 @@ class InferenceBackend:
                     payload, hoisted = hoist_system(payload)
                 else:
                     payload, adapted = adapt_openai_roles(payload)
-                    hoisted = int(adapted)
+                    payload, repaired = repair_tool_call_arguments(payload)
+                    if repaired:
+                        self._note(
+                            f"[relay] repaired {repaired} tool-call argument "
+                            "string(s) that were not JSON (kept under "
+                            "_invalid_arguments)"
+                        )
+                    hoisted = int(adapted) + repaired
                 key = conversation_key(payload)
                 if self.telemetry_sink is not None:
                     # Telemetry must NEVER affect the request path. A broad
