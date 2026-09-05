@@ -45,10 +45,16 @@ CACHE_SUBDIRS = {
 
 @dataclass(frozen=True)
 class Launch:
-    """Everything ``_run`` executes for one engine, as data."""
+    """Everything ``_run`` executes for one engine, as data.
+
+    ``env`` is the engine's environment (caches under the engine cache, HOME
+    redirected there); ``tunnel_env`` is the UNCHANGED caller environment,
+    because ssh needs the real HOME for its keys and known_hosts.
+    """
 
     key: str
     env: dict[str, str]
+    tunnel_env: dict[str, str]
     cache_dir: Path
     vllm_argv: tuple[str, ...]
     litellm_config_path: Path
@@ -191,6 +197,7 @@ def render(
     return Launch(
         key=conf.key,
         env=child_env(settings, conf, base_env),
+        tunnel_env=dict(base_env),
         cache_dir=cache_dir(settings, conf),
         vllm_argv=vllm_argv(settings, conf),
         litellm_config_path=litellm_path,

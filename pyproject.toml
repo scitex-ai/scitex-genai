@@ -116,6 +116,7 @@ all = [
 
 [project.scripts]
 scitex-genai-gateway = "scitex_genai.gateway._cli:main"
+scitex-genai-serve = "scitex_genai.serve._cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ywatanabe1989/scitex-genai"

@@ -31,6 +31,8 @@ Nothing here names a model, a site or a host.
 
 from __future__ import annotations
 
+import os
+import re
 import shlex
 import tempfile
 from dataclasses import dataclass, field
@@ -48,6 +50,29 @@ REQUIRED = (
 )
 KNOWN = REQUIRED + ("TP", "GPU_MEM_UTIL", "MAX_NUM_SEQS", "EXTRA_VLLM_ARGS")
 CONF_SUFFIX = ".conf"
+_REF = re.compile(
+    r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def expand(value: str, env: dict[str, str] | None = None) -> str:
+    """The two shell forms a conf uses: ``${NAME:-default}`` and ``$NAME`` / ``${NAME}``.
+
+    A conf line like ``export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}`` is
+    how an operator makes a flag overridable from the environment; sourcing
+    expanded it, so this reader must too, or the engine receives the literal
+    text ``${VLLM_USE_DEEP_GEMM:-1}`` as its setting.
+    """
+    source = os.environ if env is None else env
+
+    def sub(match: re.Match[str]) -> str:
+        name = match.group("name") or match.group("bare")
+        current = source.get(name)
+        if current:
+            return current
+        return match.group("default") or ""
+
+    return _REF.sub(sub, value)
 
 
 def default_models_dir() -> Path:
@@ -131,9 +156,22 @@ def _values(text: str, source: Path | None) -> dict[str, str]:
         temp.unlink(missing_ok=True)
 
 
-def parse_engine_conf(key: str, text: str, source: Path | None = None) -> EngineConf:
-    """Build an :class:`EngineConf` from the text of a ``<KEY>.conf``."""
-    values = _values(text, source)
+def parse_engine_conf(
+    key: str,
+    text: str,
+    source: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> EngineConf:
+    """Build an :class:`EngineConf` from the text of a ``<KEY>.conf``.
+
+    ``env`` is what ``${NAME:-default}`` references resolve against; the
+    process environment when None, exactly as sourcing would.
+    """
+    # Expand the shell references on the RAW text, before the ecosystem parser
+    # sees it: that parser resolves \$NAME against the process environment and
+    # knows nothing of ${NAME:-default}, so an unset name would come back empty.
+    expanded = "\n".join(expand(line, env) for line in text.splitlines())
+    values = _values(expanded, None)
     missing = [name for name in REQUIRED if not values.get(name)]
     if missing:
         where = str(source) if source is not None else f"{key}{CONF_SUFFIX}"
@@ -169,11 +207,13 @@ def list_engines(models_dir: Path | None = None) -> list[str]:
     return sorted(p.stem for p in directory.glob(f"*{CONF_SUFFIX}") if p.is_file())
 
 
-def load_engine(key: str, models_dir: Path | None = None) -> EngineConf:
+def load_engine(
+    key: str, models_dir: Path | None = None, env: dict[str, str] | None = None
+) -> EngineConf:
     """Read and validate ``<models_dir>/<key>.conf``."""
     directory = Path(models_dir) if models_dir is not None else default_models_dir()
     path = directory / f"{key}{CONF_SUFFIX}"
     if not path.is_file():
         available = ", ".join(list_engines(directory)) or "none"
         raise FileNotFoundError(f"no engine conf {path}; available: {available}")
-    return parse_engine_conf(key, path.read_text(), source=path)
+    return parse_engine_conf(key, path.read_text(), source=path, env=env)

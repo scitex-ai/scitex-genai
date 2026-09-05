@@ -15,6 +15,7 @@ from scitex_config import get_scitex_dir
 from scitex_genai.serve._conf import (
     EngineConf,
     default_models_dir,
+    expand,
     exported_names,
     list_engines,
     load_engine,
@@ -214,3 +215,42 @@ def test_default_models_dir_is_under_the_scitex_dir():
 
     # Assert
     assert path == scitex_dir / "genai" / "models.d"
+
+
+def test_a_shell_default_expands_to_its_default_when_unset():
+    # Arrange
+    text = CONF.replace(
+        "export VLLM_USE_DEEP_GEMM=1\n",
+        "export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}\n",
+    )
+
+    # Act
+    conf = parse_engine_conf("model-a", text, env={})
+
+    # Assert
+    assert conf.env["VLLM_USE_DEEP_GEMM"] == "1"
+
+
+def test_a_shell_default_yields_to_the_environment():
+    # Arrange
+    text = CONF.replace(
+        "export VLLM_USE_DEEP_GEMM=1\n",
+        "export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}\n",
+    )
+
+    # Act
+    conf = parse_engine_conf("model-a", text, env={"VLLM_USE_DEEP_GEMM": "0"})
+
+    # Assert
+    assert conf.env["VLLM_USE_DEEP_GEMM"] == "0"
+
+
+def test_expand_handles_bare_and_braced_references():
+    # Arrange
+    env = {"BASE": "/scratch/site"}
+
+    # Act
+    value = expand("$BASE/hf:${BASE}/x:${MISSING:-d}:${GONE}", env)
+
+    # Assert
+    assert value == "/scratch/site/hf:/scratch/site/x:d:"
