@@ -59,7 +59,12 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ._errors import NoAccountAvailable, UpstreamUnreachable
+from ._errors import (
+    HomeMemberReloading,
+    NoAccountAvailable,
+    UpstreamReloading,
+    UpstreamUnreachable,
+)
 from ._pool import StickyPool
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
@@ -80,6 +85,12 @@ MAX_ROUTES = 512
 #: mid-task each time. Cooling the member lets the same request try the next
 #: one; a later request probes it again.
 UNREACHABLE_COOLDOWN_S = 30.0
+#: How long a conversation stays pinned to a home upstream that just went out
+#: of rotation before it may be re-placed on another. Above the ~90 s a vLLM
+#: engine takes to reload after a crash (measured 2026-09-05, Qwen pair), so a
+#: request that killed one replica is not handed to the other by the harness's
+#: immediate retry. A home that is STILL out after this is treated as gone.
+HOME_FAILOVER_AFTER_S = 150.0
 
 #: Never forwarded. The script dropped the first three; ``transfer-encoding``
 #: joins them because the server has already de-chunked the body it hands us.
@@ -312,6 +323,8 @@ class InferenceUpstream:
     in_flight: int = 0
     last_used_at: float = 0.0
     cooldown_until: float = 0.0
+    #: When this upstream last went out of rotation (None = healthy).
+    cooling_since: float | None = None
 
     @property
     def base_url(self) -> str:
@@ -354,7 +367,10 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
     ) -> None:
         self._next_placement = 0
         super().__init__(
-            upstreams, choose=choose or self._round_robin, max_sessions=max_sessions
+            upstreams,
+            choose=choose or self._round_robin,
+            max_sessions=max_sessions,
+            failover_after_s=HOME_FAILOVER_AFTER_S,
         )
 
     @property
@@ -484,6 +500,13 @@ class InferenceBackend:
         while len(attempted) < len(self.pool.upstreams):
             try:
                 upstream = await self.pool.acquire(session, exclude=attempted)
+            except HomeMemberReloading as exc:
+                raise UpstreamReloading(
+                    f"{exc}. Retry this conversation after "
+                    f"{exc.retry_after_s:.0f}s; it stays pinned to its home "
+                    f"upstream while that upstream reloads.",
+                    retry_after_s=exc.retry_after_s,
+                ) from exc
             except NoAccountAvailable as exc:
                 failures.append(str(exc))
                 break

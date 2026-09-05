@@ -8,7 +8,11 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from scitex_genai.gateway._errors import NoAccountAvailable, UpstreamUnreachable
+from scitex_genai.gateway._errors import (
+    NoAccountAvailable,
+    UpstreamReloading,
+    UpstreamUnreachable,
+)
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
@@ -378,10 +382,13 @@ async def test_relay_refuses_naming_inference_upstreams_when_none_answers(
 
 
 @pytest.mark.asyncio
-async def test_relay_refuses_with_the_cooling_message_while_all_are_cooling(
+async def test_relay_holds_a_conversation_whose_home_just_died(
     dead_url_factory,
 ) -> None:
-    # Arrange
+    # Arrange -- the conversation was placed on the one upstream, which then
+    # produced no response. Measured 2026-09-05: re-placing it elsewhere is how
+    # the request that killed one replica killed the other. The home stays
+    # pinned and the caller is told to retry.
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(dead_url_factory()))
     body = json.dumps(_request()).encode()
     with contextlib.suppress(UpstreamUnreachable):
@@ -390,6 +397,26 @@ async def test_relay_refuses_with_the_cooling_message_while_all_are_cooling(
     # Act
     async def relay() -> None:
         await backend.relay("POST", "/v1/messages", body=body, headers={})
+
+    # Assert
+    with pytest.raises(UpstreamReloading, match="stays pinned to its home upstream"):
+        await relay()
+
+
+@pytest.mark.asyncio
+async def test_relay_refuses_with_the_cooling_message_while_all_are_cooling(
+    dead_url_factory,
+) -> None:
+    # Arrange -- a body with no conversation key has no home to wait for; when
+    # every upstream is cooling it gets the honest "all cooling" refusal.
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(dead_url_factory()))
+    keyless = json.dumps({"model": "m", "max_tokens": 8}).encode()
+    with contextlib.suppress(UpstreamUnreachable):
+        await backend.relay("POST", "/v1/messages", body=keyless, headers={})
+
+    # Act
+    async def relay() -> None:
+        await backend.relay("POST", "/v1/messages", body=keyless, headers={})
 
     # Assert
     with pytest.raises(
