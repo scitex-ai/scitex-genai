@@ -516,6 +516,30 @@ async def test_the_journal_says_which_request_went_where_and_how_it_ended(
 
 
 @pytest.mark.asyncio
+async def test_the_journal_is_written_without_the_prefix_telemetry_opt_in(
+    upstream_factory,
+) -> None:
+    # Arrange -- no telemetry sink (the production default until the env
+    # flag is set); only the journal is wired, as the CLI now does.
+    # Measured 2026-09-05: with the journal behind the opt-in flag, a night
+    # of relayed requests left zero [relay] lines to join a crash against.
+    upstream = upstream_factory()
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url), journal=lines.append
+    )
+
+    # Act
+    relayed = await backend.relay(
+        "POST", "/v1/messages", body=json.dumps(_request()).encode(), headers={}
+    )
+    await _collect(relayed.body)
+
+    # Assert
+    assert [line.startswith("[relay]") for line in lines] == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_the_journal_names_the_upstream_that_gave_no_response(
     dead_url_factory,
 ) -> None:

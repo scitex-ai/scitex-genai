@@ -437,20 +437,27 @@ class InferenceBackend:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         telemetry_sink: Callable[[str], None] | None = None,
         wait_for_home_s: float = WAIT_FOR_HOME_S,
+        journal: Callable[[str], None] | None = None,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
         self.wait_for_home_s = wait_for_home_s
+        # The request journal ([relay] lines) is separate from the opt-in
+        # prefix telemetry: it carries no payload and it is the only record
+        # of which request went to which upstream, so the CLI always wires
+        # it. Falls back to the telemetry sink so tests capture both.
+        self.journal = journal
         # ``None`` means the prefix telemetry is off. The library never picks
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
 
     def _note(self, line: str) -> None:
         """One journal line. Never affects the request path (see prepare)."""
-        if self.telemetry_sink is None:
+        sink = self.journal or self.telemetry_sink
+        if sink is None:
             return
         try:
-            self.telemetry_sink(line)
+            sink(line)
         except Exception:  # noqa: BLE001
             pass
 
