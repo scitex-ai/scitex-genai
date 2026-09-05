@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-05
+
+### Added
+
+- Gateway: relay of Anthropic `/v1/messages` to a pool of local inference
+  upstreams (vLLM / LiteLLM) with sticky per-conversation selection and
+  health-aware reselection around a dead member (`--inference-upstream`,
+  `HOIST_UPSTREAM`). Replaces the hand-run hoist proxy.
+- Gateway: settings from `~/.scitex/genai/config.yaml` through scitex-config
+  (direct -> file -> environment -> default), and
+  `scitex-genai-gateway install-unit`, which writes, reloads and enables the
+  systemd user unit from the package (login-shell ExecStart so the profile
+  supplies `SCITEX_GENAI_GATEWAY_API_KEY`).
+- Serve surface for local model engines (`scitex_genai.serve`): engine confs
+  from `~/.scitex/genai/models.d/<key>.conf` (bash-style, `${NAME:-default}`
+  expanded), site settings from the `serve:` section, a pure launch renderer
+  (engine env with a per-engine node-local cache, vLLM argv, generated LiteLLM
+  sidecar config, un-multiplexed reverse tunnel), progress-bounded readiness
+  (no fixed timeout while the JIT cache is still growing), a supervising
+  runner, the node-side `scitex-genai-serve <key>` console script, and the
+  fleet-side `scitex-genai-serve launch` that renders a lease hold body and
+  books a persistent scitex-hpc lease with it (`[serve]` extra).
+
+### Changed
+
+- The gateway's upstream pool is backend-neutral (`StickyPool`), shared by the
+  Codex-account and inference-upstream backends.
+- `scitex-config` and, for the `serve` extra, `scitex-hpc` are declared
+  dependencies.
+
 ## [0.1.4] - 2026-07-19
 
 ### Added
