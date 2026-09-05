@@ -92,6 +92,16 @@ UNREACHABLE_COOLDOWN_S = 30.0
 #: request that killed one replica is not handed to the other by the harness's
 #: immediate retry. A home that is STILL out after this is treated as gone.
 HOME_FAILOVER_AFTER_S = 150.0
+#: How long one request will WAIT, inside the relay, for its reloading home
+#: upstream before the caller is told to retry. Measured 2026-09-05: Codex
+#: treats a 503 as the end of its turn rather than backing off, so the 503 +
+#: Retry-After of #45 protected the surviving replica and killed the agent's
+#: task. Waiting here keeps the client's request open across the ~90 s vLLM
+#: reload; past this bound the 503 still goes out.
+WAIT_FOR_HOME_S = 170.0
+#: One sleep slice while waiting; the pool's retry hint is capped to this so a
+#: home that comes back early is used early.
+WAIT_SLICE_S = 5.0
 
 #: Never forwarded. The script dropped the first three; ``transfer-encoding``
 #: joins them because the server has already de-chunked the body it hands us.
@@ -426,9 +436,11 @@ class InferenceBackend:
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         telemetry_sink: Callable[[str], None] | None = None,
+        wait_for_home_s: float = WAIT_FOR_HOME_S,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
+        self.wait_for_home_s = wait_for_home_s
         # ``None`` means the prefix telemetry is off. The library never picks
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
@@ -507,13 +519,30 @@ class InferenceBackend:
         }
         attempted: set[str] = set()
         failures: list[str] = []
+        waited = 0.0
         while len(attempted) < len(self.pool.upstreams):
             try:
                 upstream = await self.pool.acquire(session, exclude=attempted)
             except HomeMemberReloading as exc:
+                if waited < self.wait_for_home_s:
+                    # Wait it out here rather than hand the caller a 503: the
+                    # home is reloading, the request stays open, and the
+                    # upstream is tried again as soon as its cooldown lapses.
+                    # Time passed, so an upstream that gave no response is a
+                    # candidate again.
+                    slice_s = min(max(exc.retry_after_s, 0.1), WAIT_SLICE_S)
+                    self._note(
+                        f"[relay] conv={session[:8] or '-'} waiting {slice_s:.0f}s "
+                        f"for its home (waited {waited:.0f}s of "
+                        f"{self.wait_for_home_s:.0f}s): {exc}"
+                    )
+                    await asyncio.sleep(slice_s)
+                    waited += slice_s
+                    attempted.clear()
+                    continue
                 self._note(
                     f"[relay] conv={session[:8] or '-'} held: {exc} "
-                    f"(retry after {exc.retry_after_s:.0f}s)"
+                    f"(retry after {exc.retry_after_s:.0f}s; waited {waited:.0f}s)"
                 )
                 raise UpstreamReloading(
                     f"{exc}. Retry this conversation after "

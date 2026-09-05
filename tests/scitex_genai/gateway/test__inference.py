@@ -389,7 +389,9 @@ async def test_relay_holds_a_conversation_whose_home_just_died(
     # produced no response. Measured 2026-09-05: re-placing it elsewhere is how
     # the request that killed one replica killed the other. The home stays
     # pinned and the caller is told to retry.
-    backend = InferenceBackend(InferenceUpstreamPool.from_urls(dead_url_factory()))
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(dead_url_factory()), wait_for_home_s=0.0
+    )
     body = json.dumps(_request()).encode()
     with contextlib.suppress(UpstreamUnreachable):
         await backend.relay("POST", "/v1/messages", body=body, headers={})
@@ -401,6 +403,38 @@ async def test_relay_holds_a_conversation_whose_home_just_died(
     # Assert
     with pytest.raises(UpstreamReloading, match="stays pinned to its home upstream"):
         await relay()
+
+
+@pytest.mark.asyncio
+async def test_relay_waits_out_a_reloading_home_and_then_serves_from_it(
+    upstream_factory,
+) -> None:
+    # Arrange -- the conversation's home is live but was marked cooling a
+    # moment ago with a short cooldown: the shape of a replica mid-reload.
+    # Measured 2026-09-05: Codex ends its turn on a 503, so the relay must
+    # keep the request open and try the home again once its cooldown lapses.
+    upstream = upstream_factory()
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url), telemetry_sink=lines.append
+    )
+    body = json.dumps(_request()).encode()
+    first = await backend.relay("POST", "/v1/messages", body=body, headers={})
+    await _collect(first.body)
+    home = backend.pool.upstreams[0]
+    await backend.pool.cool_down(home, 0.3)
+
+    # Act
+    relayed = await backend.relay("POST", "/v1/messages", body=body, headers={})
+    await _collect(relayed.body)
+
+    # Assert -- served by the home after a wait, never refused.
+    waited = [line for line in lines if "waiting" in line and "for its home" in line]
+    assert (relayed.status_code, len(upstream.requests), len(waited) >= 1) == (
+        200,
+        2,
+        True,
+    )
 
 
 @pytest.mark.asyncio
