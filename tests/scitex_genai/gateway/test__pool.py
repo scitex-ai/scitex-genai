@@ -74,9 +74,12 @@ async def test_a_session_whose_home_just_went_out_is_held_not_moved() -> None:
     await pool.release(await pool.acquire("conv-1"))
     await pool.cool_down(alpha, 30.0)
     alpha.cooling_since = time.time() - 5.0
-    # Act / Assert -- the session is refused with a retry hint, not handed to beta.
-    with pytest.raises(HomeMemberReloading):
+    # Act
+    with pytest.raises(HomeMemberReloading) as refused:
         await pool.acquire("conv-1")
+    # Assert -- refused with a retry hint that fits the window, not handed to beta.
+    assert 0.0 < refused.value.retry_after_s <= 150.0
+    assert beta.in_flight == 0
 
 
 @pytest.mark.asyncio
