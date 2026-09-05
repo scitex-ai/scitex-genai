@@ -39,7 +39,7 @@ import time
 from collections.abc import Callable
 from typing import Generic, Protocol, TypeVar
 
-from ._errors import NoAccountAvailable
+from ._errors import HomeMemberReloading, NoAccountAvailable
 
 
 class PoolMember(Protocol):
@@ -56,6 +56,12 @@ class PoolMember(Protocol):
 
 
 M = TypeVar("M", bound=PoolMember)
+
+
+def _mark_healthy(member: object) -> None:
+    """A member handed out past its cooldown is healthy again: clear the clock."""
+    if getattr(member, "cooling_since", None) is not None:
+        member.cooling_since = None  # type: ignore[attr-defined]
 
 
 class StickyPool(Generic[M]):
@@ -81,6 +87,7 @@ class StickyPool(Generic[M]):
         *,
         choose: Callable[[list[M]], M] | None = None,
         max_sessions: int | None = None,
+        failover_after_s: float = 0.0,
     ) -> None:
         if not members:
             raise NoAccountAvailable(self.empty_message)
@@ -95,10 +102,18 @@ class StickyPool(Generic[M]):
         # must not grow without limit, and losing a placement only costs a
         # prefix-cache miss on that session's next turn, never correctness.
         self._max_sessions = max_sessions
+        # How long a session's sticky member may be cooling before the session
+        # is re-placed elsewhere. 0 keeps the old behaviour (immediate failover).
+        # The inference pool sets it above an engine's reload time, because a
+        # member that died SECONDS ago is reloading, and the request that
+        # killed it must not be the next thing the survivor receives.
+        self._failover_after_s = failover_after_s
         self._lock = asyncio.Lock()
         self._choose = choose or random.SystemRandom().choice
 
-    async def acquire(self, session_id: str = "", *, exclude: set[str] | None = None) -> M:
+    async def acquire(
+        self, session_id: str = "", *, exclude: set[str] | None = None
+    ) -> M:
         excluded = exclude or set()
         async with self._lock:
             now = time.time()
@@ -106,10 +121,26 @@ class StickyPool(Generic[M]):
             if sticky_alias and sticky_alias not in excluded:
                 sticky = self._by_alias(sticky_alias)
                 if sticky is not None and sticky.cooldown_until <= now:
+                    _mark_healthy(sticky)
                     sticky.in_flight += 1
                     sticky.last_used_at = now
                     return sticky
+                if sticky is not None and self._failover_after_s > 0:
+                    since = getattr(sticky, "cooling_since", None)
+                    cooling_for = now - since if since is not None else 0.0
+                    if cooling_for < self._failover_after_s:
+                        retry_after = max(1.0, sticky.cooldown_until - now)
+                        raise HomeMemberReloading(
+                            f"home member {sticky.alias} went out of rotation "
+                            f"{cooling_for:.0f}s ago; not failing this session "
+                            f"over for {self._failover_after_s:.0f}s",
+                            retry_after_s=retry_after,
+                        )
 
+            if sticky_alias and sticky_alias not in excluded:
+                # Past the hold window (or no hold configured): the session
+                # is re-placed below; forget the stale pin explicitly.
+                self._sessions.pop(session_id, None)
             candidates = [
                 member
                 for member in self.members
@@ -128,6 +159,7 @@ class StickyPool(Generic[M]):
             selected = self._choose(rotation_candidates)
             if all(selected is not candidate for candidate in rotation_candidates):
                 raise ValueError(self.ineligible_message)
+            _mark_healthy(selected)
             selected.in_flight += 1
             selected.last_used_at = now
             if session_id:
@@ -146,7 +178,15 @@ class StickyPool(Generic[M]):
 
     async def cool_down(self, member: M, seconds: float) -> None:
         async with self._lock:
-            member.cooldown_until = max(member.cooldown_until, time.time() + seconds)
+            now = time.time()
+            member.cooldown_until = max(member.cooldown_until, now + seconds)
+            if getattr(member, "cooling_since", None) is None:
+                member.cooling_since = now
+            if self._failover_after_s > 0:
+                # Keep the sessions pinned: acquire() holds them (503, retry)
+                # until the member has been out for failover_after_s, and only
+                # then re-places them. See HomeMemberReloading.
+                return
             # Forget the sessions pinned here, or they queue behind a member
             # that was deliberately taken out of rotation.
             stale = [
@@ -156,6 +196,4 @@ class StickyPool(Generic[M]):
                 self._sessions.pop(key, None)
 
     def _by_alias(self, alias: str) -> M | None:
-        return next(
-            (member for member in self.members if member.alias == alias), None
-        )
+        return next((member for member in self.members if member.alias == alias), None)
