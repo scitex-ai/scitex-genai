@@ -79,7 +79,7 @@ async def test_a_session_whose_home_just_went_out_is_held_not_moved() -> None:
         await pool.acquire("conv-1")
 
     # Assert -- refused with a retry hint, not handed to beta.
-    with pytest.raises(HomeMemberReloading, match="reloading"):
+    with pytest.raises(HomeMemberReloading, match="went out of rotation"):
         await acquire_again()
 
 
