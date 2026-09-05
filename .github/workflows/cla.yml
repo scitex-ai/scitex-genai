@@ -23,4 +23,16 @@ jobs:
     uses: scitex-ai/.github/.github/workflows/cla.yml@main
     with:
       owner_allowlist: "bot*,ywatanabe1989,LLEmacs"
-    secrets: inherit
+      # PIN THE DESTINATION EXPLICITLY (PS-224). This job runs under
+      # `issue_comment` / `pull_request_target`, which an outsider can
+      # trigger and which bypass the fork-PR approval gate. An ephemeral
+      # hosted VM is the safe destination for that: a compromise costs one
+      # disposable runner, not the persistent self-hosted pool whose $HOME
+      # holds the fleet credential. Same call as scitex-hub and sac.
+      runs_on: '["ubuntu-latest"]'
+    # ONE SECRET, NOT ALL OF THEM. `secrets: inherit` forwarded EVERY secret
+    # this repo holds into a job an outsider can start. The callee declares
+    # this single secret precisely so callers need not do that; it is the
+    # only one the CLA assistant uses.
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
