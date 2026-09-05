@@ -124,20 +124,72 @@ def hoist_system(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     return payload, len(hoisted)
 
 
+_PREAMBLE_ROLES = frozenset({"system", "developer"})
+
+
 def conversation_key(payload: Any) -> str | None:
     """Stable id for a conversation, or None when there is nothing to key on.
 
-    Uses the system prompt plus the FIRST message — both fixed for the life of
-    a conversation while ``messages`` grows every turn, so the same agent keeps
-    hashing to the same value.
+    Uses the preamble plus the FIRST real turn — both fixed for the life of a
+    conversation while the turn list grows, so the same agent keeps hashing to
+    the same value. Three body shapes share one derivation (2026-09-05, for
+    Codex over the OpenAI protocol):
+
+    * Anthropic Messages: ``system`` + ``messages`` (the hoist has already
+      moved any in-band system message up, so ``messages[0]`` is a user
+      turn and the key is byte-identical to the pre-2026-09-05 one — no
+      fleet-wide cache flush on deploy).
+    * OpenAI chat completions: ``messages`` whose FIRST entry is usually a
+      ``system`` / ``developer`` message shared by every session of the same
+      agent in the same cwd; keying on it would collide distinct
+      conversations onto one replica, so it is skipped and the first real
+      turn is used.
+    * OpenAI Responses: ``instructions`` + ``input`` (``input`` may be a
+      bare string — the schema allows it).
+
+    Stickiness outranks load here: a miss re-pays a full prefill (~40x a
+    hit on this fleet), so a body that yields no key is placed round-robin
+    and a body that yields the wrong key is worse than none.
     """
     if not isinstance(payload, dict):
         return None
-    messages = payload.get("messages") or []
-    if not messages:
+    preamble = (
+        payload.get("system") if "system" in payload else payload.get("instructions")
+    )
+    items = payload.get("messages")
+    if items is None:
+        items = payload.get("input")
+    if isinstance(items, str):
+        items = [items]
+    if not items:
         return None
-    seed = json.dumps([payload.get("system"), messages[0]], sort_keys=True, default=str)
+    first = next(
+        (
+            item
+            for item in items
+            if not (isinstance(item, dict) and item.get("role") in _PREAMBLE_ROLES)
+        ),
+        None,
+    )
+    if first is None:
+        return None
+    seed = json.dumps([preamble, first], sort_keys=True, default=str)
     return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def hoists_on(path: str) -> bool:
+    """True only for the Anthropic Messages route.
+
+    ``hoist_system`` rewrites in-band ``role: system`` messages into the
+    top-level ``system`` field that the Anthropic shape requires. On the
+    OpenAI routes that rewrite is DESTRUCTIVE: measured 2026-09-05 against
+    the live replica, a chat/completions body run through the hoist came
+    out with its system message deleted from ``messages[]`` and parked
+    under a top-level ``system`` key that vLLM accepts and discards —
+    HTTP 200, token count byte-identical to sending no system prompt at
+    all. An agent served that way silently loses its instructions.
+    """
+    return path.split("?", 1)[0] == "/v1/messages"
 
 
 def prefix_report(payload: dict[str, Any], key: str | None) -> str | None:
@@ -282,12 +334,22 @@ class InferenceBackend:
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
 
-    def prepare(self, body: bytes | None) -> tuple[bytes | None, str]:
-        """Hoist the body and derive the sticky key. Pure apart from the sink."""
+    def prepare(
+        self, body: bytes | None, *, hoist: bool = True
+    ) -> tuple[bytes | None, str]:
+        """Derive the sticky key, hoisting the body only where the shape asks.
+
+        Pure apart from the sink. ``hoist`` is the route's verdict (see
+        :func:`hoists_on`): the Anthropic Messages route hoists, the OpenAI
+        routes forward the bytes untouched.
+        """
         key = None
         if body:
             try:
-                payload, hoisted = hoist_system(json.loads(body))
+                payload = json.loads(body)
+                hoisted = 0
+                if hoist:
+                    payload, hoisted = hoist_system(payload)
                 key = conversation_key(payload)
                 if self.telemetry_sink is not None:
                     # Telemetry must NEVER affect the request path. A broad
@@ -324,7 +386,7 @@ class InferenceBackend:
         except ImportError as exc:
             raise RuntimeError("Inference relay requires scitex-genai[gateway]") from exc
 
-        body, session = self.prepare(body)
+        body, session = self.prepare(body, hoist=hoists_on(path))
         forwarded = {
             name: value
             for name, value in headers.items()

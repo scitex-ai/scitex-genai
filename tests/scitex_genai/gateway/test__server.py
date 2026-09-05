@@ -278,3 +278,91 @@ async def test_relay_app_relays_get_paths_to_the_upstream(upstream_factory) -> N
         )
     # Assert
     assert (response.status_code, upstream.requests[0]["path"]) == (200, "/v1/models")
+
+
+# ---------------------------------------------------------------------------
+# The OpenAI protocol routes (2026-09-05, Codex).
+# ---------------------------------------------------------------------------
+
+
+def _chat_body() -> dict:
+    return {
+        "model": "local-model",
+        "messages": [
+            {"role": "system", "content": "Keep me"},
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_relay_app_serves_chat_completions_untouched(upstream_factory) -> None:
+    # Arrange
+    reply = b'{"id":"chatcmpl-1","object":"chat.completion","choices":[]}'
+    upstream = upstream_factory(chunks=(reply,))
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.post(
+            "/v1/chat/completions",
+            json=_chat_body(),
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    forwarded = json.loads(upstream.requests[0]["body"])
+    # Assert
+    assert (
+        response.status_code,
+        response.content,
+        upstream.requests[0]["path"],
+        [message["role"] for message in forwarded["messages"]],
+    ) == (200, reply, "/v1/chat/completions", ["system", "user"])
+
+
+@pytest.mark.asyncio
+async def test_relay_app_serves_responses(upstream_factory) -> None:
+    # Arrange -- Codex's only wire_api in 0.153.4 is "responses".
+    reply = b'{"id":"resp_1","object":"response","output":[]}'
+    upstream = upstream_factory(chunks=(reply,))
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.post(
+            "/v1/responses",
+            json={"model": "local-model", "instructions": "Keep me", "input": "Hello"},
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    # Assert
+    assert (response.status_code, response.content, upstream.requests[0]["path"]) == (
+        200,
+        reply,
+        "/v1/responses",
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_app_refuses_an_openai_route_in_the_openai_envelope(
+    upstream_factory,
+) -> None:
+    # Arrange -- a wrong key must reach Codex as "Invalid API key", not as an
+    # Anthropic envelope it cannot parse.
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.post(
+            "/v1/responses",
+            json={"model": "local-model", "input": "Hello"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+    # Assert
+    assert (response.status_code, response.json()) == (
+        401,
+        {
+            "error": {
+                "message": "Invalid API key",
+                "type": "authentication_error",
+                "code": 401,
+            }
+        },
+    )
+
