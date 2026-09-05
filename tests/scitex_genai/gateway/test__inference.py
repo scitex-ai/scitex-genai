@@ -202,7 +202,9 @@ def test_announce_names_every_upstream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_hoists_the_body_and_keeps_the_query_string(upstream_factory) -> None:
+async def test_relay_hoists_the_body_and_keeps_the_query_string(
+    upstream_factory,
+) -> None:
     # Arrange
     upstream = upstream_factory()
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
@@ -247,7 +249,9 @@ async def test_relay_streams_the_upstream_sse_verbatim(upstream_factory) -> None
 
 
 @pytest.mark.asyncio
-async def test_relay_returns_the_upstream_status_and_body_verbatim(upstream_factory) -> None:
+async def test_relay_returns_the_upstream_status_and_body_verbatim(
+    upstream_factory,
+) -> None:
     # Arrange
     rejection = b'{"error":{"type":"invalid_request_error","message":"nope"}}'
     upstream = upstream_factory(status=400, chunks=(rejection,))
@@ -276,7 +280,9 @@ async def test_relay_forwards_a_non_json_body_untouched(upstream_factory) -> Non
 
 
 @pytest.mark.asyncio
-async def test_relay_drops_hop_by_hop_headers_and_forwards_the_rest(upstream_factory) -> None:
+async def test_relay_drops_hop_by_hop_headers_and_forwards_the_rest(
+    upstream_factory,
+) -> None:
     # Arrange
     upstream = upstream_factory()
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
@@ -301,7 +307,9 @@ async def test_relay_drops_hop_by_hop_headers_and_forwards_the_rest(upstream_fac
 
 
 @pytest.mark.asyncio
-async def test_relay_holds_the_upstream_in_flight_while_streaming(upstream_factory) -> None:
+async def test_relay_holds_the_upstream_in_flight_while_streaming(
+    upstream_factory,
+) -> None:
     # Arrange
     upstream = upstream_factory(chunks=(b"first", b"second"))
     pool = InferenceUpstreamPool.from_urls(upstream.url)
@@ -331,7 +339,11 @@ async def test_relay_rotates_past_an_unreachable_upstream(
     )
     await _collect(relayed.body)
     # Assert
-    assert (relayed.status_code, len(live.requests), pool.upstreams[0].cooldown_until > 0) == (
+    assert (
+        relayed.status_code,
+        len(live.requests),
+        pool.upstreams[0].cooldown_until > 0,
+    ) == (
         200,
         1,
         True,
@@ -380,7 +392,9 @@ async def test_relay_refuses_with_the_cooling_message_while_all_are_cooling(
         await backend.relay("POST", "/v1/messages", body=body, headers={})
 
     # Assert
-    with pytest.raises(UpstreamUnreachable, match="All inference upstreams are cooling down"):
+    with pytest.raises(
+        UpstreamUnreachable, match="All inference upstreams are cooling down"
+    ):
         await relay()
 
 
@@ -504,40 +518,74 @@ async def test_relay_keeps_a_chat_completions_system_message_in_place(
     )
 
 
-
-
 # ---------------------------------------------------------------------------
-# The developer role (2026-09-05, first live codex turn): vLLM answers 400
-# "Unexpected message role." to it, so the gateway rewrites it to system.
+# One system preamble, first (2026-09-05, the first live codex turns): vLLM
+# refuses the developer role, then refuses a second system message.
 # ---------------------------------------------------------------------------
 
 
-def test_developer_items_become_system_in_a_responses_body() -> None:
-    # Arrange -- Codex's shape: instructions as a developer item, then the turn.
+def test_responses_developer_items_fold_into_the_instructions() -> None:
+    # Arrange -- Codex's shape: top-level instructions AND a developer item.
     payload = {
+        "instructions": "Base rules.",
         "input": [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Be terse."}],
+            },
             {"role": "user", "content": "hi"},
-            {"role": "developer", "content": "You are terse."},
-        ]
+        ],
     }
     # Act
     adapted, _ = adapt_openai_roles(payload)
-    # Assert -- rewritten AND moved first.
-    assert [m["role"] for m in adapted["input"]] == ["system", "user"]
+    # Assert -- one preamble, in `instructions`; the item is gone from input.
+    assert (adapted["instructions"], [i["role"] for i in adapted["input"]]) == (
+        "Base rules.\n\nBe terse.",
+        ["user"],
+    )
 
 
-def test_developer_messages_become_system_in_a_chat_body() -> None:
+def test_responses_without_instructions_still_get_one_preamble() -> None:
     # Arrange
     payload = {
-        "messages": [
-            {"role": "developer", "content": "x"},
-            {"role": "user", "content": "y"},
+        "input": [
+            {"role": "developer", "content": "Be terse."},
+            {"role": "user", "content": "hi"},
         ]
     }
     # Act
     adapted, changed = adapt_openai_roles(payload)
     # Assert
-    assert (adapted["messages"][0]["role"], changed) == ("system", True)
+    assert (adapted["instructions"], changed) == ("Be terse.", True)
+
+
+def test_chat_preamble_messages_merge_into_one_system_message_first() -> None:
+    # Arrange -- a developer message after the user turn, plus a system one.
+    payload = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "Be terse."},
+            {"role": "system", "content": "Base rules."},
+        ]
+    }
+    # Act
+    adapted, _ = adapt_openai_roles(payload)
+    # Assert
+    assert [m["role"] for m in adapted["messages"]] == ["system", "user"]
+
+
+def test_a_chat_body_already_in_shape_is_untouched() -> None:
+    # Arrange -- one system message, already first: nothing to do.
+    payload = {
+        "messages": [
+            {"role": "system", "content": "x"},
+            {"role": "user", "content": "y"},
+        ]
+    }
+    # Act
+    _, changed = adapt_openai_roles(payload)
+    # Assert
+    assert changed is False
 
 
 def test_a_string_input_is_left_alone() -> None:
@@ -550,7 +598,7 @@ def test_a_string_input_is_left_alone() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_rewrites_the_developer_role_on_the_responses_route(
+async def test_relay_sends_one_preamble_on_the_responses_route(
     upstream_factory,
 ) -> None:
     # Arrange
@@ -558,8 +606,9 @@ async def test_relay_rewrites_the_developer_role_on_the_responses_route(
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
     body = {
         "model": "m",
+        "instructions": "Base rules.",
         "input": [
-            {"role": "developer", "content": "You are terse."},
+            {"role": "developer", "content": "Be terse."},
             {"role": "user", "content": "hi"},
         ],
     }
@@ -573,5 +622,7 @@ async def test_relay_rewrites_the_developer_role_on_the_responses_route(
     await _collect(relayed.body)
     sent = json.loads(upstream.requests[0]["body"])
     # Assert
-    assert [m["role"] for m in sent["input"]] == ["system", "user"]
-
+    assert (sent["instructions"], [i["role"] for i in sent["input"]]) == (
+        "Base rules.\n\nBe terse.",
+        ["user"],
+    )

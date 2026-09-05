@@ -178,40 +178,82 @@ def conversation_key(payload: Any) -> str | None:
 
 
 _OPENAI_PREAMBLE_ROLE = "developer"
+_PREAMBLE_ROLES_OPENAI = frozenset({"system", "developer"})
+
+
+def _item_text(item: Any) -> str:
+    """The text of a chat message / Responses input item, whatever its shape."""
+    content = item.get("content") if isinstance(item, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
 
 
 def adapt_openai_roles(payload: Any) -> tuple[Any, bool]:
-    """Rewrite ``developer`` items to ``system`` and put them first.
+    """Leave the upstream exactly ONE system preamble, at the front.
 
-    Codex sends its instructions as a ``developer`` item (OpenAI's newer
-    preamble role). vLLM 0.22.0's Responses and chat endpoints answer
-    ``{"error": {"message": "Unexpected message role."}}`` (HTTP 400) to
-    that role — measured live on the first codex turn through this gateway,
-    2026-09-05 09:20 UTC — and then require the system message to come
-    first. Both shapes are rewritten: ``messages`` (chat completions) and a
-    list-valued ``input`` (Responses; a bare string is left alone). Pure;
-    returns ``(payload, changed)``.
+    vLLM 0.22.0's Responses and chat endpoints refuse Codex's request twice
+    over — measured on the first live codex turns through this gateway,
+    2026-09-05 09:20 and 09:37 UTC:
+
+    * ``{"error": {"message": "Unexpected message role."}}`` for the
+      ``developer`` role Codex uses for its instructions;
+    * ``{"error": {"message": "System message must be at the beginning."}}``
+      once that role is renamed, because Codex ALSO sends top-level
+      ``instructions`` (which vLLM turns into the first system message) and
+      a second system item then follows it.
+
+    So, for a Responses body, every ``developer`` / ``system`` input item is
+    folded into ``instructions`` (appended, in order) and dropped from
+    ``input``; a bare-string ``input`` is left alone. For a chat body, the
+    preamble messages are merged into a single ``system`` message placed
+    first. Pure; returns ``(payload, changed)``.
     """
     if not isinstance(payload, dict):
         return payload, False
     changed = False
-    for field in ("messages", "input"):
-        items = payload.get(field)
-        if not isinstance(items, list):
-            continue
-        preamble: list[Any] = []
-        rest: list[Any] = []
-        for item in items:
-            role = item.get("role") if isinstance(item, dict) else None
-            if role == _OPENAI_PREAMBLE_ROLE:
-                item = {**item, "role": "system"}
-                changed = True
-            is_system = isinstance(item, dict) and item.get("role") == "system"
-            (preamble if is_system else rest).append(item)
-        reordered = preamble + rest
-        if reordered != items:
+
+    items = payload.get("input")
+    if isinstance(items, list):
+        preamble = [
+            i
+            for i in items
+            if isinstance(i, dict) and i.get("role") in _PREAMBLE_ROLES_OPENAI
+        ]
+        if preamble:
+            texts = [t for t in (_item_text(i) for i in preamble) if t]
+            existing = payload.get("instructions")
+            head = [existing] if isinstance(existing, str) and existing else []
+            payload["instructions"] = "\n\n".join(head + texts)
+            payload["input"] = [i for i in items if i not in preamble]
             changed = True
-        payload[field] = reordered
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        preamble = [
+            m
+            for m in messages
+            if isinstance(m, dict) and m.get("role") in _PREAMBLE_ROLES_OPENAI
+        ]
+        rest = [m for m in messages if m not in preamble]
+        if preamble and (
+            len(preamble) > 1
+            or preamble[0].get("role") != "system"
+            or messages[0] is not preamble[0]
+        ):
+            texts = [t for t in (_item_text(m) for m in preamble) if t]
+            payload["messages"] = [
+                {"role": "system", "content": "\n\n".join(texts)}
+            ] + rest
+            changed = True
+
     return payload, changed
 
 
@@ -251,7 +293,9 @@ def prefix_report(payload: dict[str, Any], key: str | None) -> str | None:
     parts = [f"conv={(key or 'none')[:12]}", f"system_bytes={len(raw)}"]
     for cut in _CHECKPOINTS:
         if len(raw) >= cut:
-            parts.append(f"p{cut // 1024}k={hashlib.sha256(raw[:cut]).hexdigest()[:12]}")
+            parts.append(
+                f"p{cut // 1024}k={hashlib.sha256(raw[:cut]).hexdigest()[:12]}"
+            )
     parts.append(f"full={hashlib.sha256(raw).hexdigest()[:12]}")
     return " ".join(parts)
 
@@ -425,7 +469,9 @@ class InferenceBackend:
         try:
             import httpx
         except ImportError as exc:
-            raise RuntimeError("Inference relay requires scitex-genai[gateway]") from exc
+            raise RuntimeError(
+                "Inference relay requires scitex-genai[gateway]"
+            ) from exc
 
         body, session = self.prepare(body, hoist=hoists_on(path))
         forwarded = {
@@ -488,7 +534,9 @@ class InferenceBackend:
             # must finish even after the response is gone.
             await asyncio.shield(self._finish(client, response, upstream))
 
-    async def _finish(self, client: Any, response: Any, upstream: InferenceUpstream) -> None:
+    async def _finish(
+        self, client: Any, response: Any, upstream: InferenceUpstream
+    ) -> None:
         try:
             await response.aclose()
             await client.aclose()
