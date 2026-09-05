@@ -177,6 +177,44 @@ def conversation_key(payload: Any) -> str | None:
     return hashlib.sha256(seed.encode()).hexdigest()
 
 
+_OPENAI_PREAMBLE_ROLE = "developer"
+
+
+def adapt_openai_roles(payload: Any) -> tuple[Any, bool]:
+    """Rewrite ``developer`` items to ``system`` and put them first.
+
+    Codex sends its instructions as a ``developer`` item (OpenAI's newer
+    preamble role). vLLM 0.22.0's Responses and chat endpoints answer
+    ``{"error": {"message": "Unexpected message role."}}`` (HTTP 400) to
+    that role — measured live on the first codex turn through this gateway,
+    2026-09-05 09:20 UTC — and then require the system message to come
+    first. Both shapes are rewritten: ``messages`` (chat completions) and a
+    list-valued ``input`` (Responses; a bare string is left alone). Pure;
+    returns ``(payload, changed)``.
+    """
+    if not isinstance(payload, dict):
+        return payload, False
+    changed = False
+    for field in ("messages", "input"):
+        items = payload.get(field)
+        if not isinstance(items, list):
+            continue
+        preamble: list[Any] = []
+        rest: list[Any] = []
+        for item in items:
+            role = item.get("role") if isinstance(item, dict) else None
+            if role == _OPENAI_PREAMBLE_ROLE:
+                item = {**item, "role": "system"}
+                changed = True
+            is_system = isinstance(item, dict) and item.get("role") == "system"
+            (preamble if is_system else rest).append(item)
+        reordered = preamble + rest
+        if reordered != items:
+            changed = True
+        payload[field] = reordered
+    return payload, changed
+
+
 def hoists_on(path: str) -> bool:
     """True only for the Anthropic Messages route.
 
@@ -350,6 +388,9 @@ class InferenceBackend:
                 hoisted = 0
                 if hoist:
                     payload, hoisted = hoist_system(payload)
+                else:
+                    payload, adapted = adapt_openai_roles(payload)
+                    hoisted = int(adapted)
                 key = conversation_key(payload)
                 if self.telemetry_sink is not None:
                     # Telemetry must NEVER affect the request path. A broad
