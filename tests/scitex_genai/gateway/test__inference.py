@@ -442,11 +442,68 @@ async def test_telemetry_sink_receives_a_size_only_report(upstream_factory) -> N
     )
     await _collect(relayed.body)
     # Assert
-    assert (len(lines), lines[0].startswith("[prefix] conv="), SECRET in lines[0]) == (
+    prefix = [line for line in lines if line.startswith("[prefix]")]
+    assert (
+        len(prefix),
+        prefix[0].startswith("[prefix] conv="),
+        SECRET in prefix[0],
+    ) == (
         1,
         True,
         False,
     )
+
+
+@pytest.mark.asyncio
+async def test_the_journal_says_which_request_went_where_and_how_it_ended(
+    upstream_factory,
+) -> None:
+    # Arrange -- the one place that knows both the request and the upstream.
+    upstream = upstream_factory()
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url), telemetry_sink=lines.append
+    )
+    body = json.dumps(_request(system=SECRET * 40)).encode()
+
+    # Act
+    relayed = await backend.relay("POST", "/v1/messages", body=body, headers={})
+    await _collect(relayed.body)
+
+    # Assert -- a send line naming the upstream and size, a finish line with the
+    # status, and never the payload itself.
+    relay = [line for line in lines if line.startswith("[relay]")]
+    assert (
+        len(relay),
+        f"-> {upstream.url} POST /v1/messages bytes=" in relay[0],
+        f"<- {upstream.url} status=200 bytes=" in relay[1],
+        any(SECRET in line for line in relay),
+    ) == (2, True, True, False)
+
+
+@pytest.mark.asyncio
+async def test_the_journal_names_the_upstream_that_gave_no_response(
+    dead_url_factory,
+) -> None:
+    # Arrange
+    dead = dead_url_factory()
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(dead), telemetry_sink=lines.append
+    )
+
+    # Act
+    async def relay() -> None:
+        await backend.relay(
+            "POST", "/v1/messages", body=json.dumps(_request()).encode(), headers={}
+        )
+
+    with contextlib.suppress(UpstreamUnreachable):
+        await relay()
+
+    # Assert
+    relay_lines = [line for line in lines if line.startswith("[relay]")]
+    assert [f"<- {dead} no response (" in line for line in relay_lines] == [False, True]
 
 
 # ---------------------------------------------------------------------------
