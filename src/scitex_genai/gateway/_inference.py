@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -432,6 +433,15 @@ class InferenceBackend:
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
 
+    def _note(self, line: str) -> None:
+        """One journal line. Never affects the request path (see prepare)."""
+        if self.telemetry_sink is None:
+            return
+        try:
+            self.telemetry_sink(line)
+        except Exception:  # noqa: BLE001
+            pass
+
     def prepare(
         self, body: bytes | None, *, hoist: bool = True
     ) -> tuple[bytes | None, str]:
@@ -501,6 +511,10 @@ class InferenceBackend:
             try:
                 upstream = await self.pool.acquire(session, exclude=attempted)
             except HomeMemberReloading as exc:
+                self._note(
+                    f"[relay] conv={session[:8] or '-'} held: {exc} "
+                    f"(retry after {exc.retry_after_s:.0f}s)"
+                )
                 raise UpstreamReloading(
                     f"{exc}. Retry this conversation after "
                     f"{exc.retry_after_s:.0f}s; it stays pinned to its home "
@@ -511,6 +525,11 @@ class InferenceBackend:
                 failures.append(str(exc))
                 break
             attempted.add(upstream.alias)
+            started = time.monotonic()
+            self._note(
+                f"[relay] conv={session[:8] or '-'} -> {upstream.alias} "
+                f"{method} {path} bytes={len(body or b'')}"
+            )
             client = httpx.AsyncClient(timeout=self.timeout_s)
             try:
                 request = client.build_request(
@@ -521,12 +540,25 @@ class InferenceBackend:
                 await client.aclose()
                 await self.pool.release(upstream)
                 await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
+                self._note(
+                    f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
+                    f"no response ({exc.__class__.__name__}) after "
+                    f"{time.monotonic() - started:.1f}s; out of rotation for "
+                    f"{UNREACHABLE_COOLDOWN_S:.0f}s"
+                )
                 failures.append(f"{upstream.alias} ({exc.__class__.__name__}: {exc})")
                 continue
             return RelayedResponse(
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", "application/json"),
-                body=self._drain(client, response, upstream),
+                body=self._drain(
+                    client,
+                    response,
+                    upstream,
+                    tag=f"conv={session[:8] or '-'} <- {upstream.alias} "
+                    f"status={response.status_code}",
+                    started=started,
+                ),
             )
         raise UpstreamUnreachable(self._refusal(failures))
 
@@ -541,12 +573,23 @@ class InferenceBackend:
         )
 
     async def _drain(
-        self, client: Any, response: Any, upstream: InferenceUpstream
+        self,
+        client: Any,
+        response: Any,
+        upstream: InferenceUpstream,
+        *,
+        tag: str = "",
+        started: float | None = None,
     ) -> AsyncIterator[bytes]:
+        sent = 0
         try:
             async for chunk in response.aiter_bytes():
+                sent += len(chunk)
                 yield chunk
         finally:
+            if tag:
+                took = time.monotonic() - started if started is not None else 0.0
+                self._note(f"[relay] {tag} bytes={sent} {took:.1f}s")
             # ALWAYS, on every path — including a client that disconnected
             # mid-stream, which cancels this generator. An unreleased counter
             # marks that upstream busy FOREVER, so the balancer would route
