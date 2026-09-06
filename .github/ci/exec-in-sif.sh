@@ -69,11 +69,22 @@ fi
 # non-Spartan branch can be exercised on a machine that happens to have the tree.
 SPARTAN_PROJECT="${SCITEX_CI_PROJECT_DIR-/data/gpfs/projects/punim0264}"
 BIND_ARGS=()
-if [ -d "$SPARTAN_PROJECT" ]; then
+if [ -n "${SCITEX_CI_SCRATCH:-}" ]; then
+    # STATED WINS. The operator's instruction, 2026-09-06: "where the tests run
+    # should just be specifiable" — so one variable names it and nothing here
+    # second-guesses that. A caller that says where to work is never overruled
+    # by what this script happens to find on the filesystem.
+    export APPTAINER_TMPDIR="${SCITEX_CI_SCRATCH%/}/apptainer-tmp"
+elif [ -d "$SPARTAN_PROJECT" ]; then
     export APPTAINER_TMPDIR="$SPARTAN_PROJECT/ywatanabe/ci/apptainer-tmp"
     BIND_ARGS=(--bind "$SPARTAN_PROJECT")
 else
-    export APPTAINER_TMPDIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/apptainer-tmp"
+    # Nobody said, and the site tree is not here. $RUNNER_TEMP is the runner's
+    # own per-job scratch and is cleaned for us; $HOME is the last resort
+    # because it always exists for whoever is running — the operator's other
+    # suggestion the same minute, and the reason there is no failure branch
+    # left in which this script cannot find somewhere to work.
+    export APPTAINER_TMPDIR="${RUNNER_TEMP:-${TMPDIR:-$HOME}}/apptainer-tmp"
 fi
 mkdir -p "$APPTAINER_TMPDIR" || {
     echo "::error::cannot create apptainer scratch at $APPTAINER_TMPDIR"
