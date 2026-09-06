@@ -67,6 +67,9 @@ fi
 # Spartan account and no such tree, and the operator's point (2026-09-06) is that
 # a site-only assumption locks them out of our CI entirely. Overridable so the
 # non-Spartan branch can be exercised on a machine that happens to have the tree.
+# NOTE for whoever tests this: pick an absent path DELIBERATELY. "/nonexistent" is
+# not absent on every machine — on this fleet it is another suite's fixture root, so
+# a control using it silently takes the PRESENT branch and proves nothing.
 SPARTAN_PROJECT="${SCITEX_CI_PROJECT_DIR-/data/gpfs/projects/punim0264}"
 BIND_ARGS=()
 if [ -n "${SCITEX_CI_SCRATCH:-}" ]; then
