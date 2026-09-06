@@ -63,7 +63,11 @@ fi
 # "mkdir: cannot create directory '/data': Permission denied"). Deciding by what is
 # PRESENT rather than by which pool we assume we are on is what makes this wrapper
 # run wherever the job was scheduled.
-SPARTAN_PROJECT="/data/gpfs/projects/punim0264"
+# The site path is a DEFAULT, not a constant: an external contributor has no
+# Spartan account and no such tree, and the operator's point (2026-09-06) is that
+# a site-only assumption locks them out of our CI entirely. Overridable so the
+# non-Spartan branch can be exercised on a machine that happens to have the tree.
+SPARTAN_PROJECT="${SCITEX_CI_PROJECT_DIR-/data/gpfs/projects/punim0264}"
 BIND_ARGS=()
 if [ -d "$SPARTAN_PROJECT" ]; then
     export APPTAINER_TMPDIR="$SPARTAN_PROJECT/ywatanabe/ci/apptainer-tmp"
