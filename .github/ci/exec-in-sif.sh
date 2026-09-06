@@ -32,8 +32,21 @@ APPTAINER="${APPTAINER/#\~/$HOME}"
 SIF="${SIF/#\~/$HOME}"
 export PATH="$HOME/.env-3.11/bin:$PATH"
 
+# The declared path is a per-repo Actions Variable and it is often wrong for the
+# runner the job actually landed on: measured 2026-09-06, 64 of 77 repos declare
+# ~/.env-3.11/bin/apptainer, which exists on Spartan and NOT on the scitex-org-cpu
+# runners, where apptainer is /usr/bin/apptainer. Prefer the declaration, fall back
+# to whatever is on PATH, and fail loudly naming BOTH when neither resolves — a
+# variable that names an absent path must not read the same as no apptainer at all.
+if [ ! -x "$APPTAINER" ]; then
+    FALLBACK="$(command -v apptainer 2>/dev/null || true)"
+    if [ -n "$FALLBACK" ]; then
+        echo "::warning::declared apptainer '$APPTAINER' is not executable here; using '$FALLBACK' from PATH"
+        APPTAINER="$FALLBACK"
+    fi
+fi
 [ -x "$APPTAINER" ] || {
-    echo "::error::apptainer shim not executable at $APPTAINER"
+    echo "::error::no usable apptainer: SCITEX_CI_APPTAINER='${SCITEX_CI_APPTAINER}' is not executable and none is on PATH"
     exit 1
 }
 [ -f "$SIF" ] || {
@@ -41,11 +54,28 @@ export PATH="$HOME/.env-3.11/bin:$PATH"
     exit 1
 }
 
-# apptainer scratch on the shared FS — keeps HOME clean.
-export APPTAINER_TMPDIR="/data/gpfs/projects/punim0264/ywatanabe/ci/apptainer-tmp"
-mkdir -p "$APPTAINER_TMPDIR"
+# Apptainer scratch, and the project bind, are SPARTAN facts — used where Spartan
+# is, skipped where it is not. On Spartan the shared project filesystem keeps HOME
+# clean and $HOME/.scitex is a symlink into punim0264, so the bind is what makes
+# that symlink resolve inside the container. On the scitex-org-cpu runners neither
+# is true: /data does not exist, `mkdir -p` on it fails with EACCES, and the whole
+# job dies there before a single test runs (measured 2026-09-06 on run 34009594049:
+# "mkdir: cannot create directory '/data': Permission denied"). Deciding by what is
+# PRESENT rather than by which pool we assume we are on is what makes this wrapper
+# run wherever the job was scheduled.
+SPARTAN_PROJECT="/data/gpfs/projects/punim0264"
+BIND_ARGS=()
+if [ -d "$SPARTAN_PROJECT" ]; then
+    export APPTAINER_TMPDIR="$SPARTAN_PROJECT/ywatanabe/ci/apptainer-tmp"
+    BIND_ARGS=(--bind "$SPARTAN_PROJECT")
+else
+    export APPTAINER_TMPDIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/apptainer-tmp"
+fi
+mkdir -p "$APPTAINER_TMPDIR" || {
+    echo "::error::cannot create apptainer scratch at $APPTAINER_TMPDIR"
+    exit 1
+}
 
-# --bind punim0264: $HOME/.scitex is a symlink into punim0264; bind it so the
-# symlink resolves inside the container. --pwd "$PWD" keeps the checkout as cwd.
-exec "$APPTAINER" exec --pwd "$PWD" --bind /data/gpfs/projects/punim0264 \
+# --pwd "$PWD" keeps the checkout as cwd.
+exec "$APPTAINER" exec --pwd "$PWD" "${BIND_ARGS[@]}" \
     "$SIF" bash ".github/ci/$INNER" "$@"
