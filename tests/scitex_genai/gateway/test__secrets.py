@@ -156,13 +156,34 @@ def test_write_makes_the_file_owner_only(secrets_path):
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
-def test_write_makes_the_directory_owner_only(secrets_path):
-    # Arrange
+def test_write_makes_a_directory_it_creates_owner_only(secrets_path):
+    # Arrange: the parent does not exist yet
     target = secrets_path
     # Act
     write_key("abc", target)
     # Assert
     assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+
+
+def test_write_leaves_an_existing_directory_permissions_alone(secrets_path):
+    """~/.scitex/genai is shared with config.yaml; do not re-permission it."""
+    # Arrange
+    secrets_path.parent.mkdir(parents=True)
+    secrets_path.parent.chmod(0o755)
+    # Act
+    write_key("abc", secrets_path)
+    # Assert
+    assert stat.S_IMODE(secrets_path.parent.stat().st_mode) == 0o755
+
+
+def test_write_still_protects_the_file_in_an_existing_directory(secrets_path):
+    # Arrange
+    secrets_path.parent.mkdir(parents=True)
+    secrets_path.parent.chmod(0o755)
+    # Act
+    write_key("abc", secrets_path)
+    # Assert
+    assert stat.S_IMODE(secrets_path.stat().st_mode) == 0o600
 
 
 def test_write_preserves_other_names_already_in_the_file(secrets_path):

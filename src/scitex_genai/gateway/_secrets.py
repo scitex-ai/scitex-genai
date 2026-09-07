@@ -130,9 +130,17 @@ def read_secrets(path: Path | str | None = None) -> dict[str, str]:
 def write_key(value: str, path: Path | str | None = None) -> Path:
     """Store ``value`` under :data:`GATEWAY_KEY_ENV`, owner-readable only.
 
-    Other names already in the file are preserved; the directory is created with
-    ``0700`` and the file written ``0600`` before anything is put in it, so the
-    value is never briefly world-readable.
+    Other names already in the file are preserved, and the file is opened at
+    ``0600`` before anything is written into it, so the value is never briefly
+    world-readable.
+
+    A directory we CREATE is made ``0700``. One that already exists is left
+    exactly as the user has it. That asymmetry matters: this path is shared with
+    ``config.yaml``, which on a real host is a symlink into the user's dotfiles,
+    so silently tightening an existing ``~/.scitex/genai`` would change access to
+    a directory this function was only asked to add a file to. Protecting the
+    secret is the file's mode; re-permissioning someone's config directory is a
+    side effect nobody asked for.
     """
     if not value:
         raise CredentialError("refusing to write an empty gateway key")
@@ -140,8 +148,9 @@ def write_key(value: str, path: Path | str | None = None) -> Path:
     existing = read_secrets(target)
     existing[GATEWAY_KEY_ENV] = value
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(target.parent, DIR_MODE)
+    if not target.parent.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(target.parent, DIR_MODE)
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(
