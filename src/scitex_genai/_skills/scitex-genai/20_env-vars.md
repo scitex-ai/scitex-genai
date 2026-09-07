@@ -43,6 +43,41 @@ GenAI(model="qwen36-35b-a3b")
 GenAI(model="qwen36-35b-a3b", base_url="http://host:4000/v1", api_key="sk-...")
 ```
 
+## Gateway authentication
+
+| Variable | Purpose | Default | Type |
+|---|---|---|---|
+| `SCITEX_GENAI_GATEWAY_API_KEY` | The key clients present to the gateway, and the one the gateway validates. | (unset) | string |
+
+**This variable has a file home, and that is the point.** It resolves from the
+environment first, then from `~/.scitex/genai/secrets` — beside
+`~/.scitex/genai/config.yaml`, so what a gateway *is* and what *opens* it live
+together.
+
+```
+# ~/.scitex/genai/secrets      (mode 0600, NAME=value, no `export`)
+SCITEX_GENAI_GATEWAY_API_KEY=<64 hex characters>
+```
+
+Why the file exists: a shell profile is readable only by a process that gets a
+login shell. The gateway's unit used to arrange one for itself; nothing else
+did. Measured 2026-09-05 to -07, one gateway was healthy for 33 hours
+(`/health` 200, no restarts) and served **zero** completions — 444 consecutive
+`401`s — because every client resolved the variable to the empty string and
+presented an empty bearer token. A file any process can read removes that
+class of failure.
+
+**Only the gateway mints a key.** `scitex-genai-gateway` and
+`scitex-genai-gateway install-unit` create one when nothing resolves; a client
+refuses and names the file instead. That asymmetry is deliberate: a key minted
+on a host with no gateway opens nothing while looking like a configured
+system, which is worse than the missing file it would replace.
+
+`install-unit` captures whatever key currently resolves — including one that
+exists only as an `export` line in your profile — into the file *before*
+writing the unit, so migrating does not change the key your clients already
+present.
+
 ## Dispatch backend
 
 | Variable | Purpose | Default | Type |

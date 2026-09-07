@@ -31,6 +31,7 @@ from ._inference import (
     announce,
     telemetry_enabled,
 )
+from ._secrets import resolve_gateway_key
 from ._server import create_app
 from ._settings import load_settings
 from ._unit import UNIT_NAME, install_unit
@@ -109,7 +110,25 @@ def _telemetry_sink():
     return lambda line: print(line, flush=True)
 
 
+def _persist_key() -> None:
+    """Give the key a home before anything depends on it having one.
+
+    Run at install time, from whatever shell the operator used, so a key that
+    exists ONLY as an ``export`` line in their profile is captured into the
+    secrets file at its current value. That ordering is what lets the unit stop
+    asking for a login shell without changing the key every client already
+    presents.
+    """
+    key = resolve_gateway_key(create=True)
+    print(
+        f"scitex-genai-gateway: key {key.origin}"
+        + (f" -> {key.path}" if key.path else " (kept; nothing written)"),
+        flush=True,
+    )
+
+
 def _install_unit(args: argparse.Namespace) -> None:
+    _persist_key()
     path = install_unit(
         host=args.host,
         port=args.port,
@@ -149,7 +168,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         codex_pool = CodexAccountPool.discover()
         backend = CodexBackend(codex_pool, CodexTransport(base_url=args.codex_base_url))
-    app = create_app(backend)
+    key = resolve_gateway_key(create=True)
+    print(f"scitex-genai-gateway: key {key.origin}", flush=True)
+    app = create_app(backend, api_key=key.value)
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level)
 
 

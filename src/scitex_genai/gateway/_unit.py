@@ -15,19 +15,26 @@ would: settings come from ``~/.scitex/genai/config.yaml`` (see ``_settings``),
 so the unit is byte-identical on every host and a settings change needs only a
 restart. Flags given to ``install-unit`` are baked into the unit instead.
 
-TWO CHOICES THAT LOOK ODD AND ARE DELIBERATE
---------------------------------------------
-``ExecStart=/bin/bash -lc 'exec ...'`` -- a LOGIN shell. The gateway refuses
-to start without ``SCITEX_GENAI_GATEWAY_API_KEY``, and a user's profile is
-where such a secret normally lives, as an ``export NAME=value`` line that
-systemd's ``EnvironmentFile=`` cannot read. The profile is sourced the way an
-interactive login sources it, and ``exec`` hands the PID to the gateway so
-systemd supervises the server rather than the shell.
+NO SHELL, AND WHY THAT CHANGED
+------------------------------
+This unit used to run ``ExecStart=/bin/bash -lc 'exec ...'`` -- a LOGIN shell --
+for one reason, stated here at the time: the gateway refuses to start without
+``SCITEX_GENAI_GATEWAY_API_KEY``, and the value lived in the user's profile as
+an ``export NAME=value`` line that systemd's ``EnvironmentFile=`` cannot read.
+
+That reason is gone. ``_secrets`` gives the key a home any process can read, and
+``install-unit`` captures the current value into it before writing this unit, so
+the key survives the change rather than being regenerated. The login shell is
+therefore removed in the SAME change that removes its cause: a retired mechanism
+left reachable is one that will keep being used.
+
+What it bought us, besides one less moving part: a profile that fails, hangs, or
+prompts no longer decides whether the gateway starts, and the unit no longer
+depends on whatever the login shell puts on PATH.
 
 ``<interpreter> -m scitex_genai.gateway._cli`` rather than the console script:
 the interpreter is the one running ``install-unit`` (``sys.executable``), an
-absolute path known at install time, so the unit does not depend on whatever
-the login shell puts on PATH.
+absolute path known at install time.
 """
 
 from __future__ import annotations
@@ -89,7 +96,7 @@ def render_unit(
     argv = gateway_command(
         host=host, port=port, upstream=upstream, config=config, interpreter=interpreter
     )
-    inner = "exec " + " ".join(shlex.quote(arg) for arg in argv)
+    exec_start = " ".join(shlex.quote(arg) for arg in argv)
     settings = str(config) if config is not None else "~/.scitex/genai/config.yaml"
     return (
         f"# {UNIT_NAME} -- written by `scitex-genai-gateway install-unit`.\n"
@@ -103,10 +110,9 @@ def render_unit(
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        "# A LOGIN shell, so the user's profile supplies SCITEX_GENAI_GATEWAY_API_KEY\n"
-        "# (an `export NAME=value` line systemd's EnvironmentFile= cannot read).\n"
-        "# The gateway refuses to start without it: a missing key fails loud.\n"
-        f"ExecStart=/bin/bash -lc {shlex.quote(inner)}\n"
+        "# No shell: the auth key comes from ~/.scitex/genai/secrets, which a\n"
+        "# plain process can read. A missing key still fails loud.\n"
+        f"ExecStart={exec_start}\n"
         "Restart=always\n"
         "RestartSec=3\n"
         "Environment=PYTHONUNBUFFERED=1\n"
