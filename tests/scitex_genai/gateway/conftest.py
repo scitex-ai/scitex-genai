@@ -53,6 +53,17 @@ def isolate_the_scitex_store(tmp_path_factory: pytest.TempPathFactory) -> Iterat
             os.environ[name] = value
 
 
+@pytest.fixture
+def gateway_key_env():
+    """Set the real key variable for one test.
+
+    Restoring is ``isolate_the_scitex_store``'s job -- it snapshots and puts
+    back whatever was there, so a test that sets a key cannot leak it into the
+    next one.
+    """
+    return lambda value: os.environ.__setitem__(GATEWAY_KEY_ENV, value)
+
+
 class RecordingUpstream:
     """Replays one scripted reply per request and records what it was asked."""
 

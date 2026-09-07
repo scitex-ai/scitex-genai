@@ -191,3 +191,40 @@ def test_the_refusal_leaves_the_existing_unit_untouched(tmp_path: Path):
 
     # Assert
     assert (tmp_path / UNIT_NAME).read_text(encoding="utf-8") == "[Service]\n"
+
+
+def test_install_unit_persists_a_key_that_only_the_environment_had(
+    tmp_path: Path, gateway_key_env
+):
+    """Resolving is not persisting -- the bug this test exists for.
+
+    The unit written by this command runs with NO login shell. A key that lives
+    only in the installing shell's environment is therefore invisible to it, and
+    the next start would mint a replacement and rotate every client's key.
+    """
+    # Arrange
+    gateway_key_env("a-key-only-this-shell-has")
+    argv = [INSTALL_UNIT, "--unit-dir", str(tmp_path), "--no-enable"]
+
+    # Act
+    main(argv)
+
+    # Assert
+    assert (
+        read_secrets(default_secrets_path())[GATEWAY_KEY_ENV]
+        == "a-key-only-this-shell-has"
+    )
+
+
+def test_install_unit_reports_where_the_key_was_stored(
+    tmp_path: Path, gateway_key_env, capsys: pytest.CaptureFixture[str]
+):
+    # Arrange
+    gateway_key_env("a-key-only-this-shell-has")
+    argv = [INSTALL_UNIT, "--unit-dir", str(tmp_path), "--no-enable"]
+
+    # Act
+    main(argv)
+
+    # Assert
+    assert str(default_secrets_path()) in capsys.readouterr().out
