@@ -17,6 +17,7 @@ from ._anthropic import (
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
 from ._inference import InferenceBackend
+from ._secrets import resolve_gateway_key
 
 
 def _request_token(request: Any) -> str:
@@ -90,9 +91,7 @@ def create_app(
     except ImportError as exc:
         raise RuntimeError("Gateway server requires scitex-genai[gateway]") from exc
 
-    expected_key = api_key or os.getenv("SCITEX_GENAI_GATEWAY_API_KEY", "")
-    if not expected_key:
-        raise RuntimeError("SCITEX_GENAI_GATEWAY_API_KEY must be set")
+    expected_key = api_key or resolve_gateway_key().value
 
     relaying = isinstance(backend, InferenceBackend)
 

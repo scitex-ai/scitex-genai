@@ -34,14 +34,9 @@ def _sections(text: str) -> configparser.ConfigParser:
     return parsed
 
 
-def _shell_argv(text: str) -> list[str]:
-    """The argv systemd hands to the shell."""
-    return shlex.split(_sections(text)["Service"]["ExecStart"])
-
-
 def _exec_argv(text: str) -> list[str]:
-    """The argv the shell execs."""
-    return shlex.split(_shell_argv(text)[2])
+    """The argv systemd runs. No shell sits between it and the gateway."""
+    return shlex.split(_sections(text)["Service"]["ExecStart"])
 
 
 def _record(calls: list[list[str]]):
@@ -57,15 +52,31 @@ def _raised(call) -> BaseException | None:
     return None
 
 
-def test_execstart_runs_under_a_login_shell():
+def test_execstart_runs_no_shell():
+    """The login shell went when its reason did: the key now has a file home.
+
+    A shell here would put the user's profile back in the start path, which is
+    what let a gateway be healthy for 33 hours while serving nothing.
+    """
     # Arrange
     text = render_unit()
 
     # Act
-    argv = _shell_argv(text)
+    argv = _exec_argv(text)
 
     # Assert
-    assert argv[:2] == ["/bin/bash", "-lc"]
+    assert "bash" not in argv[0]
+
+
+def test_execstart_begins_with_the_interpreter_that_installed_it():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    argv = _exec_argv(text)
+
+    # Assert
+    assert argv[0] == sys.executable
 
 
 def test_with_no_flags_the_unit_execs_only_this_interpreter_and_the_module():
@@ -76,7 +87,7 @@ def test_with_no_flags_the_unit_execs_only_this_interpreter_and_the_module():
     argv = _exec_argv(text)
 
     # Assert
-    assert argv == ["exec", sys.executable, "-m", MODULE]
+    assert argv == [sys.executable, "-m", MODULE]
 
 
 def test_given_settings_are_baked_into_execstart():
@@ -87,7 +98,7 @@ def test_given_settings_are_baked_into_execstart():
     argv = _exec_argv(text)
 
     # Assert
-    assert argv[4:] == [
+    assert argv[3:] == [
         "--host",
         "0.0.0.0",
         "--port",
@@ -105,7 +116,7 @@ def test_a_config_path_is_baked_into_execstart():
     argv = _exec_argv(text)
 
     # Assert
-    assert argv[4:] == ["--config", "/srv/genai/config.yaml"]
+    assert argv[3:] == ["--config", "/srv/genai/config.yaml"]
 
 
 def test_the_description_names_the_settings_file():
@@ -235,7 +246,7 @@ def test_a_second_install_carries_the_new_settings(tmp_path: Path):
     path = install_unit(port=18790, unit_dir=tmp_path, enable=False)
 
     # Assert
-    assert _exec_argv(path.read_text())[4:] == ["--port", "18790"]
+    assert _exec_argv(path.read_text())[3:] == ["--port", "18790"]
 
 
 def test_default_unit_dir_is_the_user_manager_directory():

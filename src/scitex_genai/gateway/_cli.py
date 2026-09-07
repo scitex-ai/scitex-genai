@@ -31,9 +31,11 @@ from ._inference import (
     announce,
     telemetry_enabled,
 )
+from ._errors import CredentialError
+from ._secrets import GATEWAY_KEY_ENV, default_secrets_path, resolve_gateway_key
 from ._server import create_app
 from ._settings import load_settings
-from ._unit import UNIT_NAME, install_unit
+from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 
 INSTALL_UNIT = "install-unit"
 
@@ -109,7 +111,52 @@ def _telemetry_sink():
     return lambda line: print(line, flush=True)
 
 
+def _persist_key(*, replacing_a_unit: bool) -> None:
+    """Give the key a home before anything depends on it having one.
+
+    Run at install time, from whatever shell the operator used, so a key that
+    exists ONLY as an ``export`` line in their profile is captured into the
+    secrets file at its current value. That ordering is what lets the unit stop
+    asking for a login shell without changing the key every client already
+    presents.
+
+    THE REFUSAL BELOW IS THE POINT OF THIS FUNCTION, not a detail of it. On a
+    host that already has a gateway, clients are already holding a key. If this
+    call had to INVENT one -- which happens when it is run from a shell where
+    the old key does not resolve, exactly the non-login case this whole change
+    is about -- then installing would replace a working key with one nobody
+    has, and the symptom would be the outage we just fixed, reappearing at the
+    moment we claimed to have fixed it. So it stops, and says which shell to
+    re-run from.
+
+    A first install has no such risk: there are no clients yet, and minting is
+    what makes the host work with no manual step.
+    """
+    if replacing_a_unit:
+        try:
+            key = resolve_gateway_key()
+        except CredentialError as exc:
+            raise SystemExit(
+                f"refusing to install: a gateway unit already exists here, so "
+                f"clients already hold a key, but none resolved -- installing "
+                f"would mint a NEW one and every client would start getting "
+                f"401s. Re-run from a shell where {GATEWAY_KEY_ENV} resolves "
+                f"(the login shell whose profile holds it), or write the "
+                f"existing value into {default_secrets_path()} as "
+                f"{GATEWAY_KEY_ENV}=<value> first."
+            ) from exc
+    else:
+        key = resolve_gateway_key(create=True)
+    print(
+        f"scitex-genai-gateway: key {key.origin}"
+        + (f" -> {key.path}" if key.path else " (kept; nothing written)"),
+        flush=True,
+    )
+
+
 def _install_unit(args: argparse.Namespace) -> None:
+    unit_dir = args.unit_dir if args.unit_dir is not None else DEFAULT_UNIT_DIR
+    _persist_key(replacing_a_unit=(Path(unit_dir) / UNIT_NAME).exists())
     path = install_unit(
         host=args.host,
         port=args.port,
@@ -149,7 +196,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         codex_pool = CodexAccountPool.discover()
         backend = CodexBackend(codex_pool, CodexTransport(base_url=args.codex_base_url))
-    app = create_app(backend)
+    key = resolve_gateway_key(create=True)
+    print(f"scitex-genai-gateway: key {key.origin}", flush=True)
+    app = create_app(backend, api_key=key.value)
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level)
 
 

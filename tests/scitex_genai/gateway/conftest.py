@@ -8,12 +8,49 @@ and reads a real chunked reply — the same path a vLLM upstream exercises.
 from __future__ import annotations
 
 import http.server
+import os
 import socket
 import threading
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
+
+from scitex_genai.gateway._secrets import GATEWAY_KEY_ENV
+
+
+@pytest.fixture(autouse=True)
+def isolate_the_scitex_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """No gateway test may read or write the developer's real ``~/.scitex``.
+
+    ``install-unit`` LEGITIMATELY writes the gateway key to
+    ``$SCITEX_DIR/genai/secrets``, so any test that drives the CLI writes a real
+    key into a real home unless the store is redirected. Measured 2026-09-07:
+    it did exactly that on the machine this was written on, before this fixture
+    existed -- a 64-character key appeared in ``~/.scitex/genai/secrets`` as a
+    side effect of running the suite.
+
+    The key variable is cleared for the same reason it is cleared in
+    ``test__secrets``: this fleet injects ``SCITEX_*`` names into agent
+    containers, and a test that inherits one stops testing the logic and starts
+    testing the ambient environment -- passing in CI where it is unset and
+    behaving differently everywhere it is set.
+
+    Autouse and in ``conftest`` on purpose: a future test that calls the CLI
+    cannot forget to do this, which is the difference between a rule and a
+    barrier.
+    """
+    previous = {
+        name: os.environ.get(name) for name in ("SCITEX_DIR", GATEWAY_KEY_ENV)
+    }
+    os.environ["SCITEX_DIR"] = str(tmp_path_factory.mktemp("scitex"))
+    os.environ.pop(GATEWAY_KEY_ENV, None)
+    yield
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 class RecordingUpstream:
