@@ -32,7 +32,12 @@ from ._inference import (
     telemetry_enabled,
 )
 from ._errors import CredentialError
-from ._secrets import GATEWAY_KEY_ENV, default_secrets_path, resolve_gateway_key
+from ._secrets import (
+    GATEWAY_KEY_ENV,
+    default_secrets_path,
+    resolve_gateway_key,
+    write_key,
+)
 from ._server import create_app
 from ._settings import load_settings
 from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
@@ -147,11 +152,17 @@ def _persist_key(*, replacing_a_unit: bool) -> None:
             ) from exc
     else:
         key = resolve_gateway_key(create=True)
-    print(
-        f"scitex-genai-gateway: key {key.origin}"
-        + (f" -> {key.path}" if key.path else " (kept; nothing written)"),
-        flush=True,
-    )
+
+    # RESOLVING IS NOT PERSISTING, and this line is the whole function.
+    # A key that resolved from the ENVIRONMENT lives only in this shell. The
+    # unit written moments from now runs without one, so unless the value is
+    # put in the file HERE, the next start finds nothing and mints a
+    # replacement -- rotating the key every client holds. Measured on
+    # scitex-compute-04 2026-09-07: install-unit printed "key environment
+    # (kept; nothing written)" and wrote the shell-free unit anyway, leaving
+    # exactly that gap open until the key was written by hand.
+    stored = key.path if key.origin != "environment" else write_key(key.value)
+    print(f"scitex-genai-gateway: key {key.origin} -> {stored}", flush=True)
 
 
 def _install_unit(args: argparse.Namespace) -> None:

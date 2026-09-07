@@ -13,7 +13,6 @@ patching fixture, because the production code reads the real one.
 from __future__ import annotations
 
 import contextlib
-import os
 import stat
 
 import pytest
@@ -30,16 +29,6 @@ from scitex_genai.gateway._secrets import (
     write_key,
 )
 from scitex_genai.gateway._settings import default_config_path
-
-
-@pytest.fixture(autouse=True)
-def gateway_key_env():
-    """Clear the real variable, yield a setter, restore what was there before."""
-    original = os.environ.pop(GATEWAY_KEY_ENV, None)
-    yield lambda value: os.environ.__setitem__(GATEWAY_KEY_ENV, value)
-    os.environ.pop(GATEWAY_KEY_ENV, None)
-    if original is not None:
-        os.environ[GATEWAY_KEY_ENV] = original
 
 
 @pytest.fixture
