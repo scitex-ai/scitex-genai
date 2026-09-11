@@ -1,0 +1,61 @@
+{
+  "$schema": "qwen38-scheduler-matrix.schema.json",
+  "schema_version": 1,
+  "production_change": false,
+  "measurement_status": "unmeasured",
+  "sglang_commit": "4ccff141dbe992794f9da6c3aa23535b4f72000d",
+  "sglang_image": "/data/scratch/projects/punim0264/ywatanabe/containers/sglang-qwen38-cu12-amd64-45e39d4c5bcf.sif",
+  "sglang_image_sha256": "b742f112f8403417c781216e9d4cf9d7eff49f2d6127e682805c40225a74cab2",
+  "profiles": [
+    {
+      "id": "fcfs-eagle-c32768",
+      "file": "qwen38-fcfs-eagle-c32768.conf",
+      "schedule_policy": "fcfs",
+      "chunked_prefill_size": 32768,
+      "max_prefill_tokens": 32768,
+      "speculation": "eagle",
+      "mixed_chunk": false,
+      "purpose": "Measured-production-shape baseline"
+    },
+    {
+      "id": "lpm-eagle-c32768",
+      "file": "qwen38-lpm-eagle-c32768.conf",
+      "schedule_policy": "lpm",
+      "chunked_prefill_size": 32768,
+      "max_prefill_tokens": 32768,
+      "speculation": "eagle",
+      "mixed_chunk": false,
+      "purpose": "Negative control for waiting-queue reordering"
+    },
+    {
+      "id": "fcfs-eagle-c8192",
+      "file": "qwen38-fcfs-eagle-c8192.conf",
+      "schedule_policy": "fcfs",
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 32768,
+      "speculation": "eagle",
+      "mixed_chunk": false,
+      "purpose": "Measure whether smaller chunks admit a later warm request"
+    },
+    {
+      "id": "fcfs-eagle-c4096",
+      "file": "qwen38-fcfs-eagle-c4096.conf",
+      "schedule_policy": "fcfs",
+      "chunked_prefill_size": 4096,
+      "max_prefill_tokens": 32768,
+      "speculation": "eagle",
+      "mixed_chunk": false,
+      "purpose": "Measure fairness and cold-prefill overhead at a smaller chunk"
+    },
+    {
+      "id": "fcfs-noeagle-mixed-c8192",
+      "file": "qwen38-fcfs-noeagle-mixed-c8192.conf",
+      "schedule_policy": "fcfs",
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 32768,
+      "speculation": "off",
+      "mixed_chunk": true,
+      "purpose": "Control for protecting requests that are already decoding"
+    }
+  ]
+}
