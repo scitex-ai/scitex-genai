@@ -515,8 +515,11 @@ async def test_concurrent_health_callers_share_one_probe_generation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_injected_health_probe_obeys_end_to_end_timeout() -> None:
+async def test_injected_health_probe_obeys_python_310_end_to_end_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Arrange
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
     cancelled = asyncio.Event()
 
     async def stalled(_url: str, _timeout_s: float) -> UpstreamReachability:

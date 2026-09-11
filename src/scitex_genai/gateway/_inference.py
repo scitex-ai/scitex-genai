@@ -832,16 +832,19 @@ class InferenceBackend:
 
         async def run(url: str) -> UpstreamReachability:
             started = time.monotonic()
+
+            async def request_observation() -> UpstreamReachability:
+                if self._health_probe is not None:
+                    return await self._health_probe(url, self.health_probe_timeout_s)
+                return await probe_upstream(
+                    url, timeout_s=self.health_probe_timeout_s
+                )
+
             try:
-                async with asyncio.timeout(self.health_probe_timeout_s):
-                    if self._health_probe is not None:
-                        return await self._health_probe(
-                            url, self.health_probe_timeout_s
-                        )
-                    return await probe_upstream(
-                        url, timeout_s=self.health_probe_timeout_s
-                    )
-            except TimeoutError:
+                return await asyncio.wait_for(
+                    request_observation(), timeout=self.health_probe_timeout_s
+                )
+            except asyncio.TimeoutError:
                 return timed_out_reachability(started, monotonic=time.monotonic)
 
         snapshot = await self.pool.cooldown_snapshot()

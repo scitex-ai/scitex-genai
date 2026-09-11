@@ -7,7 +7,7 @@ import errno
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -53,7 +53,7 @@ def public_upstream_url(url: str) -> str:
 
 
 def _checked_at() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _is_connection_refused(exc: BaseException) -> bool:
