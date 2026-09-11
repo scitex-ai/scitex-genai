@@ -25,6 +25,7 @@ def _scenario() -> dict:
             {
                 "id": "cold",
                 "arrival_ms": 0,
+                "cache_state": "cold",
                 "expected_prompt_tokens": 10,
                 "body": {
                     "model": "fake",
@@ -36,6 +37,7 @@ def _scenario() -> dict:
             {
                 "id": "warm",
                 "arrival_ms": 0,
+                "cache_state": "warm",
                 "expected_prompt_tokens": 10,
                 "body": {
                     "model": "fake",
@@ -182,6 +184,105 @@ def test_manifest_requires_the_fixed_seed_in_each_body(tmp_path: Path):
     # Assert
     with ctx:
         load_scenario(path)
+
+
+def test_manifest_marks_two_cold_requests_as_a_crash_probe(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    for request in scenario["requests"]:
+        request["cache_state"] = "cold"
+    path = tmp_path / "unmarked-cold-cold.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+def test_multi_request_manifest_requires_explicit_cache_state(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    scenario["requests"][1].pop("cache_state")
+    path = tmp_path / "missing-cache-state.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="cache_state is required")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+def test_two_unknown_requests_are_a_crash_probe(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    for request in scenario["requests"]:
+        request["cache_state"] = "unknown"
+    path = tmp_path / "unknown-unknown.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+@pytest.mark.asyncio
+async def test_direct_runner_validates_crash_probe_metadata():
+    # Arrange
+    scenario = _scenario()
+    scenario["requests"][1]["cache_state"] = "cold"
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
+
+    # Act
+    # Assert
+    with ctx:
+        await run_scenario(
+            scenario,
+            endpoint="http://canary.invalid/v1/chat/completions",
+            acknowledge_isolated_canary=True,
+            run_id="direct-cold-cold",
+        )
+
+
+def test_crash_probe_requires_a_dedicated_canary_target(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    scenario["risk_class"] = "crash-probe"
+    path = tmp_path / "unsafe-target.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="target_scope dedicated-canary")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+@pytest.mark.asyncio
+async def test_crash_probe_requires_its_second_acknowledgement():
+    # Arrange
+    scenario = _scenario()
+    scenario.update(risk_class="crash-probe", target_scope="dedicated-canary")
+    ctx = pytest.raises(PermissionError, match="may-crash-the-isolated-canary")
+
+    # Act
+    # Assert
+    with ctx:
+        await run_scenario(
+            scenario,
+            endpoint="http://canary.invalid/v1/chat/completions",
+            acknowledge_isolated_canary=True,
+            acknowledge_crash_probe=False,
+            run_id="crash-probe",
+        )
 
 
 @pytest.mark.asyncio
