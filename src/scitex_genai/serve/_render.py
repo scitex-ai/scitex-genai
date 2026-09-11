@@ -154,6 +154,7 @@ def _sglang_container_prefix(
             (
                 *(name for name in CACHE_SUBDIRS if name != "HOME"),
                 *conf.env,
+                "CUDA_VISIBLE_DEVICES",
                 "SGLANG_JIT_DEEPGEMM_FAST_WARMUP",
                 SGLANG_UNIFIED_RADIX_ENV,
             )

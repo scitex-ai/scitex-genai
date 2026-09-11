@@ -26,7 +26,9 @@ import shlex
 import sys
 from pathlib import Path
 
-from ._canary import validate_runtime, write_runtime_manifest
+from scitex_dev.store import StoreError
+
+from ._canary import publish_runtime_manifest, validate_runtime
 from ._conf import list_engines, load_engine
 from ._launch import book_serve_lease, render_hold_body
 from ._render import Launch, render
@@ -194,8 +196,15 @@ def main(argv: list[str] | None = None) -> int:
         print(describe(launch))
         return 0
     if manifest is not None:
-        path = write_runtime_manifest(launch.cache_dir, manifest)
-        print(f"scitex-genai-serve: canary incarnation manifest -> {path}")
+        try:
+            destination = publish_runtime_manifest(manifest)
+        except StoreError as exc:
+            print(
+                f"scitex-genai-serve: cannot publish canary incarnation: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"scitex-genai-serve: canary incarnation -> {destination}")
     EngineRunner(launch).run_forever()
     return 0
 

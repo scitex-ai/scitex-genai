@@ -131,9 +131,25 @@ def _flag_value(args: tuple[str, ...], flag: str) -> str | None:
     return args[index] if index < len(args) else None
 
 
+_HICACHE_GUARDED_FLAGS = (
+    "--enable-hierarchical-cache",
+    "--hicache-size",
+    "--hicache-write-policy",
+    "--hicache-mem-layout",
+    "--hicache-io-backend",
+    "--hicache-storage-backend",
+    "--hicache-storage-prefetch-policy",
+    "--hicache-storage-backend-extra-config",
+    "--page-size",
+)
+
+
 def _validate_hicache(args: tuple[str, ...], env: dict[str, str]) -> None:
     if "--enable-hierarchical-cache" not in args:
         return
+    duplicates = tuple(flag for flag in _HICACHE_GUARDED_FLAGS if args.count(flag) > 1)
+    if duplicates:
+        raise ValueError(f"duplicate guarded HiCache flags: {', '.join(duplicates)}")
     size = _positive_number(_flag_value(args, "--hicache-size"))
     if size is None:
         raise ValueError(
@@ -338,11 +354,24 @@ class EngineConf:
             )
         if self.engine == "sglang":
             _validate_hicache(self.extra_sglang_args, self.env)
+        if self.canary_only and self.hicache_size_gb_per_rank:
+            total_hicache_gb = self.hicache_size_gb_per_rank * self.tp
+            if total_hicache_gb + 32 > self.required_host_memory_gb:
+                raise ValueError(
+                    f"{self.key} HiCache requests {total_hicache_gb:g} GB across "
+                    f"TP={self.tp}; REQUIRED_HOST_MEMORY_GB must leave at least "
+                    "32 GB host headroom"
+                )
 
     @property
     def engine_port(self) -> int:
         """Engine listen port; ``vllm_port`` remains the compatible field name."""
         return self.vllm_port
+
+    @property
+    def hicache_size_gb_per_rank(self) -> float:
+        value = _flag_value(self.extra_sglang_args, "--hicache-size")
+        return _positive_number(value) or 0
 
 
 def _values(text: str, source: Path | None) -> dict[str, str]:

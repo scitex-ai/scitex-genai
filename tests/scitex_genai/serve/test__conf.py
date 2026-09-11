@@ -462,6 +462,34 @@ def test_hicache_refuses_a_non_positive_or_unparseable_size(value: str):
     assert "positive --hicache-size" in str(raised)
 
 
+def test_hicache_refuses_duplicate_guarded_flags():
+    # Arrange
+    root = Path(__file__).parents[3]
+    path = root / "examples/serve/qwen38-27b-sglang-hicache-l2-canary.conf"
+    text = path.read_text().replace(
+        "--hicache-size 32", "--hicache-size 32 --hicache-size 1024"
+    )
+
+    # Act
+    raised = _raised(lambda: parse_engine_conf(path.stem, text, source=path))
+
+    # Assert
+    assert "duplicate guarded HiCache flags" in str(raised)
+
+
+def test_canary_hicache_size_must_leave_declared_host_headroom():
+    # Arrange
+    root = Path(__file__).parents[3]
+    path = root / "examples/serve/qwen38-27b-sglang-hicache-l2-canary.conf"
+    text = path.read_text().replace("--hicache-size 32", "--hicache-size 49")
+
+    # Act
+    raised = _raised(lambda: parse_engine_conf(path.stem, text, source=path))
+
+    # Assert
+    assert "must leave at least 32 GB host headroom" in str(raised)
+
+
 @pytest.mark.parametrize("value", ["0", "1.1", '"bad"'])
 def test_file_hicache_refuses_an_invalid_eviction_ratio(value: str):
     # Arrange

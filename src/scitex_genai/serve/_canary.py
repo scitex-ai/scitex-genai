@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import socket
 import subprocess
-import tempfile
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -16,6 +14,7 @@ from ._conf import EngineConf
 
 @dataclass(frozen=True)
 class RuntimeObservation:
+    cuda_visible_devices: tuple[str, ...]
     gpu_names: tuple[str, ...]
     active_gpu_processes: tuple[str, ...]
     busy_ports: tuple[int, ...]
@@ -35,7 +34,41 @@ def _model_manifest(conf: EngineConf) -> tuple[str, dict[str, str]]:
     for name in conf.model_manifest_files:
         entries[name] = _file_sha256(conf.model_path / name)
     canonical = "".join(f"{digest}  {name}\n" for name, digest in entries.items())
+    _verify_checkpoint_crc32(conf.model_path)
     return hashlib.sha256(canonical.encode()).hexdigest(), entries
+
+
+def _verify_checkpoint_crc32(model_path: Path) -> None:
+    manifest = model_path / "crc32.txt"
+    expected: dict[str, int] = {}
+    for number, raw in enumerate(manifest.read_text().splitlines(), start=1):
+        if not raw.strip():
+            continue
+        parts = raw.split(maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError(f"crc32.txt:{number}: expected '<crc32> <path>'")
+        digest, name = parts
+        relative = Path(name.strip())
+        if (
+            len(digest) != 8
+            or any(ch not in "0123456789abcdefABCDEF" for ch in digest)
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or str(relative) in expected
+        ):
+            raise ValueError(f"crc32.txt:{number}: invalid or duplicate entry")
+        expected[str(relative)] = int(digest, 16)
+    shards = {path.name for path in model_path.glob("*.safetensors")}
+    declared_shards = {name for name in expected if name.endswith(".safetensors")}
+    if not shards or declared_shards != shards:
+        raise ValueError("crc32.txt must name every safetensors shard exactly once")
+    for name in sorted(declared_shards):
+        actual = 0
+        with (model_path / name).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                actual = zlib.crc32(chunk, actual)
+        if actual & 0xFFFFFFFF != expected[name]:
+            raise ValueError(f"checkpoint CRC32 mismatch: {name}")
 
 
 def _memory_gb(env: dict[str, str]) -> float:
@@ -53,19 +86,25 @@ def _memory_gb(env: dict[str, str]) -> float:
     return value * factors[suffix]
 
 
-def _gpu_ids(env: dict[str, str]) -> str:
-    value = env.get("SLURM_STEP_GPUS") or env.get("SLURM_JOB_GPUS")
-    if not value:
+def _gpu_ids(env: dict[str, str]) -> tuple[str, ...]:
+    allocated = env.get("SLURM_STEP_GPUS") or env.get("SLURM_JOB_GPUS")
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if not allocated:
         raise ValueError("SLURM_STEP_GPUS is unset; start through the documented srun")
-    return value
+    if not visible:
+        raise ValueError("CUDA_VISIBLE_DEVICES is unset; inherit it from srun")
+    ids = tuple(part.strip() for part in visible.split(",") if part.strip())
+    if not ids:
+        raise ValueError("CUDA_VISIBLE_DEVICES does not identify any GPUs")
+    return ids
 
 
-def _nvidia_query(ids: str, query: str) -> tuple[str, ...]:
+def _nvidia_query(ids: tuple[str, ...], query: str) -> tuple[str, ...]:
     proc = subprocess.run(
         [
             "nvidia-smi",
             "--id",
-            ids,
+            ",".join(ids),
             f"--query-{query}",
             "--format=csv,noheader,nounits",
         ],
@@ -96,6 +135,7 @@ def observe_runtime(conf: EngineConf, env: dict[str, str]) -> RuntimeObservation
         ) from exc
     ports = (conf.engine_port, conf.litellm_port, conf.tunnel_port)
     return RuntimeObservation(
+        cuda_visible_devices=ids,
         gpu_names=names,
         active_gpu_processes=processes,
         busy_ports=tuple(port for port in ports if _port_is_busy(port)),
@@ -124,6 +164,11 @@ def validate_runtime(
     assert conf.required_gpu_count is not None
     assert conf.required_gpu_model is not None
     assert conf.required_host_memory_gb is not None
+    if len(observed.cuda_visible_devices) != conf.required_gpu_count:
+        raise ValueError(
+            f"canary requires {conf.required_gpu_count} visible GPUs; "
+            f"CUDA_VISIBLE_DEVICES exposes {observed.cuda_visible_devices}"
+        )
     if len(observed.gpu_names) != conf.required_gpu_count:
         raise ValueError(
             f"canary requires {conf.required_gpu_count} GPUs; observed {len(observed.gpu_names)}"
@@ -139,6 +184,13 @@ def validate_runtime(
         raise ValueError(
             f"canary requires {conf.required_host_memory_gb} GB host RAM; "
             f"observed {observed.host_memory_gb:g} GB"
+        )
+    hicache_gb = conf.hicache_size_gb_per_rank * conf.tp
+    available_gb = min(observed.host_memory_gb, conf.required_host_memory_gb)
+    if hicache_gb + 32 > available_gb:
+        raise ValueError(
+            f"HiCache requests {hicache_gb:g} GB across TP={conf.tp}; "
+            f"at least 32 GB host headroom is required within {available_gb:g} GB"
         )
     if observed.active_gpu_processes:
         raise ValueError(
@@ -177,13 +229,57 @@ def validate_runtime(
     }
 
 
-def write_runtime_manifest(cache_dir: Path, manifest: dict[str, object]) -> Path:
-    directory = cache_dir / "canary-incarnations"
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / f"{manifest['incarnation_id']}.json"
-    text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    with tempfile.NamedTemporaryFile("w", dir=directory, delete=False) as handle:
-        handle.write(text)
-        temporary = Path(handle.name)
-    os.replace(temporary, destination)
-    return destination
+def _incarnation_schema():
+    from scitex_dev.store import (
+        FieldKind,
+        FieldPolicy,
+        FieldRole,
+        MergeRule,
+        Schema,
+    )
+
+    def field(kind: FieldKind, role: FieldRole) -> FieldPolicy:
+        return FieldPolicy(
+            kind=kind,
+            role=role,
+            required=True,
+            merge=MergeRule.IMMUTABLE,
+            indexed=role is FieldRole.IDENTITY,
+        )
+
+    return Schema.build(
+        "genai_canary_incarnations",
+        {
+            "incarnation_id": field(FieldKind.TEXT, FieldRole.IDENTITY),
+            "purpose": field(FieldKind.TEXT, FieldRole.DATA),
+            "node": field(FieldKind.TEXT, FieldRole.DATA),
+            "manifest": field(FieldKind.JSON, FieldRole.DATA),
+        },
+    )
+
+
+def publish_runtime_manifest(
+    manifest: dict[str, object], *, target=None
+) -> str:
+    """Publish one immutable incarnation to the fleet's PostgreSQL store."""
+    from scitex_dev.store import NEW_RECORD, Store, WriterPolicy, host_store
+
+    node = str(manifest["slurm"]["node"])
+    resolved = target or host_store(pkg="scitex_genai", name="canary_incarnations")
+    with Store(
+        resolved,
+        _incarnation_schema(),
+        node=node,
+        writer_policy=WriterPolicy.SINGLE_WRITER,
+        actor="scitex_genai.serve",
+    ) as store:
+        store.put(
+            {
+                "incarnation_id": manifest["incarnation_id"],
+                "purpose": manifest["purpose"],
+                "node": node,
+                "manifest": manifest,
+            },
+            expected_revision=NEW_RECORD,
+        )
+    return f"{resolved.describe()}#{manifest['incarnation_id']}"

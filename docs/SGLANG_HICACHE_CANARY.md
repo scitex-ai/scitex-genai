@@ -22,7 +22,9 @@ The container preflight additionally requires SGLang
 `0.0.0.dev1+g4ccff141d.d20260907`.
 
 The model guard hashes `config.json`, tokenizer configuration and vocabulary,
-the chat template, checkpoint index, and the checkpoint CRC manifest. Their
+the chat template, checkpoint index, and the checkpoint CRC manifest. It also
+streams every `.safetensors` shard through CRC32 and requires the manifest to
+name every shard exactly once. Their
 canonical manifest is checked in at
 `examples/serve/manifests/qwen38-27b-fp8.sha256`; its digest is
 `ae63fb8baffb044e4d0ee476a03283de640690e50fe3282c95996d9dc016a01c`.
@@ -56,7 +58,9 @@ scitex-genai-serve qwen38-27b-sglang-hicache-l2-canary \
 
 Dry-run does not require a lease. A real launch requires a dedicated idle lease:
 exactly two H100 GPUs, sufficient RAM, an `srun` step, no existing GPU compute
-process, and unused engine/sidecar ports. Never reuse a lease whose hold body
+process, and unused engine/sidecar ports. GPU visibility is inherited from
+`srun`; profiles never replace `CUDA_VISIBLE_DEVICES` with assumed indices.
+Never reuse a lease whose hold body
 already starts an inference engine.
 
 For L2, run this exact step after resolving `CANARY_JOB_ID` from the lease store:
@@ -80,9 +84,11 @@ srun --overlap --jobid="${CANARY_JOB_ID:?}" --nodes=1 --ntasks=1 \
 ```
 
 At launch, the validator resolves the current job, step, node, GPU inventory,
-RAM, occupied GPU processes, ports, image digest, and model manifest into
-`<cache-root>/<engine>-cache/canary-incarnations/slurm-<job>-step-<step>-<node>.json`.
-This is the run-specific incarnation record; it is state, not recipe.
+RAM, occupied GPU processes, ports, image digest, and model manifest. It
+publishes that run-specific incarnation through `scitex_dev.store.host_store()`
+to the central PostgreSQL state store on port 55432. Failure to publish refuses
+the launch; there is no node-local JSON fallback. The record identity is
+`slurm-<job>-step-<step>-<node>`: runtime state, not recipe.
 
 ## Promotion gate
 
