@@ -220,10 +220,20 @@ class ExternalProviderBackend(InferenceBackend):
                     f"Responses API does not accept {names}; use max_output_tokens"
                 )
             max_field = "max_output_tokens"
-        elif "max_completion_tokens" in payload:
-            max_field = "max_completion_tokens"
         else:
-            max_field = "max_tokens"
+            chat_fields = {"max_tokens", "max_completion_tokens"}.intersection(
+                payload
+            )
+            if "max_output_tokens" in payload or len(chat_fields) > 1:
+                raise ModelPolicyError(
+                    "Chat request has ambiguous output limits; use exactly one of "
+                    "max_tokens or max_completion_tokens"
+                )
+            max_field = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in chat_fields
+                else "max_tokens"
+            )
         requested_output = payload.get(max_field, self.policy.max_tokens_per_request)
         if isinstance(requested_output, bool):
             raise ModelPolicyError(f"{max_field} must be a positive integer")
@@ -306,9 +316,17 @@ class ExternalProviderBackend(InferenceBackend):
             async for chunk in body:
                 if is_stream:
                     pending_line.extend(chunk)
+                    emittable = bytearray()
                     while b"\n" in pending_line:
                         raw_line, _, remainder = pending_line.partition(b"\n")
                         pending_line = bytearray(remainder)
+                        if len(raw_line) > _MAX_AUDIT_BUFFER:
+                            raise ModelPolicyError(
+                                "Provider stream event exceeded the effective-model "
+                                "audit limit"
+                            )
+                        emittable.extend(raw_line)
+                        emittable.extend(b"\n")
                         if not raw_line.startswith(b"data:"):
                             continue
                         data = raw_line[5:].strip()
@@ -328,20 +346,43 @@ class ExternalProviderBackend(InferenceBackend):
                         if seen_model:
                             reported_model = seen_model
                     if len(pending_line) > _MAX_AUDIT_BUFFER:
-                        pending_line.clear()
+                        raise ModelPolicyError(
+                            "Provider stream event exceeded the effective-model "
+                            "audit limit"
+                        )
                     if reported_model and reported_model != self.policy.canonical_model:
                         model_mismatch = True
                         raise ModelPolicyError(
                             "Provider reported a model outside the outbound policy: "
                             f"{reported_model!r}"
                         )
-                    yield chunk
+                    if emittable:
+                        yield bytes(emittable)
                 else:
                     if len(captured) + len(chunk) > _MAX_AUDIT_BUFFER:
                         raise ModelPolicyError(
                             "Provider response exceeded the effective-model audit limit"
                         )
                     captured.extend(chunk)
+            if is_stream and pending_line:
+                raw_line = bytes(pending_line)
+                if raw_line.startswith(b"data:"):
+                    data = raw_line[5:].strip()
+                    if data and data != b"[DONE]":
+                        try:
+                            candidate = json.loads(data)
+                        except ValueError:
+                            candidate = None
+                        input_tokens, output_tokens, reported_model = (
+                            _usage_from_payload(candidate)
+                        )
+                if reported_model and reported_model != self.policy.canonical_model:
+                    model_mismatch = True
+                    raise ModelPolicyError(
+                        "Provider reported a model outside the outbound policy: "
+                        f"{reported_model!r}"
+                    )
+                yield raw_line
             if not is_stream:
                 try:
                     candidate = json.loads(bytes(captured))

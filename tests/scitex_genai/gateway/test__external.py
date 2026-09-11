@@ -401,6 +401,81 @@ async def test_responses_api_refuses_legacy_output_field_before_upstream(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_limits",
+    [
+        {"max_completion_tokens": 1, "max_tokens": 999_999_999},
+        {
+            "max_completion_tokens": 1,
+            "max_tokens": 999_999_999,
+            "max_output_tokens": 1,
+        },
+    ],
+)
+async def test_chat_refuses_conflicting_output_limits_before_upstream(
+    upstream_factory, extra_limits
+):
+    # Arrange
+    upstream = upstream_factory()
+    app = create_app(_backend(upstream), api_key="local")
+    body = _body()
+    body.update(extra_limits)
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=body,
+            headers={"authorization": "Bearer local"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        upstream.requests,
+    ) == (400, "model_policy", [])
+
+
+@pytest.mark.asyncio
+async def test_oversized_split_sse_event_fails_before_unverified_bytes_are_yielded(
+    upstream_factory,
+):
+    # Arrange
+    upstream = upstream_factory(
+        content_type="text/event-stream",
+        chunks=(
+            b'data: {"padding":"',
+            b"x" * (8 * 1024 * 1024 + 1),
+            b'","model":"deepseek-v4-pro"}\n\n',
+        ),
+    )
+    backend = _backend(upstream)
+    relayed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=json.dumps(_body(stream=True)).encode(),
+        headers={"x-scitex-run-id": "run"},
+    )
+    delivered = bytearray()
+    raised: BaseException | None = None
+    # Act
+    try:
+        async for chunk in relayed.body:
+            delivered.extend(chunk)
+    except ModelPolicyError as exc:  # stx-allow: test-capture (reason: stream failure, zero delivery, and conservative billing share one proof.)
+        raised = exc
+    # Assert
+    assert (
+        isinstance(raised, ModelPolicyError),
+        bytes(delivered),
+        backend.usage.total.output_tokens,
+        backend.usage.last_reported_model,
+        len(upstream.requests),
+    ) == (True, b"", 20, "", 1)
+
+
+@pytest.mark.asyncio
 async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
     # Arrange
     upstream = upstream_factory(
