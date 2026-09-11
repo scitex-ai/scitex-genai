@@ -281,6 +281,92 @@ async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_fa
 
 
 @pytest.mark.asyncio
+async def test_partial_stream_usage_keeps_missing_output_reservation(upstream_factory):
+    # Arrange
+    upstream = upstream_factory(
+        content_type="text/event-stream",
+        chunks=(
+            b'data: {"model":"deepseek-flash","usage":{"prompt_tokens":9}}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+    )
+    backend = _backend(upstream, max_output_tokens_per_run=30)
+    app = create_app(backend, api_key="local")
+    headers = {"authorization": "Bearer local", "x-scitex-run-id": "same-run"}
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        first = await client.post(
+            "/v1/chat/completions", json=_body(stream=True), headers=headers
+        )
+        second = await client.post(
+            "/v1/chat/completions", json=_body(stream=True), headers=headers
+        )
+    # Assert
+    assert (
+        first.status_code,
+        second.status_code,
+        backend.usage.total.input_tokens,
+        backend.usage.total.output_tokens,
+        backend.usage.total.responses_without_usage,
+        len(upstream.requests),
+    ) == (200, 429, 9, 20, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_responses_api_uses_protocol_specific_output_field(upstream_factory):
+    # Arrange
+    upstream = upstream_factory(
+        chunks=(b'{"model":"deepseek-flash","usage":{"input_tokens":2,"output_tokens":1}}',)
+    )
+    app = create_app(_backend(upstream), api_key="local")
+    body = {"model": "deepseek-flash", "input": "hello", "max_output_tokens": 12}
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            json=body,
+            headers={"authorization": "Bearer local"},
+        )
+    sent = json.loads(upstream.requests[0]["body"])
+    # Assert
+    assert (
+        response.status_code,
+        sent.get("max_output_tokens"),
+        "max_tokens" in sent,
+        "max_completion_tokens" in sent,
+    ) == (200, 12, False, False)
+
+
+@pytest.mark.asyncio
+async def test_responses_api_refuses_legacy_output_field_before_upstream(
+    upstream_factory,
+):
+    # Arrange
+    upstream = upstream_factory()
+    app = create_app(_backend(upstream), api_key="local")
+    body = {"model": "deepseek-flash", "input": "hello", "max_tokens": 99}
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        response = await client.post(
+            "/v1/responses",
+            json=body,
+            headers={"authorization": "Bearer local"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        upstream.requests,
+    ) == (400, "model_policy", [])
+
+
+@pytest.mark.asyncio
 async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
     # Arrange
     upstream = upstream_factory(

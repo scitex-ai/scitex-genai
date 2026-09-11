@@ -71,7 +71,15 @@ estimated cost, runs observed, the last model label reported by the provider,
 and response-model mismatches. No prompt, completion, raw run ID, or credential
 is retained. Streaming requests force provider usage reporting when the
 OpenAI-compatible route supports it; missing usage is conservatively charged
-as the full reservation.
+as the full reservation independently for each missing token dimension. A
+partial stream that reports input usage but omits its final output usage cannot
+release the reserved output or cost budget.
+
+The relay uses the endpoint's native output-limit field: `max_output_tokens`
+for `/v1/responses`, `max_completion_tokens` when explicitly used on chat
+completions, and otherwise `max_tokens`. Legacy chat limit fields on the
+Responses endpoint are rejected before upstream rather than forwarded beside
+the enforced ceiling.
 
 The optional `anthropic_path_prefix` lets one root serve both protocols:
 OpenAI `/v1/chat/completions` remains unchanged, while Anthropic `/v1/messages`
