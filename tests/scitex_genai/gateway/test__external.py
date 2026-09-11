@@ -174,6 +174,28 @@ async def test_usage_and_response_reported_model_are_audited_without_payload(
 
 
 @pytest.mark.asyncio
+async def test_external_health_does_not_probe_the_credentialed_provider(
+    upstream_factory,
+):
+    # Arrange
+    upstream = upstream_factory()
+    app = create_app(_backend(upstream), api_key="local")
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        response = await client.get("/health")
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["provider"],
+        response.json()["health_strategy"],
+        "external" in response.json(),
+        upstream.requests,
+    ) == (200, "external:deepseek", "external_provider_status", True, [])
+
+
+@pytest.mark.asyncio
 async def test_reported_non_flash_model_fails_response_and_is_billed(upstream_factory):
     # Arrange
     upstream = upstream_factory(

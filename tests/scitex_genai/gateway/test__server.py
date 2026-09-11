@@ -15,6 +15,7 @@ import pytest_asyncio
 pytest.importorskip("fastapi")
 
 from scitex_genai.gateway._errors import InferenceAdmissionError
+from scitex_genai.gateway._health import UpstreamReachability
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
 from scitex_genai.gateway._server import _build_uvicorn_server, create_app
 
@@ -268,33 +269,277 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
     # Act
     async with _serving(backend) as test_client:
         response = await test_client.get("/health")
+    payload = response.json()
+    member = payload["members"][0]
     # Assert
-    assert response.json() == {
-        "status": "ok",
-        "provider": "inference-upstream",
-        "upstreams": [upstream.url],
-        "members": [
-            {
-                "url": upstream.url,
-                "active": True,
-                "in_flight": 0,
-                "queued": 0,
-                "capacity": 8,
-            }
-        ],
-        "active_members": 1,
-        "in_flight": 0,
-        "queued": 0,
-        "cache_admission": {
-            "mode": "observe-only",
-            "running": 0,
-            "queued": 0,
-            "oldest_wait_s": 0.0,
-            "hot_overtakes": 0,
-            "observed": {"hot": 0, "cold": 0, "unknown": 0},
-            "admitted": {"hot": 0, "cold": 0, "unknown": 0},
-        },
-    }
+    assert (
+        payload["status"],
+        payload["health_strategy"],
+        payload["upstreams"],
+        payload["configured_members"],
+        payload["admission_eligible_members"],
+        payload["reachable_members"],
+        payload["active_members"],
+        member["url"],
+        member["configured"],
+        member["admission_eligible"],
+        member["reachable"],
+        member["active"],
+        member["reachability"]["reason"],
+    ) == (
+        "ok",
+        "local_control_plane",
+        [upstream.url],
+        1,
+        1,
+        1,
+        1,
+        upstream.url,
+        True,
+        True,
+        True,
+        True,
+        "responded",
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_health_degrades_after_consecutive_unreachable_observations() -> (
+    None
+):
+    # Arrange
+    async def unreachable(_url: str, _timeout_s: float) -> UpstreamReachability:
+        return UpstreamReachability(
+            False, "connection_refused", 1.2, "2026-09-12T00:00:00Z"
+        )
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls("http://127.0.0.1:18773"),
+        health_probe=unreachable,
+        health_cache_ttl_s=0,
+    )
+    # Act
+    async with _serving(backend) as test_client:
+        first = await test_client.get("/health")
+        response = await test_client.get("/health")
+    first_payload = first.json()
+    payload = response.json()
+    # Assert
+    assert (
+        response.status_code,
+        first.status_code,
+        first_payload["members"][0]["reachable"],
+        first_payload["members"][0]["ready"],
+        first_payload["members"][0]["reachability"]["consecutive_failures"],
+        payload["status"],
+        payload["reason"],
+        payload["configured_members"],
+        payload["admission_eligible_members"],
+        payload["reachable_members"],
+        payload["active_members"],
+        payload["members"][0]["reachability"]["reason"],
+    ) == (
+        503,
+        200,
+        False,
+        True,
+        1,
+        "degraded",
+        "no_inference_upstream_reachable",
+        1,
+        1,
+        0,
+        0,
+        "connection_refused",
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_health_clears_recovered_cooldown_and_wakes_waiter() -> None:
+    # Arrange
+    async def reachable(_url: str, _timeout_s: float) -> UpstreamReachability:
+        return UpstreamReachability(True, "responded", 2.4, "2026-09-12T00:00:00Z", 200)
+
+    pool = InferenceUpstreamPool.from_urls(
+        "http://127.0.0.1:18773", capacity_per_upstream=1
+    )
+    admitted = await pool.acquire("first")
+    waiting = asyncio.create_task(pool.acquire("second"))
+    for _ in range(100):
+        if pool.upstreams[0].queued == 1:
+            break
+        await asyncio.sleep(0)
+    await pool.cool_down(pool.upstreams[0], 30)
+    await pool.release(admitted)
+    backend = InferenceBackend(pool, health_probe=reachable)
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.get("/health")
+        recovered = await asyncio.wait_for(waiting, timeout=0.1)
+    payload = response.json()
+    member = payload["members"][0]
+    await pool.release(recovered)
+    # Assert
+    assert (
+        response.status_code,
+        payload["status"],
+        payload["reachable_members"],
+        payload["admission_eligible_members"],
+        payload["active_members"],
+        member["reachable"],
+        member["admission_eligible"],
+        pool.upstreams[0].cooldown_until,
+    ) == (
+        200,
+        "ok",
+        1,
+        1,
+        1,
+        True,
+        True,
+        0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_health_failed_probe_preserves_cooldown() -> None:
+    # Arrange
+    async def failed(_url: str, _timeout_s: float) -> UpstreamReachability:
+        return UpstreamReachability(
+            False, "connection_refused", 1.1, "2026-09-12T00:00:00Z"
+        )
+
+    pool = InferenceUpstreamPool.from_urls("http://127.0.0.1:18773")
+    await pool.cool_down(pool.upstreams[0], 30)
+    cooldown_until = pool.upstreams[0].cooldown_until
+    backend = InferenceBackend(
+        pool, health_probe=failed, health_failure_threshold=1
+    )
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.get("/health")
+    # Assert
+    assert (response.status_code, pool.upstreams[0].cooldown_until) == (
+        503,
+        cooldown_until,
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_health_timeout_probe_preserves_cooldown() -> None:
+    # Arrange
+    async def timed_out(_url: str, _timeout_s: float) -> UpstreamReachability:
+        return UpstreamReachability(False, "timeout", 1_000.0, "2026-09-12T00:00:00Z")
+
+    pool = InferenceUpstreamPool.from_urls("http://127.0.0.1:18773")
+    await pool.cool_down(pool.upstreams[0], 30)
+    cooldown_until = pool.upstreams[0].cooldown_until
+    backend = InferenceBackend(
+        pool, health_probe=timed_out, health_failure_threshold=1
+    )
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.get("/health")
+    # Assert
+    assert (response.status_code, pool.upstreams[0].cooldown_until) == (
+        503,
+        cooldown_until,
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_probe_cannot_clear_a_newer_concurrent_failure() -> None:
+    # Arrange
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def delayed_recovery(_url: str, _timeout_s: float) -> UpstreamReachability:
+        started.set()
+        await finish.wait()
+        return UpstreamReachability(True, "responded", 2.4, "2026-09-12T00:00:00Z", 200)
+
+    pool = InferenceUpstreamPool.from_urls("http://127.0.0.1:18773")
+    upstream = pool.upstreams[0]
+    await pool.cool_down(upstream, 30)
+    backend = InferenceBackend(pool, health_probe=delayed_recovery)
+    probe = asyncio.create_task(backend.probe_upstreams())
+    await started.wait()
+    await pool.cool_down(upstream, 60)
+    newer_cooldown = upstream.cooldown_until
+    finish.set()
+    # Act
+    await probe
+    # Assert
+    assert (upstream.cooldown_generation, upstream.cooldown_until) == (
+        2,
+        newer_cooldown,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_health_callers_share_one_probe_generation() -> None:
+    # Arrange
+    called = 0
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def slow_probe(_url: str, _timeout_s: float) -> UpstreamReachability:
+        nonlocal called
+        called += 1
+        started.set()
+        await finish.wait()
+        return UpstreamReachability(True, "responded", 1.0, "2026-09-12T00:00:00Z", 200)
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls("http://127.0.0.1:18773"),
+        health_probe=slow_probe,
+    )
+    tasks = [asyncio.create_task(backend.probe_upstreams()) for _ in range(25)]
+    await started.wait()
+    finish.set()
+    # Act
+    results = await asyncio.gather(*tasks)
+    cached = await backend.probe_upstreams()
+    # Assert
+    assert (
+        called,
+        len(results),
+        all(result[0].reachable for result in results),
+        cached[0].reachable,
+    ) == (
+        1,
+        25,
+        True,
+        True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_injected_health_probe_obeys_python_310_end_to_end_timeout() -> None:
+    # Arrange
+    cancelled = asyncio.Event()
+
+    async def stalled(_url: str, _timeout_s: float) -> UpstreamReachability:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls("http://127.0.0.1:18773"),
+        health_probe=stalled,
+        health_probe_timeout_s=0.01,
+        health_failure_threshold=1,
+    )
+    # Act
+    result = (await backend.probe_upstreams())[0]
+    # Assert
+    assert (result.reason, result.readiness, cancelled.is_set()) == (
+        "timeout",
+        False,
+        True,
+    )
 
 
 @pytest.mark.asyncio
@@ -321,13 +566,14 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
         await pool.release(admitted)
 
     # Assert
-    assert response.json()["members"][0] == {
-        "url": upstream.url,
-        "active": True,
-        "in_flight": 1,
-        "queued": 1,
-        "capacity": 1,
-    }
+    member = response.json()["members"][0]
+    assert (
+        member["url"],
+        member["active"],
+        member["in_flight"],
+        member["queued"],
+        member["capacity"],
+    ) == (upstream.url, True, 1, 1, 1)
 
 
 @pytest.mark.asyncio

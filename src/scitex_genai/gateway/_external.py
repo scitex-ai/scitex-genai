@@ -158,6 +158,8 @@ class ExternalProviderBackend(InferenceBackend):
     """Inference transport with an outbound credential and model firewall."""
 
     provider = "external-provider"
+    active_health_probe = False
+    health_strategy = "external_provider_status"
 
     def __init__(self, *args: Any, policy: ExternalProviderPolicy, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

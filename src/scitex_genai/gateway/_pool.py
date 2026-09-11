@@ -187,6 +187,7 @@ class StickyPool(Generic[M]):
         async with self._lock:
             now = time.time()
             member.cooldown_until = max(member.cooldown_until, now + seconds)
+            self._cooldown_changed(member)
             if getattr(member, "cooling_since", None) is None:
                 member.cooling_since = now
             if self._failover_after_s > 0:
@@ -201,6 +202,9 @@ class StickyPool(Generic[M]):
             ]
             for key in stale:
                 self._sessions.pop(key, None)
+
+    def _cooldown_changed(self, member: M) -> None:
+        """Hook called under the pool lock after a failure extends cooldown."""
 
     def _by_alias(self, alias: str) -> M | None:
         return next((member for member in self.members if member.alias == alias), None)

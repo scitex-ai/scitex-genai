@@ -48,6 +48,24 @@ claude
 - 429 cooldown and retry through another configured account
 - authenticated inbound requests; health response exposes no identities
 
+For a local inference-upstream gateway, `GET /health` actively probes every
+configured server's fast `/v1/models` control-plane route with a one-second
+end-to-end bound. Concurrent callers share one probe and reuse its result for
+one second. Two consecutive failed probe generations are required before the
+gateway returns HTTP 503 with `status: degraded`; the first failure is exposed
+immediately as an observation without flapping readiness. The response keeps
+configuration, admission eligibility, observed reachability, effective
+readiness, and their intersection (`active`) separate. Each member includes a
+content-free reason, latency, and UTC observation timestamp; credentials and
+URL query strings are redacted.
+
+A successful local probe clears only the exact stale cooldown generation it
+tested and wakes admission waiters. A failure recorded during or after the
+probe wins by lock order; probes never modify sticky routing or in-flight
+accounting. External-provider gateways are deliberately not probed: their
+credentialed API is not a local control plane, and their existing
+payload-free `external` usage/status report remains authoritative.
+
 `POST /v1/messages/count_tokens` currently returns a conservative byte-based
 estimate. It is not a billing or exact context-window measurement.
 
