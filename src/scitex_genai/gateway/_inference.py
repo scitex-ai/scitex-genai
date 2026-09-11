@@ -58,9 +58,10 @@ import json
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from ._admission import AdmissionController, CacheResidency
 from ._errors import (
     HomeMemberReloading,
     InferenceAdmissionError,
@@ -703,6 +704,7 @@ class RelayedResponse:
     status_code: int
     content_type: str
     body: AsyncIterator[bytes]
+    feedback_headers: dict[str, str] = field(default_factory=dict)
 
 
 class InferenceBackend:
@@ -730,6 +732,10 @@ class InferenceBackend:
         # ``None`` means the prefix telemetry is off. The library never picks
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
+        # SAC/Hermes currently supplies stable identity but no authoritative
+        # pre-admission cache-residency result. Record UNKNOWN observations;
+        # do not activate cache-priority scheduling from prompt size or history.
+        self.cache_admission = AdmissionController()
 
     def _note(self, line: str) -> None:
         """One journal line. Never affects the request path (see prepare)."""
@@ -748,7 +754,7 @@ class InferenceBackend:
         hoist: bool = True,
         affinity_key: str = "",
         inject_session_id: bool = True,
-    ) -> tuple[bytes | None, str]:
+    ) -> tuple[bytes | None, str | None]:
         """Derive the sticky key, hoisting the body only where the shape asks.
 
         Pure apart from the sink. ``hoist`` is the route's verdict (see
@@ -803,7 +809,7 @@ class InferenceBackend:
                     body = json.dumps(payload).encode()
             except (ValueError, AttributeError, TypeError):
                 pass  # not JSON we understand - forward untouched, never drop
-        return body, key or ""
+        return body, key
 
     async def relay(
         self,
@@ -833,6 +839,13 @@ class InferenceBackend:
             affinity_key=request_session_key(headers),
             inject_session_id=accepts_session_id(path),
         )
+        routing_session = session or ""
+        self.cache_admission.observe(CacheResidency.UNKNOWN)
+        feedback_headers = {
+            "x-scitex-admission-mode": "observe-only",
+            "x-scitex-cache-residency": CacheResidency.UNKNOWN.value,
+            "x-scitex-session-key": (session or "")[:12] or "none",
+        }
         input_tokens = estimate_input_tokens(body)
         forwarded = {
             name: value
@@ -845,7 +858,7 @@ class InferenceBackend:
         while len(attempted) < len(self.pool.upstreams):
             try:
                 upstream = await self.pool.acquire(
-                    session, exclude=attempted, input_tokens=input_tokens
+                    routing_session, exclude=attempted, input_tokens=input_tokens
                 )
             except HomeMemberReloading as exc:
                 if waited < self.wait_for_home_s:
@@ -856,7 +869,7 @@ class InferenceBackend:
                     # candidate again.
                     slice_s = min(max(exc.retry_after_s, 0.1), WAIT_SLICE_S)
                     self._note(
-                        f"[relay] conv={session[:8] or '-'} waiting {slice_s:.0f}s "
+                        f"[relay] conv={routing_session[:8] or '-'} waiting {slice_s:.0f}s "
                         f"for its home (waited {waited:.0f}s of "
                         f"{self.wait_for_home_s:.0f}s): {exc}"
                     )
@@ -865,7 +878,7 @@ class InferenceBackend:
                     attempted.clear()
                     continue
                 self._note(
-                    f"[relay] conv={session[:8] or '-'} held: {exc} "
+                    f"[relay] conv={routing_session[:8] or '-'} held: {exc} "
                     f"(retry after {exc.retry_after_s:.0f}s; waited {waited:.0f}s)"
                 )
                 raise UpstreamReloading(
@@ -880,7 +893,7 @@ class InferenceBackend:
             attempted.add(upstream.alias)
             started = time.monotonic()
             self._note(
-                f"[relay] conv={session[:8] or '-'} -> {upstream.alias} "
+                f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
                 f"{method} {path} bytes={len(body or b'')} "
                 f"estimated_input_tokens={input_tokens} "
                 f"admitted_input_tokens={upstream.input_tokens_in_flight}"
@@ -898,7 +911,7 @@ class InferenceBackend:
                 # Cancellation before a response body exists must not leak a
                 # capacity slot; streaming cancellation is handled by _drain.
                 self._note(
-                    f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
+                    f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
                     "client_disconnected_before_response "
                     f"after {time.monotonic() - started:.1f}s"
                 )
@@ -907,7 +920,7 @@ class InferenceBackend:
                     self.pool.release(
                         upstream,
                         input_tokens=input_tokens,
-                        session_id=session,
+                        session_id=routing_session,
                     )
                 )
                 raise
@@ -916,11 +929,11 @@ class InferenceBackend:
                 await self.pool.release(
                     upstream,
                     input_tokens=input_tokens,
-                    session_id=session,
+                    session_id=routing_session,
                 )
                 await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
                 self._note(
-                    f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
+                    f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
                     f"no response ({exc.__class__.__name__}) after "
                     f"{time.monotonic() - started:.1f}s; out of rotation for "
                     f"{UNREACHABLE_COOLDOWN_S:.0f}s"
@@ -930,15 +943,16 @@ class InferenceBackend:
             return RelayedResponse(
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", "application/json"),
+                feedback_headers=feedback_headers,
                 body=self._drain(
                     client,
                     response,
                     upstream,
-                    tag=f"conv={session[:8] or '-'} <- {upstream.alias} "
+                    tag=f"conv={routing_session[:8] or '-'} <- {upstream.alias} "
                     f"status={response.status_code}",
                     started=started,
                     input_tokens=input_tokens,
-                    session_id=session,
+                    session_id=routing_session,
                 ),
             )
         raise UpstreamUnreachable(self._refusal(failures))

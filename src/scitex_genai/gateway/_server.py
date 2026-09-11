@@ -211,6 +211,7 @@ def create_app(
                 "active_members": sum(member["active"] for member in members),
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
+                "cache_admission": backend.cache_admission.snapshot(),
             }
             if any("token_capacity" in member for member in members):
                 status["input_tokens_in_flight"] = sum(

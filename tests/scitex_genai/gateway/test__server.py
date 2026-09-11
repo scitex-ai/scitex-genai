@@ -285,6 +285,15 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
         "active_members": 1,
         "in_flight": 0,
         "queued": 0,
+        "cache_admission": {
+            "mode": "observe-only",
+            "running": 0,
+            "queued": 0,
+            "oldest_wait_s": 0.0,
+            "hot_overtakes": 0,
+            "observed": {"hot": 0, "cold": 0, "unknown": 0},
+            "admitted": {"hot": 0, "cold": 0, "unknown": 0},
+        },
     }
 
 
