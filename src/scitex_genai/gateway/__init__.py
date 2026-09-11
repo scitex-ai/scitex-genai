@@ -8,6 +8,7 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend, CodexTransport
 from ._credentials import CodexCredential
+from ._external import ExternalProviderBackend, ExternalProviderPolicy
 from ._inference import (
     InferenceBackend,
     InferenceUpstream,
@@ -25,6 +26,8 @@ __all__ = [
     "CodexCredential",
     "CodexTransport",
     "CodexUsageClient",
+    "ExternalProviderBackend",
+    "ExternalProviderPolicy",
     "InferenceBackend",
     "InferenceUpstream",
     "InferenceUpstreamPool",

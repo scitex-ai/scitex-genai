@@ -8,6 +8,7 @@ without touching a server.
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
 
 import pytest
@@ -236,6 +237,50 @@ def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
         3,
         9,
     )
+
+
+def test_main_builds_external_backend_without_exposing_vendor_key(
+    tmp_path: Path, gateway_key_env
+):
+    gateway_key_env("local-key")
+    os.environ["TEST_VENDOR_KEY"] = "vendor-key"
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "gateway:\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com/anthropic\n"
+        "    upstream_auth_token_env: TEST_VENDOR_KEY\n"
+        "    canonical_model: deepseek-flash\n"
+        "    model_aliases: [deepseek-v4-flash]\n"
+    )
+    calls = []
+    try:
+        main(["--config", str(path)], server_runner=lambda app, **kw: calls.append(app))
+    finally:
+        os.environ.pop("TEST_VENDOR_KEY", None)
+    backend = calls[0].state.scitex_backend
+    assert backend.provider == "external:deepseek"
+    assert backend.policy.canonical_model == "deepseek-flash"
+    assert backend.policy.upstream_api_key == "vendor-key"
+
+
+def test_main_refuses_external_backend_when_vendor_key_is_absent(
+    tmp_path: Path, gateway_key_env
+):
+    gateway_key_env("local-key")
+    os.environ.pop("ABSENT_VENDOR_KEY", None)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "gateway:\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com\n"
+        "    upstream_auth_token_env: ABSENT_VENDOR_KEY\n"
+        "    canonical_model: deepseek-flash\n"
+    )
+    with pytest.raises(SystemExit, match="ABSENT_VENDOR_KEY"):
+        main(["--config", str(path)], server_runner=lambda app, **kw: None)
 
 
 def test_main_forwards_admission_bounds_to_generated_unit(
