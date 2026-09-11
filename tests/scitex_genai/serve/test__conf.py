@@ -147,10 +147,11 @@ def test_sglang_refuses_configuration_that_disables_session_cache(addition: str)
         + addition
     )
 
-    # Act / Assert
-    assert "session-aware radix" in str(
-        _raised(lambda: parse_engine_conf("model-a", text))
-    )
+    # Act
+    raised = _raised(lambda: parse_engine_conf("model-a", text))
+
+    # Assert
+    assert "session-aware radix" in str(raised)
 
 
 def test_exported_names_become_the_child_env():

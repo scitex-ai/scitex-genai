@@ -359,16 +359,18 @@ async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
         )
         await _collect(relayed.body)
 
-    # Assert
-    assert (
+    message_counts = (
         [len(json.loads(request["body"])["messages"]) for request in first.requests],
         [len(json.loads(request["body"])["messages"]) for request in second.requests],
-    ) == ([1, 3], [1])
-    assert all(
+    )
+    protocol_safe = all(
         "session_id" not in json.loads(request["body"])
         and "x-scitex-session-id" not in request["headers"]
         for request in (*first.requests, *second.requests)
     )
+
+    # Assert
+    assert (message_counts, protocol_safe) == (([1, 3], [1]), True)
 
 
 def test_pool_refuses_with_inference_wording_when_empty() -> None:
@@ -868,10 +870,12 @@ def test_scitex_session_header_has_precedence_over_legacy_spellings() -> None:
         "X-SciTeX-Session-ID": "canonical",
     }
 
-    # Act / Assert
-    assert request_session_key(headers) == request_session_key(
-        {"x-scitex-session-id": "canonical"}
-    )
+    # Act
+    actual = request_session_key(headers)
+    canonical = request_session_key({"x-scitex-session-id": "canonical"})
+
+    # Assert
+    assert actual == canonical
 
 
 @pytest.mark.parametrize(
@@ -913,14 +917,15 @@ def test_explicit_session_is_injected_without_changing_protocol_shape(
     )
     sent = json.loads(forwarded)
 
-    # Assert -- only protocol models that propagate the extension receive it.
     injected = sent.pop("session_id", None)
-    assert (session, injected, sent) == (
+
+    # Assert -- only protocol models that propagate the extension receive it.
+    assert (session, injected, sent, raw_identity not in forwarded.decode()) == (
         key,
         key if expected_injection else None,
         payload,
+        True,
     )
-    assert raw_identity not in forwarded.decode()
 
 
 def test_explicit_header_replaces_a_raw_body_session_id() -> None:
@@ -946,8 +951,11 @@ def test_uninjectable_body_is_forwarded_unchanged_with_session_affinity(
     key = request_session_key({"x-session-id": "stable"})
     backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
 
-    # Act / Assert
-    assert backend.prepare(body, hoist=False, affinity_key=key) == (body, key)
+    # Act
+    prepared = backend.prepare(body, hoist=False, affinity_key=key)
+
+    # Assert
+    assert prepared == (body, key)
 
 
 def test_no_caller_session_does_not_add_a_body_session_id() -> None:
@@ -986,13 +994,18 @@ async def test_relay_strips_raw_session_headers_and_sends_only_opaque_body_id(
     await _collect(relayed.body)
     request = upstream.requests[0]
 
-    # Assert
-    assert not {
+    headers_are_private = not {
         "x-scitex-session-id",
         "session_id",
         "x-session-id",
     } & set(request["headers"])
-    assert json.loads(request["body"])["session_id"] == request_session_key(headers)
+    opaque_session = json.loads(request["body"])["session_id"]
+
+    # Assert
+    assert (headers_are_private, opaque_session) == (
+        True,
+        request_session_key(headers),
+    )
 
 
 def test_blank_session_header_is_rejected() -> None:

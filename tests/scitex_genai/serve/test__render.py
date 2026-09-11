@@ -167,26 +167,35 @@ def test_sglang_preflight_validates_the_exact_required_capabilities():
     launch = render(SETTINGS, SGLANG_CONF, BASE_ENV)
 
     # Act
-    argv = launch.engine_preflight_argv
+    argv = launch.engine_preflight_argv or ()
+    script = argv[argv.index("-c") + 1]
 
     # Assert
-    assert argv is not None
-    script = argv[argv.index("-c") + 1]
     assert (
+        bool(argv),
         "enable_session_radix_cache" in script,
         "enable_metrics" in script,
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE" in script,
-    ) == (True, True, True)
+    ) == (True, True, True, True)
 
 
 def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
-    # Arrange / Act
-    argv = render(SETTINGS, SGLANG_CONF, BASE_ENV).engine_argv
+    # Arrange
+    conf = SGLANG_CONF
+
+    # Act
+    argv = render(SETTINGS, conf, BASE_ENV).engine_argv
 
     # Assert
-    assert argv[:4] == ("/usr/bin/apptainer", "exec", "--nv", "--cleanenv")
-    assert argv[argv.index("--bind") + 1] == "/weights/model-a:/weights/model-a:ro"
-    assert "/images/sglang.sif" in argv
+    assert (
+        argv[:4],
+        argv[argv.index("--bind") + 1],
+        "/images/sglang.sif" in argv,
+    ) == (
+        ("/usr/bin/apptainer", "exec", "--nv", "--cleanenv"),
+        "/weights/model-a:/weights/model-a:ro",
+        True,
+    )
 
 
 def test_canonical_qwen_profile_renders_session_cache_and_metrics():
