@@ -64,6 +64,7 @@ _EXTERNAL_FIELDS = (
     "upstream_auth_token_env",
     "canonical_model",
     "model_aliases",
+    "anthropic_path_prefix",
     "max_tokens_per_request",
     "max_requests_per_run",
     "max_input_tokens_per_run",
@@ -84,6 +85,7 @@ class ExternalGatewaySettings:
     upstream_auth_token_env: str
     canonical_model: str
     model_aliases: tuple[str, ...] = ()
+    anthropic_path_prefix: str = ""
     max_tokens_per_request: int = 16_384
     max_requests_per_run: int | None = 100
     max_input_tokens_per_run: int | None = 5_000_000

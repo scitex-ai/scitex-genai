@@ -30,11 +30,12 @@ gateway:
   inference_max_queue_size: 8
   external_provider:
     provider: deepseek
-    upstream: https://api.deepseek.com/anthropic
+    upstream: https://api.deepseek.com
     upstream_auth_token_env: DEEPSEEK_API_KEY
     canonical_model: deepseek-flash
     model_aliases:
       - deepseek-v4-flash
+    anthropic_path_prefix: /anthropic
     max_tokens_per_request: 16384
     max_requests_per_run: 100
     max_input_tokens_per_run: 5000000
@@ -71,6 +72,11 @@ and response-model mismatches. No prompt, completion, raw run ID, or credential
 is retained. Streaming requests force provider usage reporting when the
 OpenAI-compatible route supports it; missing usage is conservatively charged
 as the full reservation.
+
+The optional `anthropic_path_prefix` lets one root serve both protocols:
+OpenAI `/v1/chat/completions` remains unchanged, while Anthropic `/v1/messages`
+becomes `/anthropic/v1/messages` upstream. It is empty for providers that use
+the same route root for both protocols.
 
 Budgets are per run within one gateway incarnation. A production-wide or
 calendar-period spending authority still belongs in the SciTeX Postgres store;

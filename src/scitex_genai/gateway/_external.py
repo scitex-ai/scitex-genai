@@ -63,6 +63,7 @@ class ExternalProviderPolicy:
     upstream_api_key: str = field(repr=False)
     canonical_model: str = "deepseek-flash"
     model_aliases: tuple[str, ...] = ("deepseek-v4-flash",)
+    anthropic_path_prefix: str = ""
     max_tokens_per_request: int = 16_384
     max_requests_per_run: int | None = 100
     max_input_tokens_per_run: int | None = 5_000_000
@@ -87,6 +88,10 @@ class ExternalProviderPolicy:
         if len(set(aliases)) != len(aliases):
             raise ValueError("model_aliases must be unique")
         object.__setattr__(self, "model_aliases", aliases)
+        prefix = self.anthropic_path_prefix.rstrip("/")
+        if prefix and not prefix.startswith("/"):
+            raise ValueError("anthropic_path_prefix must start with /")
+        object.__setattr__(self, "anthropic_path_prefix", prefix)
         object.__setattr__(
             self,
             "max_tokens_per_request",
@@ -394,8 +399,15 @@ class ExternalProviderBackend(InferenceBackend):
         }
         outbound_headers["authorization"] = f"Bearer {self.policy.upstream_api_key}"
         try:
+            upstream_path = path
+            if path.startswith("/v1/messages") and self.policy.anthropic_path_prefix:
+                upstream_path = f"{self.policy.anthropic_path_prefix}{path}"
             relayed = await super().relay(
-                method, path, body=encoded, headers=outbound_headers
+                method,
+                path,
+                body=encoded,
+                headers=outbound_headers,
+                upstream_path=upstream_path,
             )
         except Exception:
             await self.usage.settle(

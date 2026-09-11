@@ -261,6 +261,7 @@ def main(
                 upstream_api_key=upstream_key,
                 canonical_model=external.canonical_model,
                 model_aliases=external.model_aliases,
+                anthropic_path_prefix=external.anthropic_path_prefix,
                 max_tokens_per_request=external.max_tokens_per_request,
                 max_requests_per_run=external.max_requests_per_run,
                 max_input_tokens_per_run=external.max_input_tokens_per_run,

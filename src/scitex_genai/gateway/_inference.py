@@ -707,6 +707,7 @@ class InferenceBackend:
         *,
         body: bytes | None,
         headers: Mapping[str, str],
+        upstream_path: str | None = None,
     ) -> RelayedResponse:
         """Forward one request; return the upstream's reply as it streams in.
 
@@ -776,7 +777,10 @@ class InferenceBackend:
             client = httpx.AsyncClient(timeout=self.timeout_s)
             try:
                 request = client.build_request(
-                    method, upstream.base_url + path, content=body, headers=forwarded
+                    method,
+                    upstream.base_url + (upstream_path or path),
+                    content=body,
+                    headers=forwarded,
                 )
                 response = await client.send(request, stream=True)
             except asyncio.CancelledError:

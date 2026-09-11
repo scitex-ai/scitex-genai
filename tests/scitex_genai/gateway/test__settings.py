@@ -307,10 +307,11 @@ def test_external_provider_policy_is_loaded_from_config(tmp_path: Path, clean_en
         "gateway:\n"
         "  external_provider:\n"
         "    provider: deepseek\n"
-        "    upstream: https://api.deepseek.com/anthropic/\n"
+        "    upstream: https://api.deepseek.com/\n"
         "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
         "    canonical_model: deepseek-flash\n"
         "    model_aliases: [deepseek-v4-flash]\n"
+        "    anthropic_path_prefix: /anthropic\n"
         "    max_requests_per_run: 12\n"
         "    max_tokens_per_request: 4096\n",
     )
@@ -322,11 +323,13 @@ def test_external_provider_policy_is_loaded_from_config(tmp_path: Path, clean_en
         external.upstream,
         external.canonical_model,
         external.model_aliases,
+        external.anthropic_path_prefix,
         external.max_requests_per_run,
     ) == (
-        "https://api.deepseek.com/anthropic",
+        "https://api.deepseek.com",
         "deepseek-flash",
         ("deepseek-v4-flash",),
+        "/anthropic",
         12,
     )
 

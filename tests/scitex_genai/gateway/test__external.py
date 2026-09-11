@@ -290,7 +290,7 @@ async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
             b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
         ),
     )
-    backend = _backend(upstream)
+    backend = _backend(upstream, anthropic_path_prefix="/anthropic")
     app = create_app(backend, api_key="local")
     # Act
     async with httpx.AsyncClient(
@@ -304,8 +304,9 @@ async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
     # Assert
     assert (
         response.status_code,
+        upstream.requests[0]["path"],
         backend.usage.last_reported_model,
         backend.usage.total.input_tokens,
         backend.usage.total.output_tokens,
         backend.usage.total.reported_model_mismatches,
-    ) == (200, "deepseek-v4.1-flash", 8, 5, 1)
+    ) == (200, "/anthropic/v1/messages", "deepseek-v4.1-flash", 8, 5, 1)

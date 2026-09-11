@@ -250,10 +250,11 @@ def test_main_builds_external_backend_without_exposing_vendor_key(
         "gateway:\n"
         "  external_provider:\n"
         "    provider: deepseek\n"
-        "    upstream: https://api.deepseek.com/anthropic\n"
+        "    upstream: https://api.deepseek.com\n"
         "    upstream_auth_token_env: TEST_VENDOR_KEY\n"
         "    canonical_model: deepseek-flash\n"
         "    model_aliases: [deepseek-v4-flash]\n"
+        "    anthropic_path_prefix: /anthropic\n"
     )
     calls = []
     # Act
