@@ -96,6 +96,64 @@ def test_extra_args_are_shell_split():
     )
 
 
+def test_sglang_engine_reads_image_port_and_quoted_json_argument():
+    # Arrange
+    text = (
+        CONF.replace("VLLM_PORT=8768", "ENGINE=sglang\nENGINE_PORT=8768")
+        + "SGLANG_IMAGE=/images/sglang.sif\n"
+        + 'EXTRA_SGLANG_ARGS="--json-model-override-args \'{\\"x\\":1}\'"\n'
+    )
+
+    # Act
+    conf = parse_engine_conf("model-a", text)
+
+    # Assert
+    assert (
+        conf.engine,
+        conf.engine_port,
+        conf.sglang_image,
+        conf.extra_sglang_args,
+    ) == (
+        "sglang",
+        8768,
+        Path("/images/sglang.sif"),
+        ("--json-model-override-args", '{"x":1}'),
+    )
+
+
+def test_sglang_requires_a_pinned_image():
+    # Arrange
+    text = CONF.replace("VLLM_PORT=8768", "ENGINE=sglang\nENGINE_PORT=8768")
+
+    # Act
+    raised = _raised(lambda: parse_engine_conf("model-a", text))
+
+    # Assert
+    assert "SGLANG_IMAGE" in str(raised)
+
+
+@pytest.mark.parametrize(
+    "addition",
+    [
+        'EXTRA_SGLANG_ARGS="--disable-radix-cache"\n',
+        "export SGLANG_ENABLE_UNIFIED_RADIX_TREE=0\n",
+    ],
+)
+def test_sglang_refuses_configuration_that_disables_session_cache(addition: str):
+    # Arrange
+    text = (
+        CONF.replace("VLLM_PORT=8768", "ENGINE=sglang\nENGINE_PORT=8768")
+        + "SGLANG_IMAGE=/images/sglang.sif\n"
+        + addition
+    )
+
+    # Act
+    raised = _raised(lambda: parse_engine_conf("model-a", text))
+
+    # Assert
+    assert "session-aware radix" in str(raised)
+
+
 def test_exported_names_become_the_child_env():
     # Arrange
     text = CONF

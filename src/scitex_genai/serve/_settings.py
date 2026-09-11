@@ -49,6 +49,7 @@ class ServeSettings:
     bastion: str
     bastion_user: str
     litellm_master_key: str
+    apptainer_bin: Path = Path("/usr/bin/apptainer")
     cuda_home: Path | None = None
     proxy_command: str = ""
     serve_bin: Path | None = None
@@ -56,7 +57,14 @@ class ServeSettings:
     source: Path | None = None
 
     def __post_init__(self) -> None:
-        for name in ("base", "logs", "cache_root", "vllm_bin", "litellm_bin"):
+        for name in (
+            "base",
+            "logs",
+            "cache_root",
+            "vllm_bin",
+            "litellm_bin",
+            "apptainer_bin",
+        ):
             value = getattr(self, name)
             if not Path(value).is_absolute():
                 raise ValueError(
@@ -107,6 +115,7 @@ def load_serve_settings(config_path: Path | str | None = None) -> ServeSettings:
         bastion=str(get("bastion") or ""),
         bastion_user=str(get("bastion_user", getpass.getuser())),
         litellm_master_key=str(get("litellm_master_key") or ""),
+        apptainer_bin=Path(str(get("apptainer_bin", "/usr/bin/apptainer"))),
         cuda_home=Path(str(get("cuda_home"))) if get("cuda_home") else None,
         proxy_command=str(get("proxy_command", "") or ""),
         serve_bin=Path(str(get("serve_bin"))) if get("serve_bin") else None,
