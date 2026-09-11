@@ -25,6 +25,7 @@ def _scenario() -> dict:
             {
                 "id": "cold",
                 "arrival_ms": 0,
+                "cache_state": "cold",
                 "expected_prompt_tokens": 10,
                 "body": {
                     "model": "fake",
@@ -36,6 +37,7 @@ def _scenario() -> dict:
             {
                 "id": "warm",
                 "arrival_ms": 0,
+                "cache_state": "warm",
                 "expected_prompt_tokens": 10,
                 "body": {
                     "model": "fake",
@@ -193,11 +195,60 @@ def test_manifest_marks_two_cold_requests_as_a_crash_probe(tmp_path: Path):
     path.write_text(json.dumps(scenario))
 
     # Act
-    ctx = pytest.raises(ValueError, match=r"cold\+cold.*crash-probe")
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
 
     # Assert
     with ctx:
         load_scenario(path)
+
+
+def test_multi_request_manifest_requires_explicit_cache_state(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    scenario["requests"][1].pop("cache_state")
+    path = tmp_path / "missing-cache-state.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="cache_state is required")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+def test_two_unknown_requests_are_a_crash_probe(tmp_path: Path):
+    # Arrange
+    scenario = _scenario()
+    for request in scenario["requests"]:
+        request["cache_state"] = "unknown"
+    path = tmp_path / "unknown-unknown.json"
+    path.write_text(json.dumps(scenario))
+
+    # Act
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
+
+    # Assert
+    with ctx:
+        load_scenario(path)
+
+
+@pytest.mark.asyncio
+async def test_direct_runner_validates_crash_probe_metadata():
+    # Arrange
+    scenario = _scenario()
+    scenario["requests"][1]["cache_state"] = "cold"
+    ctx = pytest.raises(ValueError, match="potentially cold.*crash-probe")
+
+    # Act
+    # Assert
+    with ctx:
+        await run_scenario(
+            scenario,
+            endpoint="http://canary.invalid/v1/chat/completions",
+            acknowledge_isolated_canary=True,
+            run_id="direct-cold-cold",
+        )
 
 
 def test_crash_probe_requires_a_dedicated_canary_target(tmp_path: Path):

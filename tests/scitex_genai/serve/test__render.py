@@ -533,6 +533,34 @@ def test_mixed_chunk_control_cannot_silently_enable_eagle():
     ) == (True, False)
 
 
+@pytest.mark.parametrize(
+    "profile_id",
+    [
+        "fcfs-eagle-c32768",
+        "lpm-eagle-c32768",
+        "fcfs-eagle-c8192",
+        "fcfs-eagle-c4096",
+    ],
+)
+def test_eagle_profiles_keep_the_exact_production_speculation_tuple(profile_id: str):
+    # Arrange
+    args = _canary_conf(_canary_profile(profile_id)).extra_sglang_args
+
+    # Act
+    observed = tuple(
+        _arg_value(args, flag)
+        for flag in (
+            "--speculative-algorithm",
+            "--speculative-num-steps",
+            "--speculative-eagle-topk",
+            "--speculative-num-draft-tokens",
+        )
+    )
+
+    # Assert
+    assert observed == ("EAGLE", "3", "1", "4")
+
+
 def test_lpm_negative_control_changes_only_policy_from_baseline():
     # Arrange
     baseline = list(
