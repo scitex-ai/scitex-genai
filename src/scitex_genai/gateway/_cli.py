@@ -37,7 +37,7 @@ from ._secrets import (
     resolve_gateway_key,
     write_key,
 )
-from ._server import create_app
+from ._server import create_app, run_uvicorn
 from ._settings import load_settings
 from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 
@@ -226,7 +226,7 @@ def main(
         _install_unit(args)
         return
     try:
-        import uvicorn
+        __import__("uvicorn")
     except ImportError as exc:
         raise SystemExit("Install scitex-genai[gateway] to run the server") from exc
     settings = load_settings(
@@ -258,7 +258,7 @@ def main(
     print(f"scitex-genai-gateway: key {key.origin}", flush=True)
     app = create_app(backend, api_key=key.value)
     app.state.scitex_backend = backend
-    (server_runner or uvicorn.run)(
+    (server_runner or run_uvicorn)(
         app, host=settings.host, port=settings.port, log_level=args.log_level
     )
 

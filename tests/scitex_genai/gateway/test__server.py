@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
+import threading
 from contextlib import asynccontextmanager, suppress
 
 import httpx
@@ -14,7 +16,7 @@ pytest.importorskip("fastapi")
 
 from scitex_genai.gateway._errors import InferenceAdmissionError
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
-from scitex_genai.gateway._server import create_app
+from scitex_genai.gateway._server import _build_uvicorn_server, create_app
 
 
 class _Pool:
@@ -361,6 +363,74 @@ async def test_relay_returns_503_when_the_bounded_queue_is_full(
         response.json()["error"]["type"],
         len(upstream.requests),
     ) == (503, "inference_admission", 0)
+
+
+@pytest.mark.asyncio
+async def test_sigterm_closes_queue_before_uvicorn_drains_admitted_request(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release_upstream = threading.Event()
+    upstream = upstream_factory(block_until=release_upstream)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    app = create_app(InferenceBackend(pool), api_key="relay-secret")
+    server = _build_uvicorn_server(
+        app,
+        host="127.0.0.1",
+        port=0,
+        log_level="warning",
+        timeout_graceful_shutdown=5,
+    )
+    serve_task = asyncio.create_task(server.serve())
+    for _ in range(1000):
+        if server.started:
+            break
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    # Act
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+        admitted_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "admitted"},
+            )
+        )
+        started = await asyncio.to_thread(upstream.request_started.wait, 2)
+        queued_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "queued"},
+            )
+        )
+        for _ in range(1000):
+            if pool.upstreams[0].queued == 1:
+                break
+            await asyncio.sleep(0.001)
+        server.handle_exit(signal.SIGTERM, None)
+        # Uvicorn re-raises captured OS signals after ``serve`` returns. This
+        # test invokes the real handler directly, so consume that bookkeeping
+        # entry rather than terminating the pytest process afterward.
+        server._captured_signals.clear()
+        queued_response = await asyncio.wait_for(queued_task, timeout=2)
+        draining = not serve_task.done()
+        release_upstream.set()
+        admitted_response = await asyncio.wait_for(admitted_task, timeout=2)
+        await asyncio.wait_for(serve_task, timeout=2)
+
+    # Assert
+    assert (
+        started,
+        queued_response.status_code,
+        queued_response.json()["error"]["type"],
+        draining,
+        admitted_response.status_code,
+        serve_task.done(),
+    ) == (True, 503, "inference_admission", True, 200, True)
 
 
 @pytest.mark.asyncio
