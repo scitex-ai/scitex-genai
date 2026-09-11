@@ -57,7 +57,7 @@ import hashlib
 import json
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -417,6 +417,8 @@ class InferenceUpstream:
     last_used_at: float = 0.0
     capacity: int = DEFAULT_CAPACITY_PER_UPSTREAM
     queued: int = 0
+    admitted_total: int = 0
+    cancelled_total: int = 0
     cooldown_until: float = 0.0
     #: When this upstream last went out of rotation (None = healthy).
     cooling_since: float | None = None
@@ -441,6 +443,8 @@ class InferenceUpstream:
             "in_flight": self.in_flight,
             "queued": self.queued,
             "capacity": self.capacity,
+            "admitted_total": self.admitted_total,
+            "cancelled_total": self.cancelled_total,
         }
 
 
@@ -519,6 +523,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             )
             if selected.in_flight < selected.capacity and not selected.queued:
                 selected.in_flight += 1
+                selected.admitted_total += 1
                 return selected
             total_queued = sum(upstream.queued for upstream in self.upstreams)
             if total_queued >= self.max_queue_size:
@@ -530,6 +535,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             waiters.append(ticket)
             selected.queued += 1
             queued = True
+            cancelled = False
             try:
                 while True:
                     if self._closing:
@@ -546,6 +552,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         selected.queued -= 1
                         queued = False
                         selected.in_flight += 1
+                        selected.admitted_total += 1
                         return selected
                     cooldown_s = max(0.0, selected.cooldown_until - now)
                     try:
@@ -557,15 +564,28 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                             await self._admission.wait()
                     except TimeoutError:
                         pass
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
             finally:
                 if queued:
                     waiters.remove(ticket)
                     selected.queued -= 1
+                    # A ticket only reaches this path when its waiter exits
+                    # without admission (normally task cancellation after an
+                    # ASGI ``http.disconnect``). This is deliberately a count
+                    # only: request/session material never enters health data.
+                    if cancelled:
+                        selected.cancelled_total += 1
                     self._admission.notify_all()
 
-    async def release(self, member: InferenceUpstream) -> None:
+    async def release(
+        self, member: InferenceUpstream, *, cancelled: bool = False
+    ) -> None:
         async with self._admission:
             member.in_flight = max(0, member.in_flight - 1)
+            if cancelled:
+                member.cancelled_total += 1
             self._admission.notify_all()
 
     async def cool_down(self, member: InferenceUpstream, seconds: float) -> None:
@@ -610,6 +630,78 @@ class RelayedResponse:
     status_code: int
     content_type: str
     body: AsyncIterator[bytes]
+    _finish: Callable[[bool], Awaitable[None]]
+
+    async def aclose(self, *, cancelled: bool = False) -> None:
+        """Release an accepted response before its body gains an owner."""
+        await self._finish(cancelled)
+
+
+async def _finish_despite_cancellation(awaitable: Awaitable[None]) -> None:
+    """Run one mandatory cleanup operation through repeated cancellation."""
+    task = asyncio.create_task(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
+class _RelayFinalizer:
+    """Exactly-once owner of one admitted upstream capacity slot."""
+
+    def __init__(
+        self,
+        pool: InferenceUpstreamPool,
+        upstream: InferenceUpstream,
+        client: Any,
+    ) -> None:
+        self._pool = pool
+        self._upstream = upstream
+        self._client = client
+        self._response: Any | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._started = False
+        self._cancel_requested = False
+
+    def attach_response(self, response: Any) -> None:
+        self._response = response
+
+    async def finish(self, cancelled: bool = False) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(cancelled))
+        try:
+            await asyncio.shield(self._task)
+        except asyncio.CancelledError:
+            # Stop potentially blocking socket closure, but leave the
+            # finalizer task alive long enough to perform its durable release.
+            self._cancel_requested = True
+            if self._started:
+                self._task.cancel()
+            raise
+
+    async def _run(self, cancelled: bool) -> None:
+        close_error: BaseException | None = None
+        self._started = True
+        try:
+            if self._cancel_requested:
+                raise asyncio.CancelledError
+            if self._response is not None:
+                await self._response.aclose()
+            await self._client.aclose()
+        except asyncio.CancelledError:
+            # Cancellation is how a blocked transport close is interrupted;
+            # capacity release below is still mandatory.
+            pass
+        except BaseException as exc:
+            close_error = exc
+        finally:
+            await _finish_despite_cancellation(
+                self._pool.release(self._upstream, cancelled=cancelled)
+            )
+        if close_error is not None:
+            raise close_error
 
 
 class InferenceBackend:
@@ -625,6 +717,7 @@ class InferenceBackend:
         telemetry_sink: Callable[[str], None] | None = None,
         wait_for_home_s: float = WAIT_FOR_HOME_S,
         journal: Callable[[str], None] | None = None,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -634,6 +727,7 @@ class InferenceBackend:
         # of which request went to which upstream, so the CLI always wires
         # it. Falls back to the telemetry sink so tests capture both.
         self.journal = journal
+        self.client_factory = client_factory
         # ``None`` means the prefix telemetry is off. The library never picks
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
@@ -647,6 +741,10 @@ class InferenceBackend:
             sink(line)
         except Exception:  # noqa: BLE001
             pass
+
+    def note_downstream_disconnect(self, method: str, path: str) -> None:
+        """Journal a payload-free downstream cancellation."""
+        self._note(f"[relay] downstream disconnected before response {method} {path}")
 
     def prepare(
         self,
@@ -773,21 +871,22 @@ class InferenceBackend:
                 f"[relay] conv={session[:8] or '-'} -> {upstream.alias} "
                 f"{method} {path} bytes={len(body or b'')}"
             )
-            client = httpx.AsyncClient(timeout=self.timeout_s)
+            client_factory = self.client_factory or httpx.AsyncClient
+            client = client_factory(timeout=self.timeout_s)
+            finalizer = _RelayFinalizer(self.pool, upstream, client)
             try:
                 request = client.build_request(
                     method, upstream.base_url + path, content=body, headers=forwarded
                 )
                 response = await client.send(request, stream=True)
+                finalizer.attach_response(response)
             except asyncio.CancelledError:
                 # Cancellation before a response body exists must not leak a
                 # capacity slot; streaming cancellation is handled by _drain.
-                await asyncio.shield(client.aclose())
-                await asyncio.shield(self.pool.release(upstream))
+                await finalizer.finish(cancelled=True)
                 raise
             except httpx.TransportError as exc:
-                await client.aclose()
-                await self.pool.release(upstream)
+                await finalizer.finish()
                 await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
                 self._note(
                     f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
@@ -801,13 +900,13 @@ class InferenceBackend:
                 status_code=response.status_code,
                 content_type=response.headers.get("content-type", "application/json"),
                 body=self._drain(
-                    client,
                     response,
-                    upstream,
+                    finalizer.finish,
                     tag=f"conv={session[:8] or '-'} <- {upstream.alias} "
                     f"status={response.status_code}",
                     started=started,
                 ),
+                _finish=finalizer.finish,
             )
         raise UpstreamUnreachable(self._refusal(failures))
 
@@ -823,9 +922,8 @@ class InferenceBackend:
 
     async def _drain(
         self,
-        client: Any,
         response: Any,
-        upstream: InferenceUpstream,
+        finish: Callable[[bool], Awaitable[None]],
         *,
         tag: str = "",
         started: float | None = None,
@@ -847,16 +945,7 @@ class InferenceBackend:
             # gets worse with every failed request. Shielded because the
             # server's cancel scope re-cancels at every await, and the release
             # must finish even after the response is gone.
-            await asyncio.shield(self._finish(client, response, upstream))
-
-    async def _finish(
-        self, client: Any, response: Any, upstream: InferenceUpstream
-    ) -> None:
-        try:
-            await response.aclose()
-            await client.aclose()
-        finally:
-            await self.pool.release(upstream)
+            await asyncio.shield(finish(False))
 
     async def close(self) -> None:
         """Stop admission and wake requests waiting for capacity."""

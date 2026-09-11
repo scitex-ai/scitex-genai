@@ -16,11 +16,23 @@ pytest.importorskip("fastapi")
 
 from scitex_genai.gateway._errors import InferenceAdmissionError
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
-from scitex_genai.gateway._server import _build_uvicorn_server, create_app
+from scitex_genai.gateway._server import (
+    _build_uvicorn_server,
+    _until_response_or_disconnect,
+    create_app,
+)
 
 
 class _Pool:
     accounts = [object()]
+
+
+async def _capture_base_exception(awaitable) -> BaseException | None:
+    try:
+        await awaitable
+    except BaseException as exc:
+        return exc
+    return None
 
 
 class _Backend:
@@ -280,11 +292,15 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
                 "in_flight": 0,
                 "queued": 0,
                 "capacity": 8,
+                "admitted_total": 0,
+                "cancelled_total": 0,
             }
         ],
         "active_members": 1,
         "in_flight": 0,
         "queued": 0,
+        "admitted_total": 0,
+        "cancelled_total": 0,
     }
 
 
@@ -318,7 +334,282 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
         "in_flight": 1,
         "queued": 1,
         "capacity": 1,
+        "admitted_total": 1,
+        "cancelled_total": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_asgi_disconnect_cancels_a_queued_relay_and_removes_its_ticket(
+    upstream_factory,
+) -> None:
+    # Arrange -- call the ASGI surface directly so ``http.disconnect`` is
+    # real protocol input rather than client-task cancellation by a test SDK.
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    occupying = await pool.acquire("occupying")
+    journal: list[str] = []
+    app = create_app(InferenceBackend(pool, journal=journal.append), api_key="secret")
+    incoming: asyncio.Queue[dict] = asyncio.Queue()
+    await incoming.put(
+        {
+            "type": "http.request",
+            "body": json.dumps(_relay_body()).encode(),
+            "more_body": False,
+        }
+    )
+    sent: list[dict] = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [
+            (b"x-api-key", b"secret"),
+            (b"x-session-id", b"private-session-name"),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("gateway.test", 80),
+    }
+
+    async def receive() -> dict:
+        return await incoming.get()
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    request_task = asyncio.create_task(app(scope, receive, send))
+    for _ in range(100):
+        if pool.upstreams[0].queued == 1:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError(f"relay did not queue: {pool.status()}")
+
+    # Act
+    await incoming.put({"type": "http.disconnect"})
+    await asyncio.wait_for(request_task, timeout=1)
+    state = pool.status()[0]
+    await pool.release(occupying)
+
+    # Assert -- only counts and route metadata are observable; neither body
+    # text nor caller-declared session identity appears in the journal.
+    journal_text = "\n".join(journal)
+    assert (
+        state["in_flight"],
+        state["queued"],
+        state["cancelled_total"],
+        sent[0]["status"],
+        len(upstream.requests),
+        "private-session-name" in journal_text,
+        "Hello" in journal_text,
+    ) == (1, 0, 1, 499, 0, False, False)
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_during_response_handoff_releases_capacity(
+    upstream_factory,
+) -> None:
+    # Arrange -- make observer cancellation pause after the response task has
+    # won, reproducing the ownership-transfer window from the reviewer probe.
+    upstream = upstream_factory(chunks=(b"reply",))
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=1)
+    backend = InferenceBackend(pool)
+    relayed = await backend.relay(
+        "POST", "/v1/messages", body=b"{}", headers={"x-session-id": "handoff"}
+    )
+    receive_started = asyncio.Event()
+    observer_cleanup_started = asyncio.Event()
+
+    class BlockingCancellationRequest:
+        async def receive(self) -> dict:
+            receive_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                observer_cleanup_started.set()
+                await asyncio.Future()
+                raise
+
+    async def completed_response():
+        await receive_started.wait()
+        return relayed
+
+    handoff = asyncio.create_task(
+        _until_response_or_disconnect(
+            BlockingCancellationRequest(), completed_response()
+        )
+    )
+    await observer_cleanup_started.wait()
+
+    # Act
+    handoff.cancel()
+    handoff_result = await _capture_base_exception(handoff)
+    state_after_cancel = pool.status()[0]
+    await relayed.aclose(cancelled=True)  # idempotency / no negative counter
+    state_after_second_close = pool.status()[0]
+
+    # Assert
+    assert (
+        isinstance(handoff_result, asyncio.CancelledError),
+        state_after_cancel["in_flight"],
+        state_after_cancel["cancelled_total"],
+        state_after_second_close["in_flight"],
+        state_after_second_close["cancelled_total"],
+    ) == (True, 0, 1, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_response_exception_always_settles_disconnect_observer() -> None:
+    # Arrange
+    receive_started = asyncio.Event()
+    receive_finished = asyncio.Event()
+
+    class Request:
+        async def receive(self) -> dict:
+            receive_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                receive_finished.set()
+
+    async def failing_response():
+        await receive_started.wait()
+        raise RuntimeError("upstream failure")
+
+    # Act
+    result = await _capture_base_exception(
+        _until_response_or_disconnect(Request(), failing_response())
+    )
+    await asyncio.sleep(0)
+
+    # Assert
+    assert (type(result), str(result), receive_finished.is_set()) == (
+        RuntimeError,
+        "upstream failure",
+        True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_outer_cancel_cannot_interrupt_pre_response_release(
+) -> None:
+    # Arrange
+    send_started = asyncio.Event()
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, *, stream):
+            send_started.set()
+            await asyncio.Future()
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1
+    )
+    backend = InferenceBackend(pool, client_factory=Client)
+
+    class Request:
+        async def receive(self) -> dict:
+            await send_started.wait()
+            return {"type": "http.disconnect"}
+
+    handoff = asyncio.create_task(
+        _until_response_or_disconnect(
+            Request(),
+            backend.relay("POST", "/v1/messages", body=b"{}", headers={}),
+        )
+    )
+    await asyncio.wait_for(close_started.wait(), 1)
+    state_during_close = pool.status()[0]
+
+    # Act
+    handoff.cancel()
+    result = await _capture_base_exception(handoff)
+    allow_close.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    state_after_close = pool.status()[0]
+
+    # Assert
+    assert (
+        state_during_close["in_flight"],
+        isinstance(result, asyncio.CancelledError),
+        state_after_close["in_flight"],
+        state_after_close["cancelled_total"],
+    ) == (1, True, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_close_does_not_poison_finalizer(
+) -> None:
+    # Arrange
+    response_close_started = asyncio.Event()
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        async def aclose(self) -> None:
+            response_close_started.set()
+            await asyncio.Future()
+
+        async def aiter_bytes(self):
+            yield b"ok"
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, *, stream):
+            return Response()
+
+        async def aclose(self) -> None:
+            pass
+
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1
+    )
+    backend = InferenceBackend(pool, client_factory=Client)
+    relayed = await backend.relay("POST", "/v1/messages", body=b"{}", headers={})
+
+    # Act
+    async with pool._admission:
+        close_task = asyncio.create_task(relayed.aclose(cancelled=True))
+        await response_close_started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        close_task.cancel()
+    first_result = await _capture_base_exception(close_task)
+    await relayed.aclose(cancelled=True)
+    state = pool.status()[0]
+
+    # Assert
+    assert (
+        isinstance(first_result, asyncio.CancelledError),
+        state["in_flight"],
+        state["cancelled_total"],
+    ) == (True, 0, 1)
 
 
 @pytest.mark.asyncio

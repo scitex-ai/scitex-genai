@@ -206,6 +206,8 @@ async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> 
             "in_flight": 8,
             "queued": 4,
             "capacity": 8,
+            "admitted_total": 8,
+            "cancelled_total": 0,
         }
     ]
 
@@ -291,7 +293,69 @@ async def test_cancelled_waiter_releases_its_queue_slot() -> None:
         isinstance(cancelled, asyncio.CancelledError),
         state["in_flight"],
         state["queued"],
-    ) == (True, 1, 0)
+        state["cancelled_total"],
+    ) == (True, 1, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_racing_admission_never_leaks_or_goes_negative() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=1
+    )
+
+    # Act -- exercise both legal outcomes of release vs cancellation.
+    for _ in range(50):
+        occupying = await pool.acquire("occupying")
+        waiting = asyncio.create_task(pool.acquire("racing"))
+        await _wait_for_queue(pool, 1)
+        release = asyncio.create_task(pool.release(occupying))
+        waiting.cancel()
+        await release
+        result = await _raised_async(waiting)
+        if not isinstance(result, BaseException):
+            await pool.release(waiting.result())
+
+    # Assert
+    state = pool.status()[0]
+    assert (
+        state["in_flight"],
+        state["queued"],
+        state["admitted_total"] >= state["cancelled_total"],
+    ) == (0, 0, True)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_waiter_preserves_fifo_for_live_waiters() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=3
+    )
+    occupying = await pool.acquire("occupying")
+    first = asyncio.create_task(pool.acquire("first-live"))
+    cancelled = asyncio.create_task(pool.acquire("disconnects"))
+    last = asyncio.create_task(pool.acquire("last-live"))
+    await _wait_for_queue(pool, 3)
+
+    # Act
+    cancelled.cancel()
+    cancelled_result = await _raised_async(cancelled)
+    await pool.release(occupying)
+    first_member = await first
+    first_won = not last.done()
+    await pool.release(first_member)
+    last_member = await last
+    await pool.release(last_member)
+
+    # Assert
+    state = pool.status()[0]
+    assert (
+        isinstance(cancelled_result, asyncio.CancelledError),
+        first_won,
+        state["in_flight"],
+        state["queued"],
+        state["cancelled_total"],
+    ) == (True, True, 0, 0, 1)
 
 
 @pytest.mark.asyncio
@@ -315,6 +379,8 @@ async def test_shutdown_wakes_waiters_and_rejects_new_admission() -> None:
         "in_flight": 1,
         "queued": 0,
         "capacity": 1,
+        "admitted_total": 1,
+        "cancelled_total": 0,
     }
     await pool.release(admitted)
 
