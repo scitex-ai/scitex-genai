@@ -322,6 +322,39 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
 
 
 @pytest.mark.asyncio
+async def test_relay_health_exposes_live_token_admission_counts(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, token_capacity_per_upstream=1_000
+    )
+    backend = InferenceBackend(pool)
+    admitted = await pool.acquire("first", input_tokens=700)
+    waiting = asyncio.create_task(pool.acquire("second", input_tokens=400))
+    for _ in range(100):
+        if pool.upstreams[0].queued == 1:
+            break
+        await asyncio.sleep(0)
+
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.get("/health")
+        waiting.cancel()
+        with suppress(asyncio.CancelledError):
+            await waiting
+        await pool.release(admitted, input_tokens=700)
+
+    # Assert
+    assert (
+        response.json()["input_tokens_in_flight"],
+        response.json()["input_tokens_queued"],
+        response.json()["members"][0]["token_capacity"],
+    ) == (700, 400, 1_000)
+
+
+@pytest.mark.asyncio
 async def test_relay_lifespan_closes_admission_on_shutdown(upstream_factory) -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls(upstream_factory().url)

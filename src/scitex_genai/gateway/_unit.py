@@ -73,6 +73,7 @@ def gateway_command(
     inference_timeout_s: float | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
+    inference_token_capacity_per_upstream: int | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> list[str]:
@@ -112,6 +113,17 @@ def gateway_command(
                 )
             ),
         ]
+    if inference_token_capacity_per_upstream is not None:
+        argv += [
+            "--inference-token-capacity-per-upstream",
+            str(
+                check_count(
+                    "inference_token_capacity_per_upstream",
+                    inference_token_capacity_per_upstream,
+                    minimum=1,
+                )
+            ),
+        ]
     return argv
 
 
@@ -125,6 +137,7 @@ def render_unit(
     interpreter: str | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
+    inference_token_capacity_per_upstream: int | None = None,
 ) -> str:
     """The unit text, byte-for-byte what ``install_unit`` writes."""
     argv = gateway_command(
@@ -134,6 +147,9 @@ def render_unit(
         inference_timeout_s=inference_timeout_s,
         inference_capacity_per_upstream=inference_capacity_per_upstream,
         inference_max_queue_size=inference_max_queue_size,
+        inference_token_capacity_per_upstream=(
+            inference_token_capacity_per_upstream
+        ),
         config=config,
         interpreter=interpreter,
     )
@@ -177,6 +193,7 @@ def install_unit(
     runner: Runner | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
+    inference_token_capacity_per_upstream: int | None = None,
     interpreter: str | None = None,
 ) -> Path:
     """Write the unit, then reload the user manager and ``enable --now`` it.
@@ -197,6 +214,9 @@ def install_unit(
             inference_timeout_s=inference_timeout_s,
             inference_capacity_per_upstream=inference_capacity_per_upstream,
             inference_max_queue_size=inference_max_queue_size,
+            inference_token_capacity_per_upstream=(
+                inference_token_capacity_per_upstream
+            ),
             config=config,
             interpreter=interpreter,
         )

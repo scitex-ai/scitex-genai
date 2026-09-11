@@ -109,6 +109,16 @@ def _add_settings_args(
             "(default: gateway.inference_max_queue_size, else 128)."
         ),
     )
+    parser.add_argument(
+        "--inference-token-capacity-per-upstream",
+        type=int,
+        default=default,
+        help=(
+            "Maximum estimated input tokens admitted concurrently per inference "
+            "upstream (default: gateway.inference_token_capacity_per_upstream; "
+            "unset disables the token budget)."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,6 +219,9 @@ def _install_unit(args: argparse.Namespace) -> None:
         inference_timeout_s=args.inference_timeout_s,
         inference_capacity_per_upstream=args.inference_capacity_per_upstream,
         inference_max_queue_size=args.inference_max_queue_size,
+        inference_token_capacity_per_upstream=(
+            args.inference_token_capacity_per_upstream
+        ),
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -238,6 +251,9 @@ def main(
         inference_timeout_s=args.inference_timeout_s,
         inference_capacity_per_upstream=args.inference_capacity_per_upstream,
         inference_max_queue_size=args.inference_max_queue_size,
+        inference_token_capacity_per_upstream=(
+            args.inference_token_capacity_per_upstream
+        ),
     )
     if settings.external_provider is not None:
         external = settings.external_provider
@@ -251,6 +267,9 @@ def main(
             [external.upstream],
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
+            token_capacity_per_upstream=(
+                settings.inference_token_capacity_per_upstream
+            ),
         )
         backend = ExternalProviderBackend(
             pool,
@@ -283,6 +302,9 @@ def main(
             settings.inference_upstream,
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
+            token_capacity_per_upstream=(
+                settings.inference_token_capacity_per_upstream
+            ),
         )
         backend = InferenceBackend(
             pool,

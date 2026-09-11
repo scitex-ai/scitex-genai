@@ -3,7 +3,6 @@
 import asyncio
 import hmac
 import json
-import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -15,7 +14,7 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
-from ._inference import InferenceBackend
+from ._inference import InferenceBackend, estimate_input_tokens
 from ._opencode import OpenCodeBackend
 from ._secrets import resolve_gateway_key
 
@@ -97,7 +96,7 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
+    return estimate_input_tokens(serialized.encode("utf-8"))
 
 
 def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
@@ -213,6 +212,13 @@ def create_app(
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
             }
+            if any("token_capacity" in member for member in members):
+                status["input_tokens_in_flight"] = sum(
+                    member["input_tokens_in_flight"] for member in members
+                )
+                status["input_tokens_queued"] = sum(
+                    member["input_tokens_queued"] for member in members
+                )
             health_status = getattr(backend, "health_status", None)
             if health_status is not None:
                 status["external"] = health_status()

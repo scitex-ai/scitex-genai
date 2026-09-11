@@ -121,7 +121,11 @@ def test_an_explicit_timeout_is_baked_into_execstart():
 
 def test_explicit_admission_bounds_are_baked_into_execstart():
     # Arrange
-    text = render_unit(inference_capacity_per_upstream=3, inference_max_queue_size=9)
+    text = render_unit(
+        inference_capacity_per_upstream=3,
+        inference_max_queue_size=9,
+        inference_token_capacity_per_upstream=1_600_000,
+    )
 
     # Act
     argv = _exec_argv(text)
@@ -132,6 +136,8 @@ def test_explicit_admission_bounds_are_baked_into_execstart():
         "3",
         "--inference-max-queue-size",
         "9",
+        "--inference-token-capacity-per-upstream",
+        "1600000",
     ]
 
 
@@ -140,6 +146,7 @@ def test_explicit_admission_bounds_are_baked_into_execstart():
     [
         {"inference_capacity_per_upstream": 0},
         {"inference_max_queue_size": -1},
+        {"inference_token_capacity_per_upstream": 0},
     ],
 )
 def test_invalid_admission_bounds_are_refused(given):

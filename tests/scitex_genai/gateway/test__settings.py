@@ -37,6 +37,7 @@ ENV_KEYS = (
     "SCITEX_GATEWAY_INFERENCE_UPSTREAMS",
     "SCITEX_GATEWAY_INFERENCE_CAPACITY_PER_UPSTREAM",
     "SCITEX_GATEWAY_INFERENCE_MAX_QUEUE_SIZE",
+    "SCITEX_GATEWAY_INFERENCE_TOKEN_CAPACITY_PER_UPSTREAM",
 )
 
 
@@ -92,6 +93,7 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         settings.inference_timeout_s,
         settings.inference_capacity_per_upstream,
         settings.inference_max_queue_size,
+        settings.inference_token_capacity_per_upstream,
     ) == (
         DEFAULT_HOST,
         DEFAULT_PORT,
@@ -100,6 +102,7 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         DEFAULT_TIMEOUT_S,
         DEFAULT_CAPACITY_PER_UPSTREAM,
         DEFAULT_MAX_QUEUE_SIZE,
+        None,
     )
 
 
@@ -240,6 +243,24 @@ def test_file_and_direct_values_resolve_admission_bounds(tmp_path: Path, clean_e
     ) == (3, 9, 4, 10)
 
 
+def test_file_and_direct_values_resolve_token_capacity(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  inference_token_capacity_per_upstream: 1600000\n",
+    )
+
+    # Act
+    from_file = load_settings(path)
+    direct = load_settings(path, inference_token_capacity_per_upstream=1700000)
+
+    # Assert
+    assert (
+        from_file.inference_token_capacity_per_upstream,
+        direct.inference_token_capacity_per_upstream,
+    ) == (1_600_000, 1_700_000)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -247,6 +268,7 @@ def test_file_and_direct_values_resolve_admission_bounds(tmp_path: Path, clean_e
         ("inference_capacity_per_upstream", -1),
         ("inference_max_queue_size", -1),
         ("inference_max_queue_size", 1.5),
+        ("inference_token_capacity_per_upstream", 0),
     ],
 )
 def test_invalid_admission_bounds_are_refused(tmp_path: Path, clean_env, field, value):

@@ -41,6 +41,7 @@ from ._inference import (
     DEFAULT_CAPACITY_PER_UPSTREAM,
     DEFAULT_MAX_QUEUE_SIZE,
     DEFAULT_TIMEOUT_S,
+    DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
     TIMEOUT_ENV,
     UPSTREAM_ENV,
     parse_upstreams,
@@ -54,6 +55,7 @@ KEY_UPSTREAMS = "gateway.inference_upstreams"
 KEY_TIMEOUT = "gateway.inference_timeout_s"
 KEY_CAPACITY = "gateway.inference_capacity_per_upstream"
 KEY_MAX_QUEUE = "gateway.inference_max_queue_size"
+KEY_TOKEN_CAPACITY = "gateway.inference_token_capacity_per_upstream"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
@@ -178,6 +180,9 @@ class GatewaySettings:
     inference_timeout_s: float = DEFAULT_TIMEOUT_S
     inference_capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM
     inference_max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE
+    inference_token_capacity_per_upstream: int | None = (
+        DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM
+    )
     external_provider: ExternalGatewaySettings | None = None
 
     def __post_init__(self) -> None:
@@ -198,6 +203,16 @@ class GatewaySettings:
                 minimum=1,
             ),
         )
+        if self.inference_token_capacity_per_upstream is not None:
+            object.__setattr__(
+                self,
+                "inference_token_capacity_per_upstream",
+                check_count(
+                    "inference_token_capacity_per_upstream",
+                    self.inference_token_capacity_per_upstream,
+                    minimum=1,
+                ),
+            )
         if self.external_provider is not None and self.inference_upstream:
             raise ValueError(
                 "gateway.external_provider and gateway.inference_upstreams are mutually exclusive"
@@ -220,6 +235,7 @@ def load_settings(
     inference_timeout_s: float | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
+    inference_token_capacity_per_upstream: int | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -262,6 +278,11 @@ def load_settings(
             KEY_MAX_QUEUE,
             direct_val=inference_max_queue_size,
             default=DEFAULT_MAX_QUEUE_SIZE,
+        ),
+        inference_token_capacity_per_upstream=config.resolve(
+            KEY_TOKEN_CAPACITY,
+            direct_val=inference_token_capacity_per_upstream,
+            default=DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         ),
         external_provider=ExternalGatewaySettings.from_mapping(
             external_mapping
