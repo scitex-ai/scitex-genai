@@ -18,6 +18,7 @@ from scitex_genai.gateway._errors import (
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
+    accepts_session_id,
     adapt_openai_roles,
     announce,
     conversation_key,
@@ -363,6 +364,11 @@ async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
         [len(json.loads(request["body"])["messages"]) for request in first.requests],
         [len(json.loads(request["body"])["messages"]) for request in second.requests],
     ) == ([1, 3], [1])
+    assert all(
+        "session_id" not in json.loads(request["body"])
+        and "x-scitex-session-id" not in request["headers"]
+        for request in (*first.requests, *second.requests)
+    )
 
 
 def test_pool_refuses_with_inference_wording_when_empty() -> None:
@@ -852,6 +858,141 @@ def test_session_header_is_case_insensitive_bounded_and_opaque() -> None:
         64,
         False,
     )
+
+
+def test_scitex_session_header_has_precedence_over_legacy_spellings() -> None:
+    # Arrange
+    headers = {
+        "x-session-id": "legacy-last",
+        "session_id": "legacy-first",
+        "X-SciTeX-Session-ID": "canonical",
+    }
+
+    # Act / Assert
+    assert request_session_key(headers) == request_session_key(
+        {"x-scitex-session-id": "canonical"}
+    )
+
+
+@pytest.mark.parametrize(
+    "path,payload,expected_injection",
+    [
+        (
+            "/v1/messages",
+            {
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            False,
+        ),
+        (
+            "/v1/chat/completions",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            True,
+        ),
+        ("/v1/responses", {"model": "m", "input": "hi"}, True),
+    ],
+)
+def test_explicit_session_is_injected_without_changing_protocol_shape(
+    path: str,
+    payload: dict,
+    expected_injection: bool,
+) -> None:
+    # Arrange
+    raw_identity = "customer/alice/session-123"
+    key = request_session_key({"X-SciTeX-Session-ID": raw_identity})
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act
+    forwarded, session = backend.prepare(
+        json.dumps(payload).encode(),
+        hoist=hoists_on(path),
+        affinity_key=key,
+        inject_session_id=accepts_session_id(path),
+    )
+    sent = json.loads(forwarded)
+
+    # Assert -- only protocol models that propagate the extension receive it.
+    injected = sent.pop("session_id", None)
+    assert (session, injected, sent) == (
+        key,
+        key if expected_injection else None,
+        payload,
+    )
+    assert raw_identity not in forwarded.decode()
+
+
+def test_explicit_header_replaces_a_raw_body_session_id() -> None:
+    # Arrange
+    payload = {"model": "m", "input": "hi", "session_id": "raw-body-identity"}
+    key = request_session_key({"session_id": "header-wins"})
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act
+    forwarded, _ = backend.prepare(
+        json.dumps(payload).encode(), hoist=False, affinity_key=key
+    )
+
+    # Assert
+    assert json.loads(forwarded)["session_id"] == key
+
+
+@pytest.mark.parametrize("body", [b"not-json", b"[1,2,3]"])
+def test_uninjectable_body_is_forwarded_unchanged_with_session_affinity(
+    body: bytes,
+) -> None:
+    # Arrange
+    key = request_session_key({"x-session-id": "stable"})
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act / Assert
+    assert backend.prepare(body, hoist=False, affinity_key=key) == (body, key)
+
+
+def test_no_caller_session_does_not_add_a_body_session_id() -> None:
+    # Arrange
+    body = json.dumps({"model": "m", "input": "hi"}).encode()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act
+    forwarded, _ = backend.prepare(body, hoist=False)
+
+    # Assert
+    assert forwarded == body
+
+
+@pytest.mark.asyncio
+async def test_relay_strips_raw_session_headers_and_sends_only_opaque_body_id(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    headers = {
+        "content-type": "application/json",
+        "X-SciTeX-Session-ID": "raw-canonical",
+        "session_id": "raw-legacy",
+        "x-session-id": "raw-other",
+    }
+
+    # Act
+    relayed = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=json.dumps({"model": "m", "input": "hi"}).encode(),
+        headers=headers,
+    )
+    await _collect(relayed.body)
+    request = upstream.requests[0]
+
+    # Assert
+    assert not {
+        "x-scitex-session-id",
+        "session_id",
+        "x-session-id",
+    } & set(request["headers"])
+    assert json.loads(request["body"])["session_id"] == request_session_key(headers)
 
 
 def test_blank_session_header_is_rejected() -> None:

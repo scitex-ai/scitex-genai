@@ -109,8 +109,10 @@ WAIT_SLICE_S = 5.0
 
 #: Never forwarded. The script dropped the first three; ``transfer-encoding``
 #: joins them because the server has already de-chunked the body it hands us.
-_HOP_BY_HOP = frozenset({"host", "content-length", "connection", "transfer-encoding"})
 _SESSION_ID_HEADERS = ("x-scitex-session-id", "session_id", "x-session-id")
+_HOP_BY_HOP = frozenset(
+    {"host", "content-length", "connection", "transfer-encoding"}
+).union(_SESSION_ID_HEADERS)
 _SESSION_KEY_DOMAIN = b"scitex-genai-session-affinity\0"
 
 # First pass (7 conversations) showed ALL agents identical at 1k and ALL
@@ -151,6 +153,17 @@ def request_session_key(headers: Mapping[str, str]) -> str:
                     _SESSION_KEY_DOMAIN + normalized.encode("utf-8")
                 ).hexdigest()
     return ""
+
+
+def accepts_session_id(path: str) -> bool:
+    """Whether the pinned SGLang protocol model propagates top-level sessions.
+
+    OpenAI Chat Completions and Responses carry ``session_id`` into the
+    scheduler. The native Anthropic adapter currently neither declares nor
+    propagates it, so adding the unknown field there would only be discarded.
+    """
+    route = path.split("?", 1)[0].rstrip("/")
+    return route in {"/v1/chat/completions", "/v1/responses"}
 
 
 def as_blocks(content: Any) -> list[Any]:
@@ -654,6 +667,7 @@ class InferenceBackend:
         *,
         hoist: bool = True,
         affinity_key: str = "",
+        inject_session_id: bool = True,
     ) -> tuple[bytes | None, str]:
         """Derive the sticky key, hoisting the body only where the shape asks.
 
@@ -684,6 +698,17 @@ class InferenceBackend:
                     hoisted = int(adapted) + repaired
                 if key is None:
                     key = conversation_key(payload)
+                # SGLang's session-aware radix cache consumes a TOP-LEVEL
+                # ``session_id``.  Only an explicit caller identity is strong
+                # enough to label cache ownership: the body heuristic remains
+                # useful for replica affinity, but is not an application
+                # session contract.  Replace any caller-provided body value
+                # with the same bounded opaque digest used for stickiness, so
+                # raw identities never cross the gateway boundary.
+                session_injected = False
+                if inject_session_id and affinity_key and isinstance(payload, dict):
+                    payload["session_id"] = affinity_key
+                    session_injected = True
                 if self.telemetry_sink is not None:
                     # Telemetry must NEVER affect the request path. A broad
                     # except is deliberate: any failure here is a lost
@@ -694,7 +719,7 @@ class InferenceBackend:
                             self.telemetry_sink(f"[prefix] {report}")
                     except Exception:  # noqa: BLE001
                         pass
-                if hoisted:
+                if hoisted or session_injected:
                     body = json.dumps(payload).encode()
             except (ValueError, AttributeError, TypeError):
                 pass  # not JSON we understand - forward untouched, never drop
@@ -726,6 +751,7 @@ class InferenceBackend:
             body,
             hoist=hoists_on(path),
             affinity_key=request_session_key(headers),
+            inject_session_id=accepts_session_id(path),
         )
         forwarded = {
             name: value

@@ -68,10 +68,10 @@ def describe(launch: Launch) -> str:
             f"# engine {launch.key}",
             f"cache:   {launch.cache_dir}",
             f"health:  {launch.health_url}",
-            f"vllm:    {shlex.join(launch.vllm_argv)}",
+            f"{launch.engine_name}: {shlex.join(launch.engine_argv)}",
             f"litellm: {shlex.join(launch.litellm_argv)}",
             f"tunnel:  {shlex.join(launch.tunnel_argv)}",
-            f"logs:    {launch.vllm_log} {launch.litellm_log} {launch.tunnel_log}",
+            f"logs:    {launch.engine_log} {launch.litellm_log} {launch.tunnel_log}",
         ]
     )
 
