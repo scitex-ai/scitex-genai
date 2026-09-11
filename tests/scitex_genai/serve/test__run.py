@@ -168,8 +168,10 @@ def test_prepare_creates_and_checks_engine_writable_directories(tmp_path: Path):
     EngineRunner(launch, popen=_Spawner()).prepare()
 
     # Assert
-    assert storage.is_dir()
-    assert not (storage / ".scitex-genai-write-probe").exists()
+    assert (
+        storage.is_dir(),
+        (storage / ".scitex-genai-write-probe").exists(),
+    ) == (True, False)
 
 
 def test_prepare_runs_sglang_capability_preflight(tmp_path: Path):

@@ -353,11 +353,13 @@ def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     }
 
     # Assert
-    assert binds == {
-        "/weights/model-a:/weights/model-a:ro",
-        f"{storage}:{storage}:rw",
-    }
-    assert launch.writable_dirs == (Path(storage),)
+    assert (binds, launch.writable_dirs) == (
+        {
+            "/weights/model-a:/weights/model-a:ro",
+            f"{storage}:{storage}:rw",
+        },
+        (Path(storage),),
+    )
 
 
 def test_canary_inherits_slurm_cuda_visibility_into_the_container():
