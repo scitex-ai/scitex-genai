@@ -77,6 +77,16 @@ class EngineRunner:
         Path(self.launch.env["HOME"], ".cache", "flashinfer").mkdir(
             parents=True, exist_ok=True
         )
+        for path in self.launch.writable_dirs:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".scitex-genai-write-probe"
+            try:
+                probe.write_bytes(b"")
+                probe.unlink()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"engine writable directory is not writable: {path}"
+                ) from exc
         for log_path in (
             self.launch.engine_log,
             self.launch.litellm_log,

@@ -156,6 +156,24 @@ def test_prepare_creates_every_cache_directory(tmp_path: Path):
     )
 
 
+def test_prepare_creates_and_checks_engine_writable_directories(tmp_path: Path):
+    # Arrange
+    launch = _launch(tmp_path)
+    storage = tmp_path / "persistent-hicache"
+    launch = type(launch)(
+        **{**launch.__dict__, "writable_dirs": (storage,)}
+    )
+
+    # Act
+    EngineRunner(launch, popen=_Spawner()).prepare()
+
+    # Assert
+    assert (
+        storage.is_dir(),
+        (storage / ".scitex-genai-write-probe").exists(),
+    ) == (True, False)
+
+
 def test_prepare_runs_sglang_capability_preflight(tmp_path: Path):
     # Arrange
     spawner = _Spawner()
