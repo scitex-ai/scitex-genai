@@ -211,3 +211,8 @@ The additional two-H100 lease, job `30409720`, was pending for priority at the
 time of this record, with an estimated start of 2026-09-15 22:30 UTC. Until a
 separate lease is available, do not run the replay against the production
 engine.
+
+A dedicated full-tier canary lease, job `30459210`, requests two H100 GPUs,
+256 GB host RAM, and one day. It was pending for priority when submitted. The
+128-GB job can run scheduler and conservative L2-only experiments; the full
+L2/L3 1M-context matrix must wait for the 256-GB canary.
