@@ -62,6 +62,15 @@ class RateLimitError(UpstreamError):
         self.retry_after = max(1.0, retry_after)
 
 
+class InferenceAdmissionError(UpstreamError):
+    """The bounded inference queue cannot admit this request."""
+
+    error_type = "inference_admission"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=503)
+
+
 class HomeMemberReloading(GatewayError):
     """The session's sticky member is cooling and too RECENTLY to fail over.
 

@@ -90,6 +90,24 @@ def _add_settings_args(
             "$SCITEX_GATEWAY_INFERENCE_TIMEOUT_S, else 600)."
         ),
     )
+    parser.add_argument(
+        "--inference-capacity-per-upstream",
+        type=int,
+        default=default,
+        help=(
+            "Maximum concurrent admitted requests per inference upstream "
+            "(default: gateway.inference_capacity_per_upstream, else 8)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-max-queue-size",
+        type=int,
+        default=default,
+        help=(
+            "Maximum requests waiting for inference capacity across the pool "
+            "(default: gateway.inference_max_queue_size, else 128)."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -188,6 +206,8 @@ def _install_unit(args: argparse.Namespace) -> None:
         port=args.port,
         upstream=args.inference_upstream,
         inference_timeout_s=args.inference_timeout_s,
+        inference_capacity_per_upstream=args.inference_capacity_per_upstream,
+        inference_max_queue_size=args.inference_max_queue_size,
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -215,9 +235,15 @@ def main(
         port=args.port,
         inference_upstream=args.inference_upstream,
         inference_timeout_s=args.inference_timeout_s,
+        inference_capacity_per_upstream=args.inference_capacity_per_upstream,
+        inference_max_queue_size=args.inference_max_queue_size,
     )
     if settings.inference_upstream:
-        pool = InferenceUpstreamPool.from_urls(settings.inference_upstream)
+        pool = InferenceUpstreamPool.from_urls(
+            settings.inference_upstream,
+            capacity_per_upstream=settings.inference_capacity_per_upstream,
+            max_queue_size=settings.inference_max_queue_size,
+        )
         backend = InferenceBackend(
             pool,
             timeout_s=settings.inference_timeout_s,

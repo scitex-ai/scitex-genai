@@ -112,12 +112,19 @@ def create_app(
             except asyncio.CancelledError:
                 pass
 
+    @asynccontextmanager
+    async def inference_lifespan(app: Any) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await backend.close()
+
     app = FastAPI(
         title="SciTeX GenAI Gateway",
         docs_url=None,
         redoc_url=None,
         # An inference pool has no quota to poll; only Codex accounts do.
-        lifespan=None if relaying else lifespan,
+        lifespan=inference_lifespan if relaying else lifespan,
     )
 
     def authorized(request: Request) -> bool:
@@ -126,10 +133,15 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, Any]:
         if relaying:
+            members = backend.pool.status()
             return {
                 "status": "ok",
                 "provider": backend.provider,
                 "upstreams": [upstream.alias for upstream in backend.pool.upstreams],
+                "members": members,
+                "active_members": sum(member["active"] for member in members),
+                "in_flight": sum(member["in_flight"] for member in members),
+                "queued": sum(member["queued"] for member in members),
             }
         return {
             "status": "ok",

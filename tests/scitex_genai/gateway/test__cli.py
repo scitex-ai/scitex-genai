@@ -57,7 +57,9 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
         args.port,
         args.inference_upstream,
         args.inference_timeout_s,
-    ) == (None, None, None, None, None)
+        args.inference_capacity_per_upstream,
+        args.inference_max_queue_size,
+    ) == (None, None, None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -122,6 +124,10 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "http://one",
         "--inference-timeout-s",
         "123",
+        "--inference-capacity-per-upstream",
+        "3",
+        "--inference-max-queue-size",
+        "9",
     ]
 
     # Act
@@ -129,7 +135,15 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
     after = parser.parse_args([INSTALL_UNIT, *settings])
 
     # Assert
-    names = ("config", "host", "port", "inference_upstream", "inference_timeout_s")
+    names = (
+        "config",
+        "host",
+        "port",
+        "inference_upstream",
+        "inference_timeout_s",
+        "inference_capacity_per_upstream",
+        "inference_max_queue_size",
+    )
     assert tuple(getattr(before, name) for name in names) == tuple(
         getattr(after, name) for name in names
     )
@@ -199,6 +213,10 @@ def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
         "http://127.0.0.1:18773",
         "--inference-timeout-s",
         "123",
+        "--inference-capacity-per-upstream",
+        "3",
+        "--inference-max-queue-size",
+        "9",
     ]
 
     # Act
@@ -206,9 +224,43 @@ def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
 
     # Assert
     app, kwargs = calls[0]
-    assert (app.state.scitex_backend.timeout_s, kwargs) == (
+    pool = app.state.scitex_backend.pool
+    assert (
+        app.state.scitex_backend.timeout_s,
+        kwargs,
+        pool.upstreams[0].capacity,
+        pool.max_queue_size,
+    ) == (
         123.0,
         {"host": "127.0.0.1", "port": 8765, "log_level": "info"},
+        3,
+        9,
+    )
+
+
+def test_main_forwards_admission_bounds_to_generated_unit(
+    tmp_path: Path, gateway_key_env
+):
+    # Arrange
+    gateway_key_env("test-key")
+
+    # Act
+    main(
+        [
+            "--inference-capacity-per-upstream",
+            "3",
+            INSTALL_UNIT,
+            "--inference-max-queue-size",
+            "9",
+            "--unit-dir",
+            str(tmp_path),
+            "--no-enable",
+        ]
+    )
+
+    # Assert
+    assert (tmp_path / UNIT_NAME).read_text() == render_unit(
+        inference_capacity_per_upstream=3, inference_max_queue_size=9
     )
 
 

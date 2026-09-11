@@ -119,6 +119,38 @@ def test_an_explicit_timeout_is_baked_into_execstart():
     assert argv[3:] == ["--inference-timeout-s", "1800.0"]
 
 
+def test_explicit_admission_bounds_are_baked_into_execstart():
+    # Arrange
+    text = render_unit(inference_capacity_per_upstream=3, inference_max_queue_size=9)
+
+    # Act
+    argv = _exec_argv(text)
+
+    # Assert
+    assert argv[3:] == [
+        "--inference-capacity-per-upstream",
+        "3",
+        "--inference-max-queue-size",
+        "9",
+    ]
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        {"inference_capacity_per_upstream": 0},
+        {"inference_max_queue_size": -1},
+    ],
+)
+def test_invalid_admission_bounds_are_refused(given):
+    # Arrange
+    # Act
+    raised = _raised(lambda: render_unit(**given))
+
+    # Assert
+    assert isinstance(raised, ValueError)
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
 def test_an_invalid_timeout_is_refused(timeout):
     # Arrange
@@ -173,6 +205,17 @@ def test_unit_restarts_always():
 
     # Assert
     assert parsed["Service"]["Restart"] == "always"
+
+
+def test_unit_allows_admitted_streams_to_drain_on_shutdown():
+    # Arrange
+    text = render_unit()
+
+    # Act
+    parsed = _sections(text)
+
+    # Assert
+    assert parsed["Service"]["TimeoutStopSec"] == "infinity"
 
 
 def test_unit_is_wanted_at_login():

@@ -14,6 +14,8 @@ list only the upstream that is actually reachable.
      inference_upstreams:
        - http://127.0.0.1:18773
      inference_timeout_s: 1800
+     inference_capacity_per_upstream: 8
+     inference_max_queue_size: 128
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
@@ -46,6 +48,24 @@ Direct values take precedence over the configuration file, then
 Capacity planning
 -----------------
 
+The gateway admits at most ``inference_capacity_per_upstream`` concurrent
+requests to each member (default 8). Additional requests wait in a bounded
+pool-wide queue of ``inference_max_queue_size`` entries (default 128); once
+that queue is full the gateway returns 503. Set the per-member value no higher
+than the inference engine's own running-request limit.
+
+Admission happens after sticky placement. A conversation therefore waits for
+its existing home member instead of moving to an idle replica and losing its
+prefix cache. ``/health`` retains the ``upstreams`` URL list and adds a
+``members`` list with each member's ``active``, ``in_flight``, ``queued``, and
+``capacity`` state, plus pool-wide totals. Cancelled waiters release their
+queue entries, and shutdown wakes all waiters while admitted streams drain.
+
+Both admission settings may also be passed before or after ``install-unit``::
+
+   scitex-genai-gateway --inference-capacity-per-upstream 8 \
+     install-unit --inference-max-queue-size 128
+
 Configure only active, reachable upstreams. A stale port is not spare
 capacity: requests pinned to it can wait and then fail while a real member is
 busy.
@@ -57,7 +77,4 @@ allocation; do not configure a second member until that independently
 allocated server is reachable.
 
 The engine's request limit (for example SGLang
-``--max-running-requests``) remains authoritative. This release does not
-claim gateway admission-control semantics: adding a queue must preserve
-conversation stickiness and prefix-cache locality, propagate cancellation
-while waiting and streaming, and drain safely during shutdown.
+``--max-running-requests``) remains authoritative.
