@@ -171,6 +171,7 @@ def create_app(
                 "active_members": sum(member["active"] for member in members),
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
+                "cache_admission": backend.cache_admission.snapshot(),
             }
             if any("token_capacity" in member for member in members):
                 status["input_tokens_in_flight"] = sum(
@@ -224,6 +225,7 @@ def create_app(
                 relayed.body,
                 status_code=relayed.status_code,
                 media_type=relayed.content_type,
+                headers=relayed.feedback_headers,
             )
 
         @app.post("/v1/messages")
