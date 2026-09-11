@@ -44,6 +44,7 @@ CROSS_PACKAGE_IMPORTS = [
     'scitex',
     'scitex_config',
     'scitex_dev',
+    'scitex_dev.store',
     'scitex_hpc._config',
     'scitex_hpc._reservation',
     'scitex_io',

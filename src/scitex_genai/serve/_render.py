@@ -154,6 +154,7 @@ def _sglang_container_prefix(
             (
                 *(name for name in CACHE_SUBDIRS if name != "HOME"),
                 *conf.env,
+                "CUDA_VISIBLE_DEVICES",
                 "SGLANG_JIT_DEEPGEMM_FAST_WARMUP",
                 SGLANG_UNIFIED_RADIX_ENV,
             )
@@ -189,7 +190,12 @@ def sglang_preflight_argv(
         "missing=[name for name in required if name not in fields]; "
         "assert not missing, f'unsupported SGLang image; missing flags: {missing}'; "
         "assert hasattr(environ.envs, 'SGLANG_ENABLE_UNIFIED_RADIX_TREE'), "
-        "'unsupported SGLang image; missing SGLANG_ENABLE_UNIFIED_RADIX_TREE'"
+        "'unsupported SGLang image; missing SGLANG_ENABLE_UNIFIED_RADIX_TREE'; "
+        "import importlib.metadata, os; "
+        "expected=os.environ.get('SCITEX_GENAI_EXPECTED_SGLANG_VERSION'); "
+        "actual=importlib.metadata.version('sglang'); "
+        "assert not expected or actual == expected, "
+        "f'unsupported SGLang build: expected {expected}, found {actual}'"
     )
     return (*_sglang_container_prefix(settings, conf, env), "python3", "-c", script)
 
