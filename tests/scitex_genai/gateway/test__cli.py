@@ -60,7 +60,8 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
         args.inference_timeout_s,
         args.inference_capacity_per_upstream,
         args.inference_max_queue_size,
-    ) == (None, None, None, None, None, None, None)
+        args.inference_token_capacity_per_upstream,
+    ) == (None, None, None, None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -129,6 +130,8 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "3",
         "--inference-max-queue-size",
         "9",
+        "--inference-token-capacity-per-upstream",
+        "1600000",
     ]
 
     # Act
@@ -144,6 +147,7 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "inference_timeout_s",
         "inference_capacity_per_upstream",
         "inference_max_queue_size",
+        "inference_token_capacity_per_upstream",
     )
     assert tuple(getattr(before, name) for name in names) == tuple(
         getattr(after, name) for name in names
