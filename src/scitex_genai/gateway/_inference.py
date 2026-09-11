@@ -106,6 +106,8 @@ WAIT_SLICE_S = 5.0
 #: Never forwarded. The script dropped the first three; ``transfer-encoding``
 #: joins them because the server has already de-chunked the body it hands us.
 _HOP_BY_HOP = frozenset({"host", "content-length", "connection", "transfer-encoding"})
+_SESSION_ID_HEADERS = ("x-scitex-session-id", "session_id", "x-session-id")
+_SESSION_KEY_DOMAIN = b"scitex-genai-session-affinity\0"
 
 # First pass (7 conversations) showed ALL agents identical at 1k and ALL
 # distinct at 4k, so the entire divergence happens in that band. These
@@ -122,6 +124,29 @@ def parse_upstreams(value: str) -> list[str]:
 def telemetry_enabled(value: str) -> bool:
     """The script's truthiness: anything but empty / ``0`` / ``false`` is on."""
     return value.lower() not in ("", "0", "false")
+
+
+def request_session_key(headers: Mapping[str, str]) -> str:
+    """Return a bounded, opaque key for caller-declared conversation identity.
+
+    Header names are matched case-insensitively even for a plain ``dict``;
+    Starlette's request header mapping already provides that behavior.
+    ``X-SciTeX-Session-ID`` is the gateway-owned contract; the older generic
+    spellings remain accepted for existing Codex and Anthropic clients.
+
+    The raw value is trimmed and immediately digested. That bounds the pool
+    key and keeps user/session identifiers out of request-journal prefixes.
+    """
+    for expected in _SESSION_ID_HEADERS:
+        for name, value in headers.items():
+            if name.lower() != expected or not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if normalized:
+                return hashlib.sha256(
+                    _SESSION_KEY_DOMAIN + normalized.encode("utf-8")
+                ).hexdigest()
+    return ""
 
 
 def as_blocks(content: Any) -> list[Any]:
@@ -515,15 +540,23 @@ class InferenceBackend:
             pass
 
     def prepare(
-        self, body: bytes | None, *, hoist: bool = True
+        self,
+        body: bytes | None,
+        *,
+        hoist: bool = True,
+        affinity_key: str = "",
     ) -> tuple[bytes | None, str]:
         """Derive the sticky key, hoisting the body only where the shape asks.
 
         Pure apart from the sink. ``hoist`` is the route's verdict (see
         :func:`hoists_on`): the Anthropic Messages route hoists, the OpenAI
-        routes forward the bytes untouched.
+        routes forward the bytes untouched. A caller-declared ``affinity_key``
+        wins over the body heuristic; the heuristic remains the compatibility
+        path for clients that cannot attach an identity header. The key has
+        already been normalized by :func:`request_session_key`, so no raw
+        request identity reaches telemetry or the journal.
         """
-        key = None
+        key = affinity_key or None
         if body:
             try:
                 payload = json.loads(body)
@@ -540,7 +573,8 @@ class InferenceBackend:
                             "_invalid_arguments)"
                         )
                     hoisted = int(adapted) + repaired
-                key = conversation_key(payload)
+                if key is None:
+                    key = conversation_key(payload)
                 if self.telemetry_sink is not None:
                     # Telemetry must NEVER affect the request path. A broad
                     # except is deliberate: any failure here is a lost
@@ -578,7 +612,11 @@ class InferenceBackend:
                 "Inference relay requires scitex-genai[gateway]"
             ) from exc
 
-        body, session = self.prepare(body, hoist=hoists_on(path))
+        body, session = self.prepare(
+            body,
+            hoist=hoists_on(path),
+            affinity_key=request_session_key(headers),
+        )
         forwarded = {
             name: value
             for name, value in headers.items()

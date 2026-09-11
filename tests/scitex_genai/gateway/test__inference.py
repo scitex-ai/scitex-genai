@@ -23,6 +23,7 @@ from scitex_genai.gateway._inference import (
     hoists_on,
     parse_upstreams,
     prefix_report,
+    request_session_key,
     telemetry_enabled,
 )
 
@@ -165,6 +166,32 @@ async def test_pool_keeps_a_conversation_sticky_even_while_it_is_busy() -> None:
         "http://a:1",
         2,
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
+    upstream_factory,
+) -> None:
+    # Arrange -- two Hermes agents can have byte-identical startup prompts.
+    first = upstream_factory()
+    second = upstream_factory()
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls([first.url, second.url])
+    )
+    body = json.dumps(_request()).encode()
+
+    # Act -- a, b must place independently; a's next turn must return home.
+    for session_id in ("hermes-session-a", "hermes-session-b", "hermes-session-a"):
+        relayed = await backend.relay(
+            "POST",
+            "/v1/messages",
+            body=body,
+            headers={"X-SciTeX-Session-ID": session_id},
+        )
+        await _collect(relayed.body)
+
+    # Assert
+    assert (len(first.requests), len(second.requests)) == (2, 1)
 
 
 def test_pool_refuses_with_inference_wording_when_empty() -> None:
@@ -602,6 +629,26 @@ def test_conversation_key_skips_the_shared_system_message_of_a_chat_body() -> No
     keys = (conversation_key(one), conversation_key(two))
     # Assert
     assert keys[0] != keys[1]
+
+
+def test_session_header_is_normalized_and_blank_keeps_body_derived_affinity() -> None:
+    # Arrange
+    payload, _ = hoist_system(_request())
+    body = json.dumps(_request()).encode()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act
+    normalized = request_session_key({"X-SCITEX-SESSION-ID": "  session-a  "})
+    same = request_session_key({"x-scitex-session-id": "session-a"})
+    blank = request_session_key({"X-SciTeX-Session-ID": " \t "})
+    _, fallback_key = backend.prepare(body, affinity_key=blank)
+
+    # Assert
+    assert normalized == same
+    assert len(normalized) == 64
+    assert "session-a" not in normalized
+    assert blank == ""
+    assert fallback_key == conversation_key(payload)
 
 
 def test_hoists_on_is_true_only_for_the_messages_route() -> None:
