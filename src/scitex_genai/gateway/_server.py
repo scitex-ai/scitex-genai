@@ -14,6 +14,7 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
+from ._health import public_upstream_url
 from ._inference import InferenceBackend, estimate_input_tokens
 from ._secrets import resolve_gateway_key
 
@@ -160,19 +161,76 @@ def create_app(
         return hmac.compare_digest(_request_token(request), expected_key)
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
+    async def health() -> Any:
         if relaying:
             members = backend.pool.status()
+            if not backend.active_health_probe:
+                for member in members:
+                    member["url"] = public_upstream_url(member["url"])
+                status = {
+                    "status": "ok",
+                    "provider": backend.provider,
+                    "health_strategy": backend.health_strategy,
+                    "upstreams": [
+                        public_upstream_url(upstream.alias)
+                        for upstream in backend.pool.upstreams
+                    ],
+                    "members": members,
+                    "active_members": sum(member["active"] for member in members),
+                    "in_flight": sum(member["in_flight"] for member in members),
+                    "queued": sum(member["queued"] for member in members),
+                    "cache_admission": backend.cache_admission.snapshot(),
+                    "external": backend.health_status(),
+                }
+                if any("token_capacity" in member for member in members):
+                    status["input_tokens_in_flight"] = sum(
+                        member["input_tokens_in_flight"] for member in members
+                    )
+                    status["input_tokens_queued"] = sum(
+                        member["input_tokens_queued"] for member in members
+                    )
+                return status
+            reachability = await backend.probe_upstreams()
+            members = backend.pool.status()
+            for member, observed in zip(members, reachability, strict=True):
+                admission_eligible = member["active"]
+                member["url"] = public_upstream_url(member["url"])
+                member["configured"] = True
+                member["admission_eligible"] = admission_eligible
+                member["reachable"] = observed.reachable
+                member["ready"] = observed.readiness
+                member["active"] = admission_eligible and observed.readiness
+                member["reachability"] = observed.as_dict()
+            active_members = sum(member["active"] for member in members)
+            reachable_members = sum(member["reachable"] for member in members)
+            ready_members = sum(member["ready"] for member in members)
+            admission_eligible_members = sum(
+                member["admission_eligible"] for member in members
+            )
             status = {
-                "status": "ok",
+                "status": "ok" if active_members else "degraded",
                 "provider": backend.provider,
-                "upstreams": [upstream.alias for upstream in backend.pool.upstreams],
+                "health_strategy": backend.health_strategy,
+                "upstreams": [
+                    public_upstream_url(upstream.alias)
+                    for upstream in backend.pool.upstreams
+                ],
                 "members": members,
-                "active_members": sum(member["active"] for member in members),
+                "configured_members": len(members),
+                "admission_eligible_members": admission_eligible_members,
+                "reachable_members": reachable_members,
+                "ready_members": ready_members,
+                "active_members": active_members,
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
                 "cache_admission": backend.cache_admission.snapshot(),
             }
+            if not active_members:
+                status["reason"] = (
+                    "no_inference_upstream_reachable"
+                    if not reachable_members
+                    else "reachable_upstreams_not_admission_eligible"
+                )
             if any("token_capacity" in member for member in members):
                 status["input_tokens_in_flight"] = sum(
                     member["input_tokens_in_flight"] for member in members
@@ -180,10 +238,7 @@ def create_app(
                 status["input_tokens_queued"] = sum(
                     member["input_tokens_queued"] for member in members
                 )
-            health_status = getattr(backend, "health_status", None)
-            if health_status is not None:
-                status["external"] = health_status()
-            return status
+            return status if active_members else JSONResponse(status, status_code=503)
         return {
             "status": "ok",
             "provider": "openai-codex",
