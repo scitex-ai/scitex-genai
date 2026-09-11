@@ -301,6 +301,7 @@ def test_legacy_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env
 
 
 def test_external_provider_policy_is_loaded_from_config(tmp_path: Path, clean_env):
+    # Arrange
     path = _write(
         tmp_path / "config.yaml",
         "gateway:\n"
@@ -313,17 +314,27 @@ def test_external_provider_policy_is_loaded_from_config(tmp_path: Path, clean_en
         "    max_requests_per_run: 12\n"
         "    max_tokens_per_request: 4096\n",
     )
+    # Act
     settings = load_settings(path)
-    assert settings.external_provider is not None
-    assert settings.external_provider.upstream == "https://api.deepseek.com/anthropic"
-    assert settings.external_provider.canonical_model == "deepseek-flash"
-    assert settings.external_provider.model_aliases == ("deepseek-v4-flash",)
-    assert settings.external_provider.max_requests_per_run == 12
+    external = settings.external_provider
+    # Assert
+    assert external is not None and (
+        external.upstream,
+        external.canonical_model,
+        external.model_aliases,
+        external.max_requests_per_run,
+    ) == (
+        "https://api.deepseek.com/anthropic",
+        "deepseek-flash",
+        ("deepseek-v4-flash",),
+        12,
+    )
 
 
 def test_external_provider_and_local_inference_are_mutually_exclusive(
     tmp_path: Path, clean_env
 ):
+    # Arrange
     path = _write(
         tmp_path / "config.yaml",
         "gateway:\n"
@@ -334,6 +345,8 @@ def test_external_provider_and_local_inference_are_mutually_exclusive(
         "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
         "    canonical_model: deepseek-flash\n",
     )
+    # Act
+    # Assert
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_settings(path)
 

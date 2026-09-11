@@ -53,6 +53,7 @@ def _backend(upstream, **policy):
 
 @pytest.mark.asyncio
 async def test_alias_is_normalized_and_credentials_are_separated(upstream_factory):
+    # Arrange
     upstream = upstream_factory(
         chunks=(
             json.dumps(
@@ -65,6 +66,7 @@ async def test_alias_is_normalized_and_credentials_are_separated(upstream_factor
         )
     )
     app = create_app(_backend(upstream), api_key="local-gateway-secret")
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -76,12 +78,15 @@ async def test_alias_is_normalized_and_credentials_are_separated(upstream_factor
                 "x-scitex-run-id": "run-containing-private-identity",
             },
         )
-    assert response.status_code == 200
     sent = upstream.requests[0]
-    assert json.loads(sent["body"])["model"] == "deepseek-flash"
-    assert sent["headers"]["authorization"] == "Bearer vendor-secret"
-    assert "local-gateway-secret" not in str(sent)
-    assert "run-containing-private-identity" not in str(sent)
+    # Assert
+    assert (
+        response.status_code,
+        json.loads(sent["body"])["model"],
+        sent["headers"]["authorization"],
+        "local-gateway-secret" in str(sent),
+        "run-containing-private-identity" in str(sent),
+    ) == (200, "deepseek-flash", "Bearer vendor-secret", False, False)
 
 
 @pytest.mark.asyncio
@@ -91,8 +96,10 @@ async def test_alias_is_normalized_and_credentials_are_separated(upstream_factor
 async def test_explicit_model_switch_cannot_bypass_firewall(
     upstream_factory, forbidden
 ):
+    # Arrange
     upstream = upstream_factory()
     app = create_app(_backend(upstream), api_key="local")
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -101,32 +108,39 @@ async def test_explicit_model_switch_cannot_bypass_firewall(
             json=_body(forbidden),
             headers={"authorization": "Bearer local"},
         )
-    assert (response.status_code, response.json()["error"]["type"]) == (
-        400,
-        "model_policy",
-    )
-    assert upstream.requests == []
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        upstream.requests,
+    ) == (400, "model_policy", [])
 
 
 @pytest.mark.asyncio
 async def test_model_discovery_is_synthetic_and_does_not_expose_vendor(upstream_factory):
+    # Arrange
     upstream = upstream_factory()
     app = create_app(_backend(upstream), api_key="local")
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
         response = await client.get(
             "/v1/models", headers={"authorization": "Bearer local"}
         )
-    assert response.status_code == 200
-    assert [row["id"] for row in response.json()["data"]] == ["deepseek-flash"]
-    assert upstream.requests == []
+    # Assert
+    assert (
+        response.status_code,
+        [row["id"] for row in response.json()["data"]],
+        upstream.requests,
+    ) == (200, ["deepseek-flash"], [])
 
 
 @pytest.mark.asyncio
 async def test_usage_and_response_reported_model_are_audited_without_payload(
     upstream_factory,
 ):
+    # Arrange
     upstream = upstream_factory(
         chunks=(
             b'{"model":"unexpected-provider-label","usage":'
@@ -135,6 +149,7 @@ async def test_usage_and_response_reported_model_are_audited_without_payload(
     )
     backend = _backend(upstream)
     app = create_app(backend, api_key="local")
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -144,18 +159,22 @@ async def test_usage_and_response_reported_model_are_audited_without_payload(
             headers={"authorization": "Bearer local", "x-scitex-run-id": "private"},
         )
         health = (await client.get("/health")).json()["external"]
-    assert response.status_code == 200
-    assert health["last_reported_model"] == "unexpected-provider-label"
-    assert health["usage"]["input_tokens"] == 7
-    assert health["usage"]["output_tokens"] == 3
-    assert health["usage"]["reported_model_mismatches"] == 1
-    assert health["usage"]["estimated_cost_usd"] == 0.0000013
-    assert "secret prompt" not in json.dumps(health)
-    assert "private" not in json.dumps(health)
+    # Assert
+    assert (
+        response.status_code,
+        health["last_reported_model"],
+        health["usage"]["input_tokens"],
+        health["usage"]["output_tokens"],
+        health["usage"]["reported_model_mismatches"],
+        health["usage"]["estimated_cost_usd"],
+        "secret prompt" in json.dumps(health),
+        "private" in json.dumps(health),
+    ) == (200, "unexpected-provider-label", 7, 3, 1, 0.0000013, False, False)
 
 
 @pytest.mark.asyncio
 async def test_request_and_output_budgets_reject_before_upstream(upstream_factory):
+    # Arrange
     response_body = b'{"model":"deepseek-flash","usage":{"prompt_tokens":1,"completion_tokens":1}}'
     upstream = upstream_factory(chunks=(response_body,))
     app = create_app(
@@ -168,6 +187,7 @@ async def test_request_and_output_budgets_reject_before_upstream(upstream_factor
         api_key="local",
     )
     headers = {"authorization": "Bearer local", "x-scitex-run-id": "same-run"}
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -176,14 +196,18 @@ async def test_request_and_output_budgets_reject_before_upstream(upstream_factor
         oversized = await client.post(
             "/v1/chat/completions", json=_body(max_tokens=101), headers=headers
         )
-    assert first.status_code == 200
-    assert second.status_code == 429
-    assert oversized.status_code == 429
-    assert len(upstream.requests) == 1
+    # Assert
+    assert (
+        first.status_code,
+        second.status_code,
+        oversized.status_code,
+        len(upstream.requests),
+    ) == (200, 429, 429, 1)
 
 
 @pytest.mark.asyncio
 async def test_cost_budget_rejects_before_upstream(upstream_factory):
+    # Arrange
     upstream = upstream_factory()
     app = create_app(
         _backend(
@@ -194,6 +218,7 @@ async def test_cost_budget_rejects_before_upstream(upstream_factory):
         ),
         api_key="local",
     )
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -202,15 +227,17 @@ async def test_cost_budget_rejects_before_upstream(upstream_factory):
             json=_body(),
             headers={"authorization": "Bearer local"},
         )
-    assert (response.status_code, response.json()["error"]["type"]) == (
-        429,
-        "budget_exceeded",
-    )
-    assert upstream.requests == []
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        upstream.requests,
+    ) == (429, "budget_exceeded", [])
 
 
 @pytest.mark.asyncio
 async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_factory):
+    # Arrange
     upstream = upstream_factory(
         content_type="text/event-stream",
         chunks=(
@@ -221,6 +248,7 @@ async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_fa
     )
     backend = _backend(upstream)
     app = create_app(backend, api_key="local")
+    # Act
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
     ) as client:
@@ -230,7 +258,10 @@ async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_fa
             headers={"authorization": "Bearer local"},
         )
     sent = json.loads(upstream.requests[0]["body"])
-    assert response.status_code == 200
-    assert sent["stream_options"] == {"include_usage": True}
-    assert backend.usage.total.input_tokens == 9
-    assert backend.usage.total.output_tokens == 4
+    # Assert
+    assert (
+        response.status_code,
+        sent["stream_options"],
+        backend.usage.total.input_tokens,
+        backend.usage.total.output_tokens,
+    ) == (200, {"include_usage": True}, 9, 4)
