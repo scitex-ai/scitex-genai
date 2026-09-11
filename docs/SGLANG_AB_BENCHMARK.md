@@ -40,7 +40,9 @@ Create a scenario manifest (keep large prompt bodies out of Git):
 
 Populate `messages` with the already-tokenized-and-verified A/B corpus and use
 the identical file for every configuration. The command fails if reported
-prompt tokens differ from `expected_prompt_tokens`.
+prompt tokens differ from `expected_prompt_tokens`. Every request in a
+multi-request replay must declare `cache_state` explicitly. Two requests whose
+state is `cold` or `unknown` are conservatively treated as a crash probe.
 
 Run only against an isolated canary:
 

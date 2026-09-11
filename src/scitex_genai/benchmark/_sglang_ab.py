@@ -54,10 +54,9 @@ _SCHEDULER_KEYS = {
 }
 
 
-def load_scenario(path: Path) -> dict[str, Any]:
-    """Load and strictly validate a version-one replay manifest."""
-    data = json.loads(path.read_text())
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+def _validate_scenario(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Strictly validate a version-one replay manifest, including safety metadata."""
+    if not isinstance(data, Mapping) or data.get("schema_version") != 1:
         raise ValueError("scenario schema_version must be 1")
     if not isinstance(data.get("name"), str) or not data["name"].strip():
         raise ValueError("scenario name must be a non-empty string")
@@ -95,22 +94,36 @@ def load_scenario(path: Path) -> dict[str, Any]:
             raise ValueError(
                 f"request {label} seed must equal scenario seed {data['seed']}"
             )
-        cache_state = request.get("cache_state", "unknown")
+        cache_state = request.get("cache_state")
+        if len(requests) > 1 and cache_state is None:
+            raise ValueError(
+                f"request {label} cache_state is required for multi-request replay"
+            )
+        cache_state = cache_state or "unknown"
         if cache_state not in {"cold", "warm", "unknown"}:
             raise ValueError(
                 f"request {label} cache_state must be cold, warm, or unknown"
             )
-    cold_requests = sum(
-        request.get("cache_state", "unknown") == "cold" for request in requests
+    potentially_cold_requests = sum(
+        request.get("cache_state", "unknown") != "warm" for request in requests
     )
     risk_class = data.get("risk_class", "standard")
     if risk_class not in {"standard", "crash-probe"}:
         raise ValueError("scenario risk_class must be standard or crash-probe")
-    if cold_requests >= 2 and risk_class != "crash-probe":
-        raise ValueError("a cold+cold scenario must declare risk_class crash-probe")
+    if potentially_cold_requests >= 2 and risk_class != "crash-probe":
+        raise ValueError(
+            "two potentially cold requests (cache_state cold or unknown) require "
+            "risk_class crash-probe"
+        )
     if risk_class == "crash-probe" and data.get("target_scope") != "dedicated-canary":
         raise ValueError("a crash-probe requires target_scope dedicated-canary")
     return data
+
+
+def load_scenario(path: Path) -> dict[str, Any]:
+    """Load and strictly validate a version-one replay manifest."""
+    data = json.loads(path.read_text())
+    return dict(_validate_scenario(data))
 
 
 def _request_id(run_id: str, index: int, label: str) -> str:
@@ -289,6 +302,7 @@ async def run_scenario(
     timeout_s: float = 1800.0,
 ) -> list[dict[str, Any]]:
     """Run one fixed replay, returning results in declared arrival order."""
+    scenario = _validate_scenario(scenario)
     if not endpoint or not endpoint.startswith(("http://", "https://")):
         raise ValueError("an explicit http(s) endpoint is required")
     if not acknowledge_isolated_canary:

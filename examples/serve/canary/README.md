@@ -49,6 +49,11 @@ with the canary incarnation manifest. Restart the baseline for its measured
 row, then run every other profile against the same namespace. A result without
 that warm-up evidence is invalid.
 
+Warm-up evidence is deliberately procedural. The current launcher can observe
+engine readiness, but it has no trustworthy signal distinguishing an
+unmeasured warm-up incarnation from a measured incarnation. It therefore does
+not create or infer a warm-up marker.
+
 The primary replay is cold + warm. A cold + cold replay is a separate expected
 crash-probe risk, not an ordinary throughput case. The replay harness requires
 dedicated-canary metadata and an additional crash-probe acknowledgement; do
@@ -73,9 +78,9 @@ The image contains SGLang commit
 
 Source links are pinned, not `main`:
 
-- [server arguments](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/server_args.py#L802-L839)
-- [prefill scheduling order](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/managers/scheduler.py#L3238-L3310)
-- [EAGLE mixed-chunk handling](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/arg_groups/speculative_hook.py#L543-L576)
+- [server arguments](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/server_args.py#L771-L813)
+- [prefill scheduling order](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/managers/scheduler.py#L3012-L3102)
+- [EAGLE mixed-chunk handling](https://github.com/sgl-project/sglang/blob/4ccff141dbe992794f9da6c3aa23535b4f72000d/python/sglang/srt/arg_groups/speculative_hook.py#L499-L530)
 
 The JSON manifest is the machine-readable source of the intended differences.
 Its schema and dry-render tests prevent silent drift between the manifest,
