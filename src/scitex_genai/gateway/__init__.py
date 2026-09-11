@@ -1,6 +1,7 @@
 """Structured provider gateways for external agent harnesses."""
 
 from ._accounts import CodexAccount, CodexAccountPool
+from ._admission import AdmissionController, CacheResidency
 from ._anthropic import (
     AnthropicStreamTranslator,
     anthropic_to_codex,
@@ -19,6 +20,7 @@ from ._server import create_app
 from ._usage import CodexUsageClient
 
 __all__ = [
+    "AdmissionController",
     "AnthropicStreamTranslator",
     "CodexAccount",
     "CodexAccountPool",
@@ -26,6 +28,7 @@ __all__ = [
     "CodexCredential",
     "CodexTransport",
     "CodexUsageClient",
+    "CacheResidency",
     "ExternalProviderBackend",
     "ExternalProviderPolicy",
     "InferenceBackend",
