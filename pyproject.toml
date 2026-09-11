@@ -75,6 +75,9 @@ gateway = [
     "httpx>=0.27",
     "uvicorn>=0.29",
 ]
+benchmark = [
+    "httpx>=0.27",
+]
 image = []
 audio = []
 video = []
@@ -121,6 +124,7 @@ all = [
 [project.scripts]
 scitex-genai-gateway = "scitex_genai.gateway._cli:main"
 scitex-genai-serve = "scitex_genai.serve._cli:main"
+scitex-genai-sglang-ab = "scitex_genai.benchmark._sglang_ab:main"
 
 [project.urls]
 Homepage = "https://github.com/ywatanabe1989/scitex-genai"
