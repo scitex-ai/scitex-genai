@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from scitex_config import ScitexConfig, get_scitex_dir
+from scitex_config import ScitexConfig, get_scitex_dir, load_yaml
 
 from ._inference import (
     DEFAULT_CAPACITY_PER_UPSTREAM,
@@ -57,24 +57,6 @@ KEY_MAX_QUEUE = "gateway.inference_max_queue_size"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
-
-_EXTERNAL_FIELDS = (
-    "provider",
-    "upstream",
-    "upstream_auth_token_env",
-    "canonical_model",
-    "model_aliases",
-    "anthropic_path_prefix",
-    "max_tokens_per_request",
-    "max_requests_per_run",
-    "max_input_tokens_per_run",
-    "max_output_tokens_per_run",
-    "max_total_tokens_per_run",
-    "max_estimated_usd_per_run",
-    "input_usd_per_million_tokens",
-    "output_usd_per_million_tokens",
-)
-
 
 @dataclass(frozen=True)
 class ExternalGatewaySettings:
@@ -258,11 +240,13 @@ def load_settings(
         timeout = (
             os.getenv(TIMEOUT_ENV) or os.getenv(SCITEX_TIMEOUT_ENV) or DEFAULT_TIMEOUT_S
         )
-    external_mapping = {
-        name: value
-        for name in _EXTERNAL_FIELDS
-        if (value := config.get(f"{KEY_EXTERNAL_PROVIDER}.{name}")) is not None
-    }
+    raw_config = load_yaml(path) if present else {}
+    raw_gateway = raw_config.get("gateway", {}) if isinstance(raw_config, dict) else {}
+    external_mapping = (
+        raw_gateway.get("external_provider")
+        if isinstance(raw_gateway, dict)
+        else None
+    )
     return GatewaySettings(
         host=config.resolve(KEY_HOST, direct_val=host, default=DEFAULT_HOST),
         port=config.resolve(KEY_PORT, direct_val=port, default=DEFAULT_PORT, type=int),

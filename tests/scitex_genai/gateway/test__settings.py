@@ -354,6 +354,24 @@ def test_external_provider_and_local_inference_are_mutually_exclusive(
         load_settings(path)
 
 
+def test_external_provider_typo_is_refused(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com\n"
+        "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
+        "    canonical_model: deepseek-flash\n"
+        "    max_request_per_run: 12\n",
+    )
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match="unknown keys: max_request_per_run"):
+        load_settings(path)
+
+
 def test_namespaced_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env):
     # Arrange
     os.environ[SCITEX_TIMEOUT_ENV] = "900"
