@@ -23,6 +23,7 @@ from scitex_genai.gateway._inference import (
     hoists_on,
     parse_upstreams,
     prefix_report,
+    request_session_key,
     telemetry_enabled,
 )
 
@@ -165,6 +166,47 @@ async def test_pool_keeps_a_conversation_sticky_even_while_it_is_busy() -> None:
         "http://a:1",
         2,
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
+    upstream_factory,
+) -> None:
+    # Arrange -- two Hermes agents can have byte-identical startup prompts.
+    first = upstream_factory()
+    second = upstream_factory()
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls([first.url, second.url])
+    )
+    startup_body = json.dumps(_request()).encode()
+    continued_body = json.dumps(
+        _request(
+            later=(
+                {"role": "assistant", "content": "Hi"},
+                {"role": "user", "content": "Again"},
+            )
+        )
+    ).encode()
+
+    # Act -- identical starts separate, then a changed a-turn must return home.
+    for session_id, body in (
+        ("hermes-session-a", startup_body),
+        ("hermes-session-b", startup_body),
+        ("hermes-session-a", continued_body),
+    ):
+        relayed = await backend.relay(
+            "POST",
+            "/v1/messages",
+            body=body,
+            headers={"X-SciTeX-Session-ID": session_id},
+        )
+        await _collect(relayed.body)
+
+    # Assert
+    assert (
+        [len(json.loads(request["body"])["messages"]) for request in first.requests],
+        [len(json.loads(request["body"])["messages"]) for request in second.requests],
+    ) == ([1, 3], [1])
 
 
 def test_pool_refuses_with_inference_wording_when_empty() -> None:
@@ -602,6 +644,50 @@ def test_conversation_key_skips_the_shared_system_message_of_a_chat_body() -> No
     keys = (conversation_key(one), conversation_key(two))
     # Assert
     assert keys[0] != keys[1]
+
+
+def test_session_header_is_case_insensitive_bounded_and_opaque() -> None:
+    # Arrange
+    upper_case = {"X-SCITEX-SESSION-ID": "  session-a  "}
+    lower_case = {"x-scitex-session-id": "session-a"}
+
+    # Act
+    normalized = request_session_key(upper_case)
+    same = request_session_key(lower_case)
+
+    # Assert
+    assert (normalized == same, len(normalized), "session-a" in normalized) == (
+        True,
+        64,
+        False,
+    )
+
+
+def test_blank_session_header_is_rejected() -> None:
+    # Arrange
+    headers = {"X-SciTeX-Session-ID": " \t "}
+
+    # Act
+    blank = request_session_key(headers)
+
+    # Assert
+    assert blank == ""
+
+
+def test_blank_session_header_keeps_body_derived_affinity() -> None:
+    # Arrange
+    payload, _ = hoist_system(_request())
+    body = json.dumps(_request()).encode()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls("http://127.0.0.1:9"))
+
+    # Act
+    _, fallback_key = backend.prepare(
+        body,
+        affinity_key=request_session_key({"X-SciTeX-Session-ID": " \t "}),
+    )
+
+    # Assert
+    assert fallback_key == conversation_key(payload)
 
 
 def test_hoists_on_is_true_only_for_the_messages_route() -> None:
