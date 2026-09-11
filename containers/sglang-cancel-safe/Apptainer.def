@@ -1,0 +1,42 @@
+Bootstrap: docker
+From: lmsysorg/sglang@sha256:45e39d4c5bcfd89d171b3358ba78899354ab26a85bc746a17621ad818f8394aa
+
+%files
+    patches/0001-preserve-dispatched-state-and-retry-chunked-abort.patch /opt/scitex/patches/0001-sglang-cancel-safe.patch
+
+%post
+    set -eu
+    source_dir=/sgl-workspace/sglang
+    expected_commit=4ccff141dbe992794f9da6c3aa23535b4f72000d
+
+    test -d "${source_dir}/.git"
+    actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+    test "${actual_commit}" = "${expected_commit}"
+
+    git -C "${source_dir}" apply --check /opt/scitex/patches/0001-sglang-cancel-safe.patch
+    git -C "${source_dir}" apply /opt/scitex/patches/0001-sglang-cancel-safe.patch
+    python3 -m py_compile \
+        "${source_dir}/python/sglang/srt/managers/tokenizer_manager.py" \
+        "${source_dir}/python/sglang/srt/managers/scheduler.py"
+    git -C "${source_dir}" diff --check
+
+    mkdir -p /opt/scitex/image-metadata
+    git -C "${source_dir}" diff --binary > /opt/scitex/image-metadata/applied.patch
+    printf '%s\n' "${expected_commit}" > /opt/scitex/image-metadata/base-sglang-commit
+
+%test
+    set -eu
+    test "$(cat /opt/scitex/image-metadata/base-sglang-commit)" = \
+        "4ccff141dbe992794f9da6c3aa23535b4f72000d"
+    grep -q 'dispatched: bool = False' \
+        /sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py
+    grep -q 'retry against its current location' \
+        /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py
+
+%labels
+    org.opencontainers.image.base.name lmsysorg/sglang
+    org.opencontainers.image.base.digest sha256:45e39d4c5bcfd89d171b3358ba78899354ab26a85bc746a17621ad818f8394aa
+    ai.scitex.sglang.base_commit 4ccff141dbe992794f9da6c3aa23535b4f72000d
+    ai.scitex.sglang.patch_scope disconnect-state-and-chunked-prefill-abort
+    ai.scitex.sglang.upstream_reference f478b2bb2d582c09e7f1b4e49f0c2d039da8747a
+
