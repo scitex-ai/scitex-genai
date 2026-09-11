@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import asynccontextmanager
+import signal
+import threading
+from contextlib import asynccontextmanager, suppress
 
 import httpx
 import pytest
@@ -11,8 +14,9 @@ import pytest_asyncio
 # skip cleanly on installs without the [gateway] extra.
 pytest.importorskip("fastapi")
 
+from scitex_genai.gateway._errors import InferenceAdmissionError
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
-from scitex_genai.gateway._server import create_app
+from scitex_genai.gateway._server import _build_uvicorn_server, create_app
 
 
 class _Pool:
@@ -93,7 +97,11 @@ async def test_nonstream_messages_returns_anthropic_shape(client) -> None:
         headers={"x-api-key": "relay-secret", "session_id": "session-a"},
     )
     # Assert
-    assert (response.status_code, response.json()["content"], response.json()["usage"]) == (
+    assert (
+        response.status_code,
+        response.json()["content"],
+        response.json()["usage"],
+    ) == (
         200,
         [{"type": "text", "text": "Hello"}],
         {"input_tokens": 3, "output_tokens": 1},
@@ -170,7 +178,9 @@ async def _serving(backend: InferenceBackend):
 
 
 @pytest.mark.asyncio
-async def test_relay_app_serves_messages_from_the_upstream_pool(upstream_factory) -> None:
+async def test_relay_app_serves_messages_from_the_upstream_pool(
+    upstream_factory,
+) -> None:
     # Arrange
     reply = b'{"id":"msg_1","type":"message","role":"assistant","content":[]}'
     upstream = upstream_factory(chunks=(reply,))
@@ -263,7 +273,164 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
         "status": "ok",
         "provider": "inference-upstream",
         "upstreams": [upstream.url],
+        "members": [
+            {
+                "url": upstream.url,
+                "active": True,
+                "in_flight": 0,
+                "queued": 0,
+                "capacity": 8,
+            }
+        ],
+        "active_members": 1,
+        "in_flight": 0,
+        "queued": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    backend = InferenceBackend(pool)
+    admitted = await pool.acquire("first")
+    waiting = asyncio.create_task(pool.acquire("second"))
+    for _ in range(100):
+        if pool.upstreams[0].queued == 1:
+            break
+        await asyncio.sleep(0)
+
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.get("/health")
+        waiting.cancel()
+        with suppress(asyncio.CancelledError):
+            await waiting
+        await pool.release(admitted)
+
+    # Assert
+    assert response.json()["members"][0] == {
+        "url": upstream.url,
+        "active": True,
+        "in_flight": 1,
+        "queued": 1,
+        "capacity": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_relay_lifespan_closes_admission_on_shutdown(upstream_factory) -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(upstream_factory().url)
+    backend = InferenceBackend(pool)
+
+    # Act
+    async with _serving(backend):
+        pass
+
+    # Assert
+    with pytest.raises(InferenceAdmissionError, match="shutting down"):
+        await pool.acquire("after-shutdown")
+
+
+@pytest.mark.asyncio
+async def test_relay_returns_503_when_the_bounded_queue_is_full(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=0
+    )
+    admitted = await pool.acquire("occupying")
+    backend = InferenceBackend(pool)
+
+    # Act
+    async with _serving(backend) as test_client:
+        response = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={"x-api-key": "relay-secret", "x-session-id": "overload"},
+        )
+        await pool.release(admitted)
+
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        len(upstream.requests),
+    ) == (503, "inference_admission", 0)
+
+
+@pytest.mark.asyncio
+async def test_sigterm_closes_queue_before_uvicorn_drains_admitted_request(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release_upstream = threading.Event()
+    upstream = upstream_factory(block_until=release_upstream)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    app = create_app(InferenceBackend(pool), api_key="relay-secret")
+    server = _build_uvicorn_server(
+        app,
+        host="127.0.0.1",
+        port=0,
+        log_level="warning",
+        timeout_graceful_shutdown=5,
+    )
+    serve_task = asyncio.create_task(server.serve())
+    for _ in range(1000):
+        if server.started:
+            break
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    # Act
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+        admitted_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "admitted"},
+            )
+        )
+        started = await asyncio.to_thread(upstream.request_started.wait, 2)
+        queued_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "queued"},
+            )
+        )
+        for _ in range(1000):
+            if pool.upstreams[0].queued == 1:
+                break
+            await asyncio.sleep(0.001)
+        server.handle_exit(signal.SIGTERM, None)
+        # Uvicorn re-raises captured OS signals after ``serve`` returns. This
+        # test invokes the real handler directly, so consume that bookkeeping
+        # entry rather than terminating the pytest process afterward.
+        server._captured_signals.clear()
+        queued_response = await asyncio.wait_for(queued_task, timeout=2)
+        draining = not serve_task.done()
+        release_upstream.set()
+        admitted_response = await asyncio.wait_for(admitted_task, timeout=2)
+        await asyncio.wait_for(serve_task, timeout=2)
+
+    # Assert
+    assert (
+        started,
+        queued_response.status_code,
+        queued_response.json()["error"]["type"],
+        draining,
+        admitted_response.status_code,
+        serve_task.done(),
+    ) == (True, 503, "inference_admission", True, 200, True)
 
 
 @pytest.mark.asyncio
@@ -365,4 +532,3 @@ async def test_relay_app_refuses_an_openai_route_in_the_openai_envelope(
             }
         },
     )
-

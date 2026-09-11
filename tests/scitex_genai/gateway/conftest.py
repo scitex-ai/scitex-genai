@@ -73,10 +73,13 @@ class RecordingUpstream:
         status: int = 200,
         content_type: str = "application/json",
         chunks: tuple[bytes, ...] = (b'{"ok": true}',),
+        block_until: threading.Event | None = None,
     ) -> None:
         self.status = status
         self.content_type = content_type
         self.chunks = chunks
+        self.block_until = block_until
+        self.request_started = threading.Event()
         self.requests: list[dict[str, Any]] = []
         upstream = self
 
@@ -95,6 +98,9 @@ class RecordingUpstream:
                         "body": self.rfile.read(length) if length else b"",
                     }
                 )
+                upstream.request_started.set()
+                if upstream.block_until is not None:
+                    upstream.block_until.wait(timeout=10)
                 self.send_response(upstream.status)
                 self.send_header("content-type", upstream.content_type)
                 self.send_header("transfer-encoding", "chunked")

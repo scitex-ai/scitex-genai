@@ -13,19 +13,30 @@ from pathlib import Path
 import pytest
 from scitex_config import get_scitex_dir
 
-from scitex_genai.gateway._inference import UPSTREAM_ENV
+from scitex_genai.gateway._inference import (
+    DEFAULT_CAPACITY_PER_UPSTREAM,
+    DEFAULT_MAX_QUEUE_SIZE,
+    DEFAULT_TIMEOUT_S,
+    TIMEOUT_ENV,
+    UPSTREAM_ENV,
+)
 from scitex_genai.gateway._settings import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    SCITEX_TIMEOUT_ENV,
     default_config_path,
     load_settings,
 )
 
 ENV_KEYS = (
     UPSTREAM_ENV,
+    SCITEX_TIMEOUT_ENV,
+    TIMEOUT_ENV,
     "SCITEX_GATEWAY_HOST",
     "SCITEX_GATEWAY_PORT",
     "SCITEX_GATEWAY_INFERENCE_UPSTREAMS",
+    "SCITEX_GATEWAY_INFERENCE_CAPACITY_PER_UPSTREAM",
+    "SCITEX_GATEWAY_INFERENCE_MAX_QUEUE_SIZE",
 )
 
 
@@ -78,11 +89,17 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         settings.port,
         settings.inference_upstream,
         settings.source,
+        settings.inference_timeout_s,
+        settings.inference_capacity_per_upstream,
+        settings.inference_max_queue_size,
     ) == (
         DEFAULT_HOST,
         DEFAULT_PORT,
         "",
         None,
+        DEFAULT_TIMEOUT_S,
+        DEFAULT_CAPACITY_PER_UPSTREAM,
+        DEFAULT_MAX_QUEUE_SIZE,
     )
 
 
@@ -177,6 +194,161 @@ def test_a_bad_host_or_port_in_the_file_is_refused(
 ):
     # Arrange
     path = _write(tmp_path / "config.yaml", text)
+
+    # Act
+    raised = _raised(lambda: load_settings(path))
+
+    # Assert
+    assert isinstance(raised, ValueError)
+
+
+def test_the_file_supplies_an_explicit_inference_timeout(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  inference_timeout_s: 1800\n",
+    )
+
+    # Act
+    settings = load_settings(path)
+
+    # Assert
+    assert settings.inference_timeout_s == 1800.0
+
+
+def test_file_and_direct_values_resolve_admission_bounds(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  inference_capacity_per_upstream: 3\n"
+        "  inference_max_queue_size: 9\n",
+    )
+
+    # Act
+    from_file = load_settings(path)
+    direct = load_settings(
+        path, inference_capacity_per_upstream=4, inference_max_queue_size=10
+    )
+
+    # Assert
+    assert (
+        from_file.inference_capacity_per_upstream,
+        from_file.inference_max_queue_size,
+        direct.inference_capacity_per_upstream,
+        direct.inference_max_queue_size,
+    ) == (3, 9, 4, 10)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("inference_capacity_per_upstream", 0),
+        ("inference_capacity_per_upstream", -1),
+        ("inference_max_queue_size", -1),
+        ("inference_max_queue_size", 1.5),
+    ],
+)
+def test_invalid_admission_bounds_are_refused(tmp_path: Path, clean_env, field, value):
+    # Arrange
+    path = _write(tmp_path / "config.yaml", f"gateway:\n  {field}: {value}\n")
+
+    # Act
+    # Assert
+    with pytest.raises(ValueError):
+        load_settings(path)
+
+
+def test_a_direct_timeout_beats_the_file(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  inference_timeout_s: 1800\n",
+    )
+
+    # Act
+    settings = load_settings(path, inference_timeout_s=2400)
+
+    # Assert
+    assert settings.inference_timeout_s == 2400.0
+
+
+def test_the_timeout_file_value_beats_the_legacy_environment(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  inference_timeout_s: 1800\n",
+    )
+    os.environ[TIMEOUT_ENV] = "900"
+    os.environ[SCITEX_TIMEOUT_ENV] = "600"
+
+    # Act
+    settings = load_settings(path)
+
+    # Assert
+    assert settings.inference_timeout_s == 1800.0
+
+
+def test_legacy_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env):
+    # Arrange
+    os.environ[TIMEOUT_ENV] = "1200"
+
+    # Act
+    settings = load_settings(tmp_path / "none.yaml")
+
+    # Assert
+    assert settings.inference_timeout_s == 1200.0
+
+
+def test_namespaced_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env):
+    # Arrange
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(tmp_path / "none.yaml")
+
+    # Assert
+    assert settings.inference_timeout_s == 900.0
+
+
+def test_legacy_timeout_environment_beats_the_implicit_namespaced_one(
+    tmp_path: Path, clean_env
+):
+    # Arrange
+    os.environ[TIMEOUT_ENV] = "1200"
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(tmp_path / "none.yaml")
+
+    # Assert
+    assert settings.inference_timeout_s == 1200.0
+
+
+def test_direct_timeout_beats_both_environment_names(tmp_path: Path, clean_env):
+    # Arrange
+    os.environ[TIMEOUT_ENV] = "1200"
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(
+        tmp_path / "none.yaml",
+        inference_timeout_s=1800,
+    )
+
+    # Assert
+    assert settings.inference_timeout_s == 1800.0
+
+
+@pytest.mark.parametrize("value", [0, -1, "nan", "inf", "not-a-number"])
+def test_a_non_positive_or_non_finite_timeout_is_refused(
+    tmp_path: Path, clean_env, value
+):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        f"gateway:\n  inference_timeout_s: {value}\n",
+    )
 
     # Act
     raised = _raised(lambda: load_settings(path))

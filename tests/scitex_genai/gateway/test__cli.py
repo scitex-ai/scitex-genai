@@ -51,12 +51,15 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
     args = parser.parse_args([])
 
     # Assert
-    assert (args.config, args.host, args.port, args.inference_upstream) == (
-        None,
-        None,
-        None,
-        None,
-    )
+    assert (
+        args.config,
+        args.host,
+        args.port,
+        args.inference_upstream,
+        args.inference_timeout_s,
+        args.inference_capacity_per_upstream,
+        args.inference_max_queue_size,
+    ) == (None, None, None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -82,6 +85,67 @@ def test_install_unit_takes_the_settings_flags():
         "0.0.0.0",
         18772,
         UPSTREAM,
+    )
+
+
+def test_install_unit_takes_an_inference_timeout():
+    # Arrange
+    parser = build_parser()
+
+    # Act
+    args = parser.parse_args([INSTALL_UNIT, "--inference-timeout-s", "1800"])
+
+    # Assert
+    assert args.inference_timeout_s == 1800.0
+
+
+def test_timeout_before_install_unit_is_not_erased_by_subparser_defaults():
+    # Arrange
+    parser = build_parser()
+
+    # Act
+    args = parser.parse_args(["--inference-timeout-s", "123", INSTALL_UNIT])
+
+    # Assert
+    assert args.inference_timeout_s == 123.0
+
+
+def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
+    # Arrange
+    parser = build_parser()
+    settings = [
+        "--config",
+        "/srv/genai/config.yaml",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "18772",
+        "--inference-upstream",
+        "http://one",
+        "--inference-timeout-s",
+        "123",
+        "--inference-capacity-per-upstream",
+        "3",
+        "--inference-max-queue-size",
+        "9",
+    ]
+
+    # Act
+    before = parser.parse_args([*settings, INSTALL_UNIT])
+    after = parser.parse_args([INSTALL_UNIT, *settings])
+
+    # Assert
+    names = (
+        "config",
+        "host",
+        "port",
+        "inference_upstream",
+        "inference_timeout_s",
+        "inference_capacity_per_upstream",
+        "inference_max_queue_size",
+    )
+    assert tuple(getattr(before, name) for name in names) == tuple(
+        getattr(after, name) for name in names
     )
 
 
@@ -134,6 +198,112 @@ def test_main_install_unit_reports_the_path_and_the_state(
         True,
         "written only",
     )
+
+
+def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
+    # Arrange
+    gateway_key_env("test-key")
+    calls = []
+
+    def record(app, **kwargs):
+        calls.append((app, kwargs))
+
+    argv = [
+        "--inference-upstream",
+        "http://127.0.0.1:18773",
+        "--inference-timeout-s",
+        "123",
+        "--inference-capacity-per-upstream",
+        "3",
+        "--inference-max-queue-size",
+        "9",
+    ]
+
+    # Act
+    main(argv, server_runner=record)
+
+    # Assert
+    app, kwargs = calls[0]
+    pool = app.state.scitex_backend.pool
+    assert (
+        app.state.scitex_backend.timeout_s,
+        kwargs,
+        pool.upstreams[0].capacity,
+        pool.max_queue_size,
+    ) == (
+        123.0,
+        {"host": "127.0.0.1", "port": 8765, "log_level": "info"},
+        3,
+        9,
+    )
+
+
+def test_main_forwards_admission_bounds_to_generated_unit(
+    tmp_path: Path, gateway_key_env
+):
+    # Arrange
+    gateway_key_env("test-key")
+
+    # Act
+    main(
+        [
+            "--inference-capacity-per-upstream",
+            "3",
+            INSTALL_UNIT,
+            "--inference-max-queue-size",
+            "9",
+            "--unit-dir",
+            str(tmp_path),
+            "--no-enable",
+        ]
+    )
+
+    # Assert
+    assert (tmp_path / UNIT_NAME).read_text() == render_unit(
+        inference_capacity_per_upstream=3, inference_max_queue_size=9
+    )
+
+
+def test_main_forwards_parent_form_timeout_to_generated_unit(
+    tmp_path: Path, gateway_key_env
+):
+    # Arrange
+    gateway_key_env("test-key")
+    argv = [
+        "--inference-timeout-s",
+        "123",
+        INSTALL_UNIT,
+        "--unit-dir",
+        str(tmp_path),
+        "--no-enable",
+    ]
+
+    # Act
+    main(argv)
+
+    # Assert
+    assert (tmp_path / UNIT_NAME).read_text() == render_unit(inference_timeout_s=123)
+
+
+def test_main_forwards_subcommand_form_timeout_to_generated_unit(
+    tmp_path: Path, gateway_key_env
+):
+    # Arrange
+    gateway_key_env("test-key")
+    argv = [
+        INSTALL_UNIT,
+        "--inference-timeout-s",
+        "321",
+        "--unit-dir",
+        str(tmp_path),
+        "--no-enable",
+    ]
+
+    # Act
+    main(argv)
+
+    # Assert
+    assert (tmp_path / UNIT_NAME).read_text() == render_unit(inference_timeout_s=321)
 
 
 def test_a_first_install_mints_a_key_so_a_new_host_needs_no_manual_step(

@@ -114,63 +114,70 @@ class StickyPool(Generic[M]):
     async def acquire(
         self, session_id: str = "", *, exclude: set[str] | None = None
     ) -> M:
-        excluded = exclude or set()
         async with self._lock:
-            now = time.time()
-            sticky_alias = self._sessions.get(session_id) if session_id else None
-            if sticky_alias and sticky_alias not in excluded:
-                sticky = self._by_alias(sticky_alias)
-                if sticky is not None and sticky.cooldown_until <= now:
-                    _mark_healthy(sticky)
-                    sticky.in_flight += 1
-                    sticky.last_used_at = now
-                    return sticky
-                if sticky is not None and self._failover_after_s > 0:
-                    since = getattr(sticky, "cooling_since", None)
-                    cooling_for = now - since if since is not None else 0.0
-                    if cooling_for < self._failover_after_s:
-                        retry_after = max(1.0, sticky.cooldown_until - now)
-                        raise HomeMemberReloading(
-                            f"home member {sticky.alias} went out of rotation "
-                            f"{cooling_for:.0f}s ago; not failing this session "
-                            f"over for {self._failover_after_s:.0f}s",
-                            retry_after_s=retry_after,
-                        )
-
-            if sticky_alias and sticky_alias not in excluded:
-                # Past the hold window (or no hold configured): the session
-                # is re-placed below; forget the stale pin explicitly.
-                self._sessions.pop(session_id, None)
-            candidates = [
-                member
-                for member in self.members
-                if member.alias not in excluded and member.cooldown_until <= now
-            ]
-            if not candidates:
-                raise NoAccountAvailable(self.cooling_message)
-            best_usage = min(member.usage_score for member in candidates)
-            usage_candidates = [
-                member for member in candidates if member.usage_score == best_usage
-            ]
-            best_load = min(member.in_flight for member in usage_candidates)
-            rotation_candidates = [
-                member for member in usage_candidates if member.in_flight == best_load
-            ]
-            selected = self._choose(rotation_candidates)
-            if all(selected is not candidate for candidate in rotation_candidates):
-                raise ValueError(self.ineligible_message)
-            _mark_healthy(selected)
+            selected = self._select_locked(
+                session_id, exclude or set(), now=time.time()
+            )
             selected.in_flight += 1
-            selected.last_used_at = now
-            if session_id:
-                if (
-                    self._max_sessions is not None
-                    and session_id not in self._sessions
-                    and len(self._sessions) >= self._max_sessions
-                ):
-                    self._sessions.pop(next(iter(self._sessions)))
-                self._sessions[session_id] = selected.alias
             return selected
+
+    def _select_locked(self, session_id: str, excluded: set[str], *, now: float) -> M:
+        """Place a session while the pool lock is held; admission is separate."""
+        sticky_alias = self._sessions.get(session_id) if session_id else None
+        if sticky_alias and sticky_alias not in excluded:
+            sticky = self._by_alias(sticky_alias)
+            if sticky is not None and sticky.cooldown_until <= now:
+                _mark_healthy(sticky)
+                sticky.last_used_at = now
+                return sticky
+            if sticky is not None and self._failover_after_s > 0:
+                since = getattr(sticky, "cooling_since", None)
+                cooling_for = now - since if since is not None else 0.0
+                if cooling_for < self._failover_after_s:
+                    retry_after = max(1.0, sticky.cooldown_until - now)
+                    raise HomeMemberReloading(
+                        f"home member {sticky.alias} went out of rotation "
+                        f"{cooling_for:.0f}s ago; not failing this session "
+                        f"over for {self._failover_after_s:.0f}s",
+                        retry_after_s=retry_after,
+                    )
+        if sticky_alias and sticky_alias not in excluded:
+            # Past the hold window (or no hold configured): the session
+            # is re-placed below; forget the stale pin explicitly.
+            self._sessions.pop(session_id, None)
+        candidates = [
+            member
+            for member in self.members
+            if member.alias not in excluded and member.cooldown_until <= now
+        ]
+        if not candidates:
+            raise NoAccountAvailable(self.cooling_message)
+        best_usage = min(member.usage_score for member in candidates)
+        usage_candidates = [
+            member for member in candidates if member.usage_score == best_usage
+        ]
+
+        def load(member: M) -> int:
+            return int(getattr(member, "scheduling_load", member.in_flight))
+
+        best_load = min(load(member) for member in usage_candidates)
+        rotation_candidates = [
+            member for member in usage_candidates if load(member) == best_load
+        ]
+        selected = self._choose(rotation_candidates)
+        if all(selected is not candidate for candidate in rotation_candidates):
+            raise ValueError(self.ineligible_message)
+        _mark_healthy(selected)
+        selected.last_used_at = now
+        if session_id:
+            if (
+                self._max_sessions is not None
+                and session_id not in self._sessions
+                and len(self._sessions) >= self._max_sessions
+            ):
+                self._sessions.pop(next(iter(self._sessions)))
+            self._sessions[session_id] = selected.alias
+        return selected
 
     async def release(self, member: M) -> None:
         async with self._lock:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -9,6 +10,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from scitex_genai.gateway._errors import (
+    InferenceAdmissionError,
     NoAccountAvailable,
     UpstreamReloading,
     UpstreamUnreachable,
@@ -47,6 +49,14 @@ def _request(*, system: str = "You are terse.", later: tuple[dict, ...] = ()) ->
 
 async def _collect(body: AsyncIterator[bytes]) -> bytes:
     return b"".join([chunk async for chunk in body])
+
+
+async def _raised_async(awaitable) -> BaseException | None:
+    try:
+        await awaitable
+    except BaseException as exc:
+        return exc
+    return None
 
 
 def test_parse_upstreams_strips_whitespace_and_drops_empties() -> None:
@@ -168,6 +178,154 @@ async def test_pool_keeps_a_conversation_sticky_even_while_it_is_busy() -> None:
     )
 
 
+async def _wait_for_queue(pool: InferenceUpstreamPool, size: int) -> None:
+    for _ in range(100):
+        if sum(member.queued for member in pool.upstreams) == size:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"queue did not reach {size}: {pool.status()}")
+
+
+@pytest.mark.asyncio
+async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=8, max_queue_size=4
+    )
+    tasks = [
+        asyncio.create_task(pool.acquire(f"session-{index}")) for index in range(12)
+    ]
+
+    # Act
+    await _wait_for_queue(pool, 4)
+    saturated = pool.status()
+    expected = [
+        {
+            "url": "http://only:1",
+            "active": True,
+            "in_flight": 8,
+            "queued": 4,
+            "capacity": 8,
+        }
+    ]
+
+    admitted = [task.result() for task in tasks if task.done()]
+    for member in admitted:
+        await pool.release(member)
+    remaining = await asyncio.gather(*(task for task in tasks if not task.done()))
+    for member in remaining:
+        await pool.release(member)
+    # Assert
+    assert (saturated, pool.status()[0]["in_flight"]) == (expected, 0)
+
+
+@pytest.mark.asyncio
+async def test_queue_bound_refuses_overload_with_503_error() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=1
+    )
+    admitted = await pool.acquire("first")
+    waiting = asyncio.create_task(pool.acquire("second"))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    refused = await _raised_async(pool.acquire("third"))
+    waiting.cancel()
+    cancelled = await _raised_async(waiting)
+    await pool.release(admitted)
+
+    # Assert
+    assert (
+        isinstance(refused, InferenceAdmissionError),
+        getattr(refused, "status_code", None),
+        "queue is full" in str(refused),
+        isinstance(cancelled, asyncio.CancelledError),
+    ) == (True, 503, True, True)
+
+
+@pytest.mark.asyncio
+async def test_waiting_preserves_sticky_home_even_when_another_member_is_idle() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://a:1,http://b:2", capacity_per_upstream=1
+    )
+    home = await pool.acquire("sticky")
+    waiting = asyncio.create_task(pool.acquire("sticky"))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    waiting_state = [
+        (member.alias, member.in_flight, member.queued) for member in pool.upstreams
+    ]
+    expected = [
+        ("http://a:1", 1, 1),
+        ("http://b:2", 0, 0),
+    ]
+    await pool.release(home)
+    readmitted = await waiting
+    await pool.release(readmitted)
+
+    # Assert
+    assert (waiting_state, readmitted.alias) == (expected, "http://a:1")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_releases_its_queue_slot() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=1
+    )
+    admitted = await pool.acquire("first")
+    waiting = asyncio.create_task(pool.acquire("second"))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    waiting.cancel()
+    cancelled = await _raised_async(waiting)
+    state = pool.status()[0]
+    await pool.release(admitted)
+
+    # Assert
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        state["in_flight"],
+        state["queued"],
+    ) == (True, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_wakes_waiters_and_rejects_new_admission() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=1
+    )
+    admitted = await pool.acquire("first")
+    waiting = asyncio.create_task(pool.acquire("second"))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    await pool.close()
+    waiting_error = await _raised_async(waiting)
+    new_error = await _raised_async(pool.acquire("third"))
+    state = pool.status()[0]
+    expected = {
+        "url": "http://only:1",
+        "active": False,
+        "in_flight": 1,
+        "queued": 0,
+        "capacity": 1,
+    }
+    await pool.release(admitted)
+
+    # Assert
+    assert (
+        isinstance(waiting_error, InferenceAdmissionError),
+        isinstance(new_error, InferenceAdmissionError),
+        state,
+    ) == (True, True, expected)
+
+
 @pytest.mark.asyncio
 async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
     upstream_factory,
@@ -175,9 +333,7 @@ async def test_explicit_session_ids_separate_identical_prompts_and_stay_sticky(
     # Arrange -- two Hermes agents can have byte-identical startup prompts.
     first = upstream_factory()
     second = upstream_factory()
-    backend = InferenceBackend(
-        InferenceUpstreamPool.from_urls([first.url, second.url])
-    )
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls([first.url, second.url]))
     startup_body = json.dumps(_request()).encode()
     continued_body = json.dumps(
         _request(
@@ -272,6 +428,41 @@ async def test_relay_hoists_the_body_and_keeps_the_query_string(
             {"type": "text", "text": "You are terse."},
             {"type": "text", "text": LISTING},
         ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_holds_capacity_until_its_body_is_drained(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(chunks=(b"first",))
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    backend = InferenceBackend(pool)
+    first = await backend.relay(
+        "POST", "/v1/messages", body=b"{}", headers={"x-session-id": "first"}
+    )
+
+    # Act
+    second_task = asyncio.create_task(
+        backend.relay(
+            "POST", "/v1/messages", body=b"{}", headers={"x-session-id": "second"}
+        )
+    )
+    await _wait_for_queue(pool, 1)
+    was_waiting = not second_task.done()
+    first_body = await _collect(first.body)
+    second = await second_task
+    second_body = await _collect(second.body)
+
+    # Assert
+    assert (was_waiting, first_body, second_body, pool.status()[0]["in_flight"]) == (
+        True,
+        b"first",
+        b"first",
+        0,
     )
 
 
