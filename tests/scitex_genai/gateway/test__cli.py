@@ -51,12 +51,13 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
     args = parser.parse_args([])
 
     # Assert
-    assert (args.config, args.host, args.port, args.inference_upstream) == (
-        None,
-        None,
-        None,
-        None,
-    )
+    assert (
+        args.config,
+        args.host,
+        args.port,
+        args.inference_upstream,
+        args.inference_timeout_s,
+    ) == (None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -83,6 +84,17 @@ def test_install_unit_takes_the_settings_flags():
         18772,
         UPSTREAM,
     )
+
+
+def test_install_unit_takes_an_inference_timeout():
+    # Arrange
+    parser = build_parser()
+
+    # Act
+    args = parser.parse_args([INSTALL_UNIT, "--inference-timeout-s", "1800"])
+
+    # Assert
+    assert args.inference_timeout_s == 1800.0
 
 
 def test_install_unit_takes_a_unit_dir():

@@ -20,6 +20,7 @@ the relay's users already export it::
       inference_upstreams:
         - http://127.0.0.1:18773
         - http://127.0.0.1:18774
+      inference_timeout_s: 1800
 
 A missing file is not an error: the package must run for someone who has no
 config yet, on the defaults the command line always had (127.0.0.1:8765, the
@@ -28,6 +29,7 @@ Codex backend). ``source`` says which case applied.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,13 +37,14 @@ from typing import Any
 
 from scitex_config import ScitexConfig, get_scitex_dir
 
-from ._inference import UPSTREAM_ENV, parse_upstreams
+from ._inference import DEFAULT_TIMEOUT_S, TIMEOUT_ENV, UPSTREAM_ENV, parse_upstreams
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 KEY_HOST = "gateway.host"
 KEY_PORT = "gateway.port"
 KEY_UPSTREAMS = "gateway.inference_upstreams"
+KEY_TIMEOUT = "gateway.inference_timeout_s"
 
 
 def default_config_path() -> Path:
@@ -65,6 +68,17 @@ def check_port(port: Any) -> int:
     return number
 
 
+def check_timeout_s(timeout_s: Any) -> float:
+    """A finite positive request timeout, in seconds."""
+    number = float(timeout_s)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(
+            "inference_timeout_s must be a finite number greater than 0, "
+            f"got {timeout_s!r}"
+        )
+    return number
+
+
 def upstream_string(value: Any) -> str:
     """The comma-separated form the server takes; a list, a string or nothing."""
     if value is None:
@@ -82,12 +96,16 @@ class GatewaySettings:
     port: int
     inference_upstream: str
     source: Path | None
+    inference_timeout_s: float = DEFAULT_TIMEOUT_S
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", check_host(self.host))
         object.__setattr__(self, "port", check_port(self.port))
         object.__setattr__(
             self, "inference_upstream", upstream_string(self.inference_upstream)
+        )
+        object.__setattr__(
+            self, "inference_timeout_s", check_timeout_s(self.inference_timeout_s)
         )
 
 
@@ -97,6 +115,7 @@ def load_settings(
     host: str | None = None,
     port: int | None = None,
     inference_upstream: str | None = None,
+    inference_timeout_s: float | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -107,9 +126,13 @@ def load_settings(
     )
     if upstream is None:
         upstream = os.getenv(UPSTREAM_ENV, "")
+    timeout = config.resolve(KEY_TIMEOUT, direct_val=inference_timeout_s, default=None)
+    if timeout is None:
+        timeout = os.getenv(TIMEOUT_ENV, DEFAULT_TIMEOUT_S)
     return GatewaySettings(
         host=config.resolve(KEY_HOST, direct_val=host, default=DEFAULT_HOST),
         port=config.resolve(KEY_PORT, direct_val=port, default=DEFAULT_PORT, type=int),
         inference_upstream=upstream,
         source=path if present else None,
+        inference_timeout_s=timeout,
     )

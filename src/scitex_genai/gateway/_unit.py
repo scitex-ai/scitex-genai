@@ -45,7 +45,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from ._settings import check_host, check_port, upstream_string
+from ._settings import check_host, check_port, check_timeout_s, upstream_string
 
 UNIT_NAME = "scitex-genai-gateway.service"
 DEFAULT_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
@@ -64,6 +64,7 @@ def gateway_command(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> list[str]:
@@ -81,6 +82,8 @@ def gateway_command(
         argv += ["--port", str(check_port(port))]
     if upstream is not None and upstream_string(upstream):
         argv += ["--inference-upstream", upstream_string(upstream)]
+    if inference_timeout_s is not None:
+        argv += ["--inference-timeout-s", str(check_timeout_s(inference_timeout_s))]
     return argv
 
 
@@ -89,12 +92,18 @@ def render_unit(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> str:
     """The unit text, byte-for-byte what ``install_unit`` writes."""
     argv = gateway_command(
-        host=host, port=port, upstream=upstream, config=config, interpreter=interpreter
+        host=host,
+        port=port,
+        upstream=upstream,
+        inference_timeout_s=inference_timeout_s,
+        config=config,
+        interpreter=interpreter,
     )
     exec_start = " ".join(shlex.quote(arg) for arg in argv)
     settings = str(config) if config is not None else "~/.scitex/genai/config.yaml"
@@ -127,6 +136,7 @@ def install_unit(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     unit_dir: Path | None = None,
     enable: bool = True,
@@ -148,6 +158,7 @@ def install_unit(
             host=host,
             port=port,
             upstream=upstream,
+            inference_timeout_s=inference_timeout_s,
             config=config,
             interpreter=interpreter,
         )

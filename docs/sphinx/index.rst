@@ -49,6 +49,7 @@ on attribute access — import paths are stable as features land.
    :caption: API Reference
 
    api
+   gateway
 
 
 Indices and tables

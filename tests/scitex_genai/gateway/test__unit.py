@@ -108,6 +108,40 @@ def test_given_settings_are_baked_into_execstart():
     ]
 
 
+def test_an_explicit_timeout_is_baked_into_execstart():
+    # Arrange
+    text = render_unit(inference_timeout_s=1800)
+
+    # Act
+    argv = _exec_argv(text)
+
+    # Assert
+    assert argv[3:] == ["--inference-timeout-s", "1800.0"]
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_an_invalid_timeout_is_refused(timeout):
+    # Arrange
+    given = {"inference_timeout_s": timeout}
+
+    # Act
+    raised = _raised(lambda: render_unit(**given))
+
+    # Assert
+    assert isinstance(raised, ValueError)
+
+
+def test_install_writes_an_explicit_timeout(tmp_path: Path):
+    # Arrange
+    timeout_s = 1800
+
+    # Act
+    path = install_unit(inference_timeout_s=timeout_s, unit_dir=tmp_path, enable=False)
+
+    # Assert
+    assert _exec_argv(path.read_text())[3:] == ["--inference-timeout-s", "1800.0"]
+
+
 def test_a_config_path_is_baked_into_execstart():
     # Arrange
     text = render_unit(config="/srv/genai/config.yaml")

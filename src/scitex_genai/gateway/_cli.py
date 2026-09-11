@@ -22,16 +22,14 @@ from pathlib import Path
 
 from ._accounts import CodexAccountPool
 from ._codex import CodexBackend, CodexTransport
+from ._errors import CredentialError
 from ._inference import (
-    DEFAULT_TIMEOUT_S,
     PREFIX_TELEMETRY_ENV,
-    TIMEOUT_ENV,
     InferenceBackend,
     InferenceUpstreamPool,
     announce,
     telemetry_enabled,
 )
-from ._errors import CredentialError
 from ._secrets import (
     GATEWAY_KEY_ENV,
     default_secrets_path,
@@ -73,6 +71,15 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
             "upstreams (vLLM, LiteLLM). When set, /v1/messages is relayed to "
             "that pool instead of the Codex accounts. Default: "
             "gateway.inference_upstreams in the settings file, else $HOIST_UPSTREAM."
+        ),
+    )
+    parser.add_argument(
+        "--inference-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Upstream inference timeout in seconds (default: "
+            "gateway.inference_timeout_s, else $HOIST_TIMEOUT_S, else 600)."
         ),
     )
 
@@ -172,6 +179,7 @@ def _install_unit(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         upstream=args.inference_upstream,
+        inference_timeout_s=args.inference_timeout_s,
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -194,12 +202,13 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         inference_upstream=args.inference_upstream,
+        inference_timeout_s=args.inference_timeout_s,
     )
     if settings.inference_upstream:
         pool = InferenceUpstreamPool.from_urls(settings.inference_upstream)
         backend = InferenceBackend(
             pool,
-            timeout_s=float(os.getenv(TIMEOUT_ENV, DEFAULT_TIMEOUT_S)),
+            timeout_s=settings.inference_timeout_s,
             telemetry_sink=_telemetry_sink(),
             journal=lambda line: print(line, flush=True),
         )
