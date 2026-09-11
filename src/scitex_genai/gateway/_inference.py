@@ -524,6 +524,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._waiters: dict[str, deque[object]] = {
             upstream.alias: deque() for upstream in self.upstreams
         }
+        self._active_sessions: set[str] = set()
         self._closing = False
 
     @property
@@ -573,9 +574,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     "Estimated request input exceeds this upstream's token capacity "
                     f"({input_tokens}/{selected.token_capacity})"
                 )
-            if self._fits(selected, input_tokens) and not selected.queued:
+            if self._fits(selected, input_tokens, session_id) and not selected.queued:
                 selected.in_flight += 1
                 selected.input_tokens_in_flight += input_tokens
+                if session_id:
+                    self._active_sessions.add(session_id)
                 return selected
             total_queued = sum(upstream.queued for upstream in self.upstreams)
             if total_queued >= self.max_queue_size:
@@ -597,7 +600,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     now = time.time()
                     if (
                         waiters[0] is ticket
-                        and self._fits(selected, input_tokens)
+                        and self._fits(selected, input_tokens, session_id)
                         and selected.cooldown_until <= now
                     ):
                         waiters.popleft()
@@ -606,6 +609,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         queued = False
                         selected.in_flight += 1
                         selected.input_tokens_in_flight += input_tokens
+                        if session_id:
+                            self._active_sessions.add(session_id)
                         return selected
                     cooldown_s = max(0.0, selected.cooldown_until - now)
                     try:
@@ -624,21 +629,36 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     selected.input_tokens_queued -= input_tokens
                     self._admission.notify_all()
 
-    def _fits(self, member: InferenceUpstream, input_tokens: int) -> bool:
+    def _fits(
+        self,
+        member: InferenceUpstream,
+        input_tokens: int,
+        session_id: str = "",
+    ) -> bool:
         token_capacity = member.token_capacity
-        return member.in_flight < member.capacity and (
-            token_capacity is None
-            or member.input_tokens_in_flight + input_tokens <= token_capacity
+        return (
+            session_id not in self._active_sessions
+            and member.in_flight < member.capacity
+            and (
+                token_capacity is None
+                or member.input_tokens_in_flight + input_tokens <= token_capacity
+            )
         )
 
     async def release(
-        self, member: InferenceUpstream, *, input_tokens: int = 0
+        self,
+        member: InferenceUpstream,
+        *,
+        input_tokens: int = 0,
+        session_id: str = "",
     ) -> None:
         async with self._admission:
             member.in_flight = max(0, member.in_flight - 1)
             member.input_tokens_in_flight = max(
                 0, member.input_tokens_in_flight - input_tokens
             )
+            if session_id:
+                self._active_sessions.discard(session_id)
             self._admission.notify_all()
 
     async def cool_down(self, member: InferenceUpstream, seconds: float) -> None:
@@ -884,12 +904,20 @@ class InferenceBackend:
                 )
                 await asyncio.shield(client.aclose())
                 await asyncio.shield(
-                    self.pool.release(upstream, input_tokens=input_tokens)
+                    self.pool.release(
+                        upstream,
+                        input_tokens=input_tokens,
+                        session_id=session,
+                    )
                 )
                 raise
             except httpx.TransportError as exc:
                 await client.aclose()
-                await self.pool.release(upstream, input_tokens=input_tokens)
+                await self.pool.release(
+                    upstream,
+                    input_tokens=input_tokens,
+                    session_id=session,
+                )
                 await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
                 self._note(
                     f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
@@ -910,6 +938,7 @@ class InferenceBackend:
                     f"status={response.status_code}",
                     started=started,
                     input_tokens=input_tokens,
+                    session_id=session,
                 ),
             )
         raise UpstreamUnreachable(self._refusal(failures))
@@ -933,6 +962,7 @@ class InferenceBackend:
         tag: str = "",
         started: float | None = None,
         input_tokens: int = 0,
+        session_id: str = "",
     ) -> AsyncIterator[bytes]:
         sent = 0
         outcome = "complete"
@@ -949,9 +979,7 @@ class InferenceBackend:
         finally:
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
-                self._note(
-                    f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s"
-                )
+                self._note(f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s")
             # ALWAYS, on every path — including a client that disconnected
             # mid-stream, which cancels this generator. An unreleased counter
             # marks that upstream busy FOREVER, so the balancer would route
@@ -962,7 +990,11 @@ class InferenceBackend:
             # must finish even after the response is gone.
             await asyncio.shield(
                 self._finish(
-                    client, response, upstream, input_tokens=input_tokens
+                    client,
+                    response,
+                    upstream,
+                    input_tokens=input_tokens,
+                    session_id=session_id,
                 )
             )
 
@@ -973,12 +1005,17 @@ class InferenceBackend:
         upstream: InferenceUpstream,
         *,
         input_tokens: int = 0,
+        session_id: str = "",
     ) -> None:
         try:
             await response.aclose()
             await client.aclose()
         finally:
-            await self.pool.release(upstream, input_tokens=input_tokens)
+            await self.pool.release(
+                upstream,
+                input_tokens=input_tokens,
+                session_id=session_id,
+            )
 
     async def close(self) -> None:
         """Stop admission and wake requests waiting for capacity."""
