@@ -21,6 +21,7 @@ from scitex_genai.gateway._inference import (
     adapt_openai_roles,
     announce,
     conversation_key,
+    estimate_input_tokens,
     hoist_system,
     hoists_on,
     parse_upstreams,
@@ -66,6 +67,18 @@ def test_parse_upstreams_strips_whitespace_and_drops_empties() -> None:
     parsed = parse_upstreams(value)
     # Assert
     assert parsed == ["http://a:1", "http://b:2"]
+
+
+@pytest.mark.parametrize("size, expected", [(0, 0), (1, 1), (4, 1), (5, 2)])
+def test_input_token_estimate_uses_the_documented_four_byte_approximation(
+    size: int, expected: int
+) -> None:
+    # Arrange
+    body = b"x" * size
+    # Act
+    estimated = estimate_input_tokens(body)
+    # Assert
+    assert estimated == expected
 
 
 def test_telemetry_enabled_matches_the_script_truthiness() -> None:
@@ -217,6 +230,73 @@ async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> 
         await pool.release(member)
     # Assert
     assert (saturated, pool.status()[0]["in_flight"]) == (expected, 0)
+
+
+@pytest.mark.asyncio
+async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=8,
+        token_capacity_per_upstream=1_000, max_queue_size=2,
+    )
+    first = await pool.acquire("long-a", input_tokens=700)
+    second = await pool.acquire("short", input_tokens=200)
+    waiting = asyncio.create_task(pool.acquire("long-b", input_tokens=400))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    saturated = pool.status()[0]
+    await pool.release(second, input_tokens=200)
+    still_waiting = not waiting.done()
+    await pool.release(first, input_tokens=700)
+    admitted = await waiting
+    await pool.release(admitted, input_tokens=400)
+
+    # Assert
+    assert (
+        saturated["input_tokens_in_flight"],
+        saturated["input_tokens_queued"],
+        still_waiting,
+        pool.status()[0]["input_tokens_in_flight"],
+    ) == (900, 400, True, 0)
+
+
+@pytest.mark.asyncio
+async def test_token_capacity_rejects_a_request_that_can_never_fit() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", token_capacity_per_upstream=1_000
+    )
+
+    # Act
+    refused = await _raised_async(pool.acquire("too-large", input_tokens=1_001))
+
+    # Assert
+    assert (
+        isinstance(refused, InferenceAdmissionError),
+        "1001/1000" in str(refused),
+        pool.status()[0]["in_flight"],
+    ) == (True, True, 0)
+
+
+@pytest.mark.asyncio
+async def test_token_waiter_keeps_its_cached_home_when_another_member_is_idle() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://a:1,http://b:2", token_capacity_per_upstream=1_000
+    )
+    home = await pool.acquire("sticky", input_tokens=700)
+    waiting = asyncio.create_task(pool.acquire("sticky", input_tokens=400))
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    aliases = [member.alias for member in pool.upstreams if member.in_flight]
+    await pool.release(home, input_tokens=700)
+    readmitted = await waiting
+    await pool.release(readmitted, input_tokens=400)
+
+    # Assert
+    assert (aliases, readmitted.alias) == (["http://a:1"], "http://a:1")
 
 
 @pytest.mark.asyncio
@@ -743,9 +823,11 @@ async def test_the_journal_says_which_request_went_where_and_how_it_ended(
     assert (
         len(relay),
         f"-> {upstream.url} POST /v1/messages bytes=" in relay[0],
+        "estimated_input_tokens=" in relay[0],
+        "admitted_input_tokens=" in relay[0],
         f"<- {upstream.url} status=200 bytes=" in relay[1],
         any(SECRET in line for line in relay),
-    ) == (2, True, True, False)
+    ) == (2, True, True, True, True, False)
 
 
 @pytest.mark.asyncio

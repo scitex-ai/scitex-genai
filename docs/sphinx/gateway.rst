@@ -16,6 +16,8 @@ list only the upstream that is actually reachable.
      inference_timeout_s: 1800
      inference_capacity_per_upstream: 8
      inference_max_queue_size: 128
+     # Optional weighted guard; choose from measured engine KV capacity.
+     inference_token_capacity_per_upstream: 1600000
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
@@ -78,3 +80,23 @@ allocated server is reachable.
 
 The engine's request limit (for example SGLang
 ``--max-running-requests``) remains authoritative.
+
+Request count is not enough when agents have very different context lengths.
+When ``inference_token_capacity_per_upstream`` is set, the gateway also limits
+the sum of estimated input tokens in flight on each upstream.  It estimates
+one token per four UTF-8 request-body bytes, without loading a model tokenizer
+into the gateway.  This is a planning approximation, so set the budget below
+the engine's measured usable token capacity with enough margin for output and
+estimation error.  A request larger than the configured budget is refused;
+otherwise it waits in the same bounded queue as count-limited work.
+
+Weighted admission happens *after* sticky placement.  A warm conversation
+therefore waits for room on its cache-owning upstream rather than moving to an
+idle replica and paying a cold prefill.  Cache hits reduce prefill work but do
+not make active sequence KV free, so the guard accounts the full estimated
+input instead of discounting a presumed cached prefix.
+
+With the token guard enabled, ``/health`` adds
+``input_tokens_in_flight``, ``input_tokens_queued``, and per-member
+``token_capacity`` fields.  Each ``[relay] ... ->`` journal line also records
+the request estimate and the admitted token total; payloads remain absent.
