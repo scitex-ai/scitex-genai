@@ -630,7 +630,8 @@ async def test_relay_holds_the_upstream_in_flight_while_streaming(
     # Arrange
     upstream = upstream_factory(chunks=(b"first", b"second"))
     pool = InferenceUpstreamPool.from_urls(upstream.url)
-    backend = InferenceBackend(pool)
+    lines: list[str] = []
+    backend = InferenceBackend(pool, journal=lines.append)
     # Act
     relayed = await backend.relay(
         "POST", "/v1/messages", body=json.dumps(_request()).encode(), headers={}
@@ -639,7 +640,11 @@ async def test_relay_holds_the_upstream_in_flight_while_streaming(
     while_streaming = pool.upstreams[0].in_flight
     await relayed.body.aclose()
     # Assert
-    assert (while_streaming, pool.upstreams[0].in_flight) == (1, 0)
+    assert (
+        while_streaming,
+        pool.upstreams[0].in_flight,
+        any("outcome=client_disconnected" in line for line in lines),
+    ) == (1, 0, True)
 
 
 @pytest.mark.asyncio
@@ -825,7 +830,7 @@ async def test_the_journal_says_which_request_went_where_and_how_it_ended(
         f"-> {upstream.url} POST /v1/messages bytes=" in relay[0],
         "estimated_input_tokens=" in relay[0],
         "admitted_input_tokens=" in relay[0],
-        f"<- {upstream.url} status=200 bytes=" in relay[1],
+        f"<- {upstream.url} status=200 outcome=complete bytes=" in relay[1],
         any(SECRET in line for line in relay),
     ) == (2, True, True, True, True, False)
 

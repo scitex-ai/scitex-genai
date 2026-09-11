@@ -851,6 +851,11 @@ class InferenceBackend:
             except asyncio.CancelledError:
                 # Cancellation before a response body exists must not leak a
                 # capacity slot; streaming cancellation is handled by _drain.
+                self._note(
+                    f"[relay] conv={session[:8] or '-'} <- {upstream.alias} "
+                    "client_disconnected_before_response "
+                    f"after {time.monotonic() - started:.1f}s"
+                )
                 await asyncio.shield(client.aclose())
                 await asyncio.shield(
                     self.pool.release(upstream, input_tokens=input_tokens)
@@ -904,14 +909,23 @@ class InferenceBackend:
         input_tokens: int = 0,
     ) -> AsyncIterator[bytes]:
         sent = 0
+        outcome = "complete"
         try:
             async for chunk in response.aiter_bytes():
                 sent += len(chunk)
                 yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            outcome = "client_disconnected"
+            raise
+        except BaseException:
+            outcome = "stream_error"
+            raise
         finally:
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
-                self._note(f"[relay] {tag} bytes={sent} {took:.1f}s")
+                self._note(
+                    f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s"
+                )
             # ALWAYS, on every path — including a client that disconnected
             # mid-stream, which cancels this generator. An unreleased counter
             # marks that upstream busy FOREVER, so the balancer would route

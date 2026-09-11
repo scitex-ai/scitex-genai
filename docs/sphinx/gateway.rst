@@ -100,3 +100,13 @@ With the token guard enabled, ``/health`` adds
 ``input_tokens_in_flight``, ``input_tokens_queued``, and per-member
 ``token_capacity`` fields.  Each ``[relay] ... ->`` journal line also records
 the request estimate and the admitted token total; payloads remain absent.
+Stream completion lines distinguish ``outcome=complete``,
+``outcome=client_disconnected``, and ``outcome=stream_error``.
+
+The gateway releases its reservation after closing a disconnected upstream
+HTTP stream.  The inference engine must actually abort that request too.
+SGLang regressions `#36333 <https://github.com/sgl-project/sglang/issues/36333>`_
+and `#36876 <https://github.com/sgl-project/sglang/issues/36876>`_ describe
+versions where tokenizer state is deleted but the scheduler keeps a zombie
+request running.  Gateway admission cannot observe or safely reclaim that
+engine-side state; deploy an SGLang build containing the upstream abort fix.
