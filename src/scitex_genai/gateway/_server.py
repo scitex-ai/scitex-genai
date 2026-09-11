@@ -20,6 +20,36 @@ from ._inference import InferenceBackend
 from ._secrets import resolve_gateway_key
 
 
+def _build_uvicorn_server(app: Any, **kwargs: Any) -> Any:
+    """Build uvicorn with inference admission closed before request draining.
+
+    Uvicorn normally waits for active request tasks before running the app's
+    lifespan shutdown. Capacity waiters are active tasks, so lifespan alone
+    cannot wake them. Closing admission at the start of ``shutdown`` makes
+    those waiters return 503 before uvicorn waits, while already admitted
+    streams remain request tasks and retain uvicorn's normal graceful drain.
+    """
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError("Gateway server requires scitex-genai[gateway]") from exc
+
+    backend = app.state.scitex_backend
+
+    class AdmissionAwareServer(uvicorn.Server):
+        async def shutdown(self, sockets=None) -> None:
+            if isinstance(backend, InferenceBackend):
+                await backend.close()
+            await super().shutdown(sockets)
+
+    return AdmissionAwareServer(uvicorn.Config(app, **kwargs))
+
+
+def run_uvicorn(app: Any, **kwargs: Any) -> None:
+    """Run the admission-aware uvicorn server used by the console command."""
+    _build_uvicorn_server(app, **kwargs).run()
+
+
 def _request_token(request: Any) -> str:
     api_key = request.headers.get("x-api-key", "")
     if api_key:
@@ -112,13 +142,21 @@ def create_app(
             except asyncio.CancelledError:
                 pass
 
+    @asynccontextmanager
+    async def inference_lifespan(app: Any) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await backend.close()
+
     app = FastAPI(
         title="SciTeX GenAI Gateway",
         docs_url=None,
         redoc_url=None,
         # An inference pool has no quota to poll; only Codex accounts do.
-        lifespan=None if relaying else lifespan,
+        lifespan=inference_lifespan if relaying else lifespan,
     )
+    app.state.scitex_backend = backend
 
     def authorized(request: Request) -> bool:
         return hmac.compare_digest(_request_token(request), expected_key)
@@ -126,10 +164,15 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, Any]:
         if relaying:
+            members = backend.pool.status()
             return {
                 "status": "ok",
                 "provider": backend.provider,
                 "upstreams": [upstream.alias for upstream in backend.pool.upstreams],
+                "members": members,
+                "active_members": sum(member["active"] for member in members),
+                "in_flight": sum(member["in_flight"] for member in members),
+                "queued": sum(member["queued"] for member in members),
             }
         return {
             "status": "ok",

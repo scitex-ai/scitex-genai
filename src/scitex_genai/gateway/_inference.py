@@ -56,12 +56,14 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from ._errors import (
     HomeMemberReloading,
+    InferenceAdmissionError,
     NoAccountAvailable,
     UpstreamReloading,
     UpstreamUnreachable,
@@ -74,6 +76,8 @@ UPSTREAM_ENV = "HOIST_UPSTREAM"
 TIMEOUT_ENV = "HOIST_TIMEOUT_S"
 PREFIX_TELEMETRY_ENV = "HOIST_PREFIX_TELEMETRY"
 DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_CAPACITY_PER_UPSTREAM = 8
+DEFAULT_MAX_QUEUE_SIZE = 128
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
 #: are few (one per agent) and eviction only costs a prefix-cache miss, never
@@ -411,6 +415,8 @@ class InferenceUpstream:
     alias: str
     in_flight: int = 0
     last_used_at: float = 0.0
+    capacity: int = DEFAULT_CAPACITY_PER_UPSTREAM
+    queued: int = 0
     cooldown_until: float = 0.0
     #: When this upstream last went out of rotation (None = healthy).
     cooling_since: float | None = None
@@ -424,22 +430,26 @@ class InferenceUpstream:
         """No quota notion: the pool assumes interchangeable upstreams."""
         return 0.0
 
+    @property
+    def scheduling_load(self) -> int:
+        return self.in_flight + self.queued
+
+    def status(self, *, closing: bool = False) -> dict[str, Any]:
+        return {
+            "url": self.alias,
+            "active": not closing and self.cooldown_until <= time.time(),
+            "in_flight": self.in_flight,
+            "queued": self.queued,
+            "capacity": self.capacity,
+        }
+
 
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
-    """Sticky per-conversation pool of interchangeable inference upstreams.
+    """Sticky per-conversation pool with bounded per-upstream admission.
 
-    The scheduling is :class:`~._pool.StickyPool`'s. What this adds is the
-    script's FIRST-PLACEMENT policy: a conversation with an unseen key is
-    assigned by ROUND ROBIN. That is the right policy and not a legacy
-    accident — at idle every in-flight count is 0, so a least-loaded rule
-    resolving on an index tiebreak would send every new conversation to the
-    first upstream. In-flight then only breaks ties among non-sticky
-    upstreams, which in practice is the key-less path.
-
-    THE POOL ASSUMES UPSTREAMS ARE INTERCHANGEABLE. Measured 2026-08-16: an
-    A100 ~8.7x slower than the H100s drained its queue and therefore kept
-    LOOKING least-loaded, carrying more traffic than any H100. Exclude the odd
-    member from the configuration; do not tune the policy.
+    First placement remains least-loaded round robin across interchangeable
+    upstreams. Once placed, a conversation waits for that same member's
+    capacity so admission never trades away prefix-cache locality.
     """
 
     empty_message = "No inference upstreams are configured"
@@ -453,7 +463,16 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         *,
         choose: Callable[[list[InferenceUpstream]], InferenceUpstream] | None = None,
         max_sessions: int | None = MAX_ROUTES,
+        capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
     ) -> None:
+        if capacity_per_upstream < 1:
+            raise ValueError("capacity_per_upstream must be >= 1")
+        if max_queue_size < 0:
+            raise ValueError("max_queue_size must be >= 0")
+        for upstream in upstreams:
+            upstream.capacity = capacity_per_upstream
+        self.max_queue_size = max_queue_size
         self._next_placement = 0
         super().__init__(
             upstreams,
@@ -461,17 +480,107 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             max_sessions=max_sessions,
             failover_after_s=HOME_FAILOVER_AFTER_S,
         )
+        self._admission = asyncio.Condition(self._lock)
+        self._waiters: dict[str, deque[object]] = {
+            upstream.alias: deque() for upstream in self.upstreams
+        }
+        self._closing = False
 
     @property
     def upstreams(self) -> list[InferenceUpstream]:
         return self.members
 
     @classmethod
-    def from_urls(cls, urls: str | list[str]) -> "InferenceUpstreamPool":
+    def from_urls(
+        cls,
+        urls: str | list[str],
+        *,
+        capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+    ) -> "InferenceUpstreamPool":
         """Build from the ``HOIST_UPSTREAM`` string or an already-split list."""
         if isinstance(urls, str):
             urls = parse_upstreams(urls)
-        return cls([InferenceUpstream(alias=url) for url in urls])
+        return cls(
+            [InferenceUpstream(alias=url) for url in urls],
+            capacity_per_upstream=capacity_per_upstream,
+            max_queue_size=max_queue_size,
+        )
+
+    async def acquire(
+        self, session_id: str = "", *, exclude: set[str] | None = None
+    ) -> InferenceUpstream:
+        """Place first for cache locality, then wait for that member's capacity."""
+        async with self._admission:
+            if self._closing:
+                raise InferenceAdmissionError("Inference gateway is shutting down")
+            selected = self._select_locked(
+                session_id, exclude or set(), now=time.time()
+            )
+            if selected.in_flight < selected.capacity and not selected.queued:
+                selected.in_flight += 1
+                return selected
+            total_queued = sum(upstream.queued for upstream in self.upstreams)
+            if total_queued >= self.max_queue_size:
+                raise InferenceAdmissionError(
+                    f"Inference queue is full ({total_queued}/{self.max_queue_size})"
+                )
+            ticket = object()
+            waiters = self._waiters[selected.alias]
+            waiters.append(ticket)
+            selected.queued += 1
+            queued = True
+            try:
+                while True:
+                    if self._closing:
+                        raise InferenceAdmissionError(
+                            "Inference gateway is shutting down"
+                        )
+                    now = time.time()
+                    if (
+                        waiters[0] is ticket
+                        and selected.in_flight < selected.capacity
+                        and selected.cooldown_until <= now
+                    ):
+                        waiters.popleft()
+                        selected.queued -= 1
+                        queued = False
+                        selected.in_flight += 1
+                        return selected
+                    cooldown_s = max(0.0, selected.cooldown_until - now)
+                    try:
+                        if cooldown_s:
+                            await asyncio.wait_for(
+                                self._admission.wait(), timeout=cooldown_s
+                            )
+                        else:
+                            await self._admission.wait()
+                    except TimeoutError:
+                        pass
+            finally:
+                if queued:
+                    waiters.remove(ticket)
+                    selected.queued -= 1
+                    self._admission.notify_all()
+
+    async def release(self, member: InferenceUpstream) -> None:
+        async with self._admission:
+            member.in_flight = max(0, member.in_flight - 1)
+            self._admission.notify_all()
+
+    async def cool_down(self, member: InferenceUpstream, seconds: float) -> None:
+        await super().cool_down(member, seconds)
+        async with self._admission:
+            self._admission.notify_all()
+
+    async def close(self) -> None:
+        """Reject new work and wake every queued request during shutdown."""
+        async with self._admission:
+            self._closing = True
+            self._admission.notify_all()
+
+    def status(self) -> list[dict[str, Any]]:
+        return [upstream.status(closing=self._closing) for upstream in self.upstreams]
 
     def _round_robin(self, candidates: list[InferenceUpstream]) -> InferenceUpstream:
         chosen = candidates[self._next_placement % len(candidates)]
@@ -670,6 +779,12 @@ class InferenceBackend:
                     method, upstream.base_url + path, content=body, headers=forwarded
                 )
                 response = await client.send(request, stream=True)
+            except asyncio.CancelledError:
+                # Cancellation before a response body exists must not leak a
+                # capacity slot; streaming cancellation is handled by _drain.
+                await asyncio.shield(client.aclose())
+                await asyncio.shield(self.pool.release(upstream))
+                raise
             except httpx.TransportError as exc:
                 await client.aclose()
                 await self.pool.release(upstream)
@@ -742,3 +857,7 @@ class InferenceBackend:
             await client.aclose()
         finally:
             await self.pool.release(upstream)
+
+    async def close(self) -> None:
+        """Stop admission and wake requests waiting for capacity."""
+        await self.pool.close()

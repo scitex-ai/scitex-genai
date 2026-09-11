@@ -45,7 +45,13 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from ._settings import check_host, check_port, upstream_string
+from ._settings import (
+    check_count,
+    check_host,
+    check_port,
+    check_timeout_s,
+    upstream_string,
+)
 
 UNIT_NAME = "scitex-genai-gateway.service"
 DEFAULT_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
@@ -64,6 +70,9 @@ def gateway_command(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
+    inference_capacity_per_upstream: int | None = None,
+    inference_max_queue_size: int | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> list[str]:
@@ -81,6 +90,28 @@ def gateway_command(
         argv += ["--port", str(check_port(port))]
     if upstream is not None and upstream_string(upstream):
         argv += ["--inference-upstream", upstream_string(upstream)]
+    if inference_timeout_s is not None:
+        argv += ["--inference-timeout-s", str(check_timeout_s(inference_timeout_s))]
+    if inference_capacity_per_upstream is not None:
+        argv += [
+            "--inference-capacity-per-upstream",
+            str(
+                check_count(
+                    "inference_capacity_per_upstream",
+                    inference_capacity_per_upstream,
+                    minimum=1,
+                )
+            ),
+        ]
+    if inference_max_queue_size is not None:
+        argv += [
+            "--inference-max-queue-size",
+            str(
+                check_count(
+                    "inference_max_queue_size", inference_max_queue_size, minimum=0
+                )
+            ),
+        ]
     return argv
 
 
@@ -89,12 +120,22 @@ def render_unit(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
+    inference_capacity_per_upstream: int | None = None,
+    inference_max_queue_size: int | None = None,
 ) -> str:
     """The unit text, byte-for-byte what ``install_unit`` writes."""
     argv = gateway_command(
-        host=host, port=port, upstream=upstream, config=config, interpreter=interpreter
+        host=host,
+        port=port,
+        upstream=upstream,
+        inference_timeout_s=inference_timeout_s,
+        inference_capacity_per_upstream=inference_capacity_per_upstream,
+        inference_max_queue_size=inference_max_queue_size,
+        config=config,
+        interpreter=interpreter,
     )
     exec_start = " ".join(shlex.quote(arg) for arg in argv)
     settings = str(config) if config is not None else "~/.scitex/genai/config.yaml"
@@ -113,6 +154,8 @@ def render_unit(
         "# No shell: the auth key comes from ~/.scitex/genai/secrets, which a\n"
         "# plain process can read. A missing key still fails loud.\n"
         f"ExecStart={exec_start}\n"
+        "# Let uvicorn drain admitted streams and wake queued requests on shutdown.\n"
+        "TimeoutStopSec=infinity\n"
         "Restart=always\n"
         "RestartSec=3\n"
         "Environment=PYTHONUNBUFFERED=1\n"
@@ -127,10 +170,13 @@ def install_unit(
     host: str | None = None,
     port: int | None = None,
     upstream: str | None = None,
+    inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     unit_dir: Path | None = None,
     enable: bool = True,
     runner: Runner | None = None,
+    inference_capacity_per_upstream: int | None = None,
+    inference_max_queue_size: int | None = None,
     interpreter: str | None = None,
 ) -> Path:
     """Write the unit, then reload the user manager and ``enable --now`` it.
@@ -148,6 +194,9 @@ def install_unit(
             host=host,
             port=port,
             upstream=upstream,
+            inference_timeout_s=inference_timeout_s,
+            inference_capacity_per_upstream=inference_capacity_per_upstream,
+            inference_max_queue_size=inference_max_queue_size,
             config=config,
             interpreter=interpreter,
         )

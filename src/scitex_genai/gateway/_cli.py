@@ -18,61 +18,94 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from ._accounts import CodexAccountPool
 from ._codex import CodexBackend, CodexTransport
+from ._errors import CredentialError
 from ._inference import (
-    DEFAULT_TIMEOUT_S,
     PREFIX_TELEMETRY_ENV,
-    TIMEOUT_ENV,
     InferenceBackend,
     InferenceUpstreamPool,
     announce,
     telemetry_enabled,
 )
-from ._errors import CredentialError
 from ._secrets import (
     GATEWAY_KEY_ENV,
     default_secrets_path,
     resolve_gateway_key,
     write_key,
 )
-from ._server import create_app
+from ._server import create_app, run_uvicorn
 from ._settings import load_settings
 from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 
 INSTALL_UNIT = "install-unit"
 
 
-def _add_settings_args(parser: argparse.ArgumentParser) -> None:
+def _add_settings_args(
+    parser: argparse.ArgumentParser, *, suppress_defaults: bool = False
+) -> None:
     """The flags that describe ONE gateway; shared by serve and install-unit.
 
     Every default is ``None`` on purpose: an unset flag means "the settings
     file decides", so the command line never overrides silently.
     """
+    default = argparse.SUPPRESS if suppress_defaults else None
     parser.add_argument(
         "--config",
         type=Path,
-        default=None,
+        default=default,
         help="settings file (default: ~/.scitex/genai/config.yaml)",
     )
     parser.add_argument(
         "--host",
-        default=None,
+        default=default,
         help="bind address (default: gateway.host, else 127.0.0.1)",
     )
     parser.add_argument(
-        "--port", type=int, default=None, help="port (default: gateway.port, else 8765)"
+        "--port",
+        type=int,
+        default=default,
+        help="port (default: gateway.port, else 8765)",
     )
     parser.add_argument(
         "--inference-upstream",
-        default=None,
+        default=default,
         help=(
             "Comma-separated base URLs of Anthropic-compatible inference "
             "upstreams (vLLM, LiteLLM). When set, /v1/messages is relayed to "
             "that pool instead of the Codex accounts. Default: "
             "gateway.inference_upstreams in the settings file, else $HOIST_UPSTREAM."
+        ),
+    )
+    parser.add_argument(
+        "--inference-timeout-s",
+        type=float,
+        default=default,
+        help=(
+            "Upstream inference timeout in seconds (default: "
+            "gateway.inference_timeout_s, else $HOIST_TIMEOUT_S, else "
+            "$SCITEX_GATEWAY_INFERENCE_TIMEOUT_S, else 600)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-capacity-per-upstream",
+        type=int,
+        default=default,
+        help=(
+            "Maximum concurrent admitted requests per inference upstream "
+            "(default: gateway.inference_capacity_per_upstream, else 8)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-max-queue-size",
+        type=int,
+        default=default,
+        help=(
+            "Maximum requests waiting for inference capacity across the pool "
+            "(default: gateway.inference_max_queue_size, else 128)."
         ),
     )
 
@@ -94,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         INSTALL_UNIT,
         help="write the systemd user unit for this gateway, reload, enable --now",
     )
-    _add_settings_args(unit)
+    _add_settings_args(unit, suppress_defaults=True)
     unit.add_argument(
         "--unit-dir",
         type=Path,
@@ -172,6 +205,9 @@ def _install_unit(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         upstream=args.inference_upstream,
+        inference_timeout_s=args.inference_timeout_s,
+        inference_capacity_per_upstream=args.inference_capacity_per_upstream,
+        inference_max_queue_size=args.inference_max_queue_size,
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -180,13 +216,17 @@ def _install_unit(args: argparse.Namespace) -> None:
     print(f"scitex-genai-gateway: {UNIT_NAME} -> {path} ({state})", flush=True)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    server_runner: Callable[..., None] | None = None,
+) -> None:
     args = build_parser().parse_args(argv)
     if args.command == INSTALL_UNIT:
         _install_unit(args)
         return
     try:
-        import uvicorn
+        __import__("uvicorn")
     except ImportError as exc:
         raise SystemExit("Install scitex-genai[gateway] to run the server") from exc
     settings = load_settings(
@@ -194,12 +234,19 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         inference_upstream=args.inference_upstream,
+        inference_timeout_s=args.inference_timeout_s,
+        inference_capacity_per_upstream=args.inference_capacity_per_upstream,
+        inference_max_queue_size=args.inference_max_queue_size,
     )
     if settings.inference_upstream:
-        pool = InferenceUpstreamPool.from_urls(settings.inference_upstream)
+        pool = InferenceUpstreamPool.from_urls(
+            settings.inference_upstream,
+            capacity_per_upstream=settings.inference_capacity_per_upstream,
+            max_queue_size=settings.inference_max_queue_size,
+        )
         backend = InferenceBackend(
             pool,
-            timeout_s=float(os.getenv(TIMEOUT_ENV, DEFAULT_TIMEOUT_S)),
+            timeout_s=settings.inference_timeout_s,
             telemetry_sink=_telemetry_sink(),
             journal=lambda line: print(line, flush=True),
         )
@@ -210,7 +257,10 @@ def main(argv: list[str] | None = None) -> None:
     key = resolve_gateway_key(create=True)
     print(f"scitex-genai-gateway: key {key.origin}", flush=True)
     app = create_app(backend, api_key=key.value)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level)
+    app.state.scitex_backend = backend
+    (server_runner or run_uvicorn)(
+        app, host=settings.host, port=settings.port, log_level=args.log_level
+    )
 
 
 if __name__ == "__main__":
