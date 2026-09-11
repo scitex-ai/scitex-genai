@@ -278,3 +278,34 @@ async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_fa
         backend.usage.total.input_tokens,
         backend.usage.total.output_tokens,
     ) == (200, {"include_usage": True}, 9, 4)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
+    # Arrange
+    upstream = upstream_factory(
+        content_type="text/event-stream",
+        chunks=(
+            b'data: {"type":"message_start","message":{"model":"deepseek-v4.1-flash","usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+            b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
+        ),
+    )
+    backend = _backend(upstream)
+    app = create_app(backend, api_key="local")
+    # Act
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+    ) as client:
+        response = await client.post(
+            "/v1/messages",
+            json=_body(stream=True),
+            headers={"authorization": "Bearer local"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        backend.usage.last_reported_model,
+        backend.usage.total.input_tokens,
+        backend.usage.total.output_tokens,
+        backend.usage.total.reported_model_mismatches,
+    ) == (200, "deepseek-v4.1-flash", 8, 5, 1)
