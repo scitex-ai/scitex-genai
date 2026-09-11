@@ -15,7 +15,7 @@ from ._anthropic import (
 )
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
-from ._inference import InferenceBackend
+from ._inference import InferenceBackend, RelayedResponse
 from ._secrets import resolve_gateway_key
 
 
@@ -99,6 +99,82 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
     return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
 
 
+async def _wait_for_downstream_disconnect(request: Any) -> None:
+    """Wait for the ASGI event that proves the downstream is gone.
+
+    Starlette does not promise to cancel a route coroutine when the peer goes
+    away. After ``Request.body()`` has consumed the final ``http.request``,
+    the request receive channel is therefore the authoritative signal: only
+    an actual ``http.disconnect`` cancels admission. This avoids treating a
+    transient socket probe or a slow client as a disconnect.
+    """
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _until_response_or_disconnect(request: Any, awaitable: Any) -> Any | None:
+    """Return the response, or cancel pre-response work on ASGI disconnect.
+
+    Response completion wins an exact race. At that point ownership of the
+    upstream stream has transferred to ``StreamingResponse``, whose normal
+    disconnect cancellation closes it and releases capacity.
+    """
+    response_task = asyncio.create_task(awaitable)
+    disconnect_task = asyncio.create_task(_wait_for_downstream_disconnect(request))
+
+    async def cancel_and_settle(*tasks: asyncio.Task) -> tuple[list[Any], bool]:
+        """Cancel children and wait through repeated cancellation of this task."""
+        for task in tasks:
+            task.cancel()
+        settlement = asyncio.ensure_future(
+            asyncio.gather(*tasks, return_exceptions=True)
+        )
+        interrupted = False
+        while not settlement.done():
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                interrupted = True
+                for task in tasks:
+                    task.cancel()
+        return settlement.result(), interrupted
+
+    async def close_if_relayed(result: Any) -> None:
+        if isinstance(result, RelayedResponse):
+            await result.aclose(cancelled=True)
+
+    try:
+        done, _ = await asyncio.wait(
+            {response_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+    except BaseException:
+        # The route itself may be cancelled during server shutdown. Do not
+        # detach either child task from that lifecycle.
+        results, _ = await cancel_and_settle(response_task, disconnect_task)
+        await close_if_relayed(results[0])
+        raise
+    if response_task in done:
+        try:
+            relayed = await response_task
+        except BaseException:
+            _, interrupted = await cancel_and_settle(disconnect_task)
+            if interrupted:
+                raise asyncio.CancelledError
+            raise
+        _, interrupted = await cancel_and_settle(disconnect_task)
+        if interrupted:
+            await close_if_relayed(relayed)
+            raise asyncio.CancelledError
+        return relayed
+    results, interrupted = await cancel_and_settle(response_task)
+    await close_if_relayed(results[0])
+    if interrupted:
+        raise asyncio.CancelledError
+    return None
+
+
 def create_app(
     backend: CodexBackend | InferenceBackend, *, api_key: str | None = None
 ) -> Any:
@@ -172,6 +248,12 @@ def create_app(
                 "active_members": sum(member["active"] for member in members),
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
+                "admitted_total": sum(
+                    member["admitted_total"] for member in members
+                ),
+                "cancelled_total": sum(
+                    member["cancelled_total"] for member in members
+                ),
             }
             health_status = getattr(backend, "health_status", None)
             if health_status is not None:
@@ -206,14 +288,25 @@ def create_app(
                 target = f"{target}?{request.url.query}"
             body = await request.body()
             try:
-                relayed = await backend.relay(
-                    request.method, target, body=body or None, headers=request.headers
+                relayed = await _until_response_or_disconnect(
+                    request,
+                    backend.relay(
+                        request.method,
+                        target,
+                        body=body or None,
+                        headers=request.headers,
+                    ),
                 )
             except UpstreamError as exc:
                 return JSONResponse(
                     _error_for(path, str(exc), exc.error_type, exc.status_code),
                     exc.status_code,
                 )
+            if relayed is None:
+                backend.note_downstream_disconnect(request.method, path)
+                # The peer is already gone; 499 simply gives ASGI middleware
+                # a completed response without misreporting an upstream fault.
+                return JSONResponse({}, 499)
             return StreamingResponse(
                 relayed.body,
                 status_code=relayed.status_code,
