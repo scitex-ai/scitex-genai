@@ -300,6 +300,78 @@ def test_legacy_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env
     assert settings.inference_timeout_s == 1200.0
 
 
+def test_external_provider_policy_is_loaded_from_config(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com/\n"
+        "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
+        "    canonical_model: deepseek-flash\n"
+        "    model_aliases: [deepseek-v4-flash]\n"
+        "    anthropic_path_prefix: /anthropic\n"
+        "    max_requests_per_run: 12\n"
+        "    max_tokens_per_request: 4096\n",
+    )
+    # Act
+    settings = load_settings(path)
+    external = settings.external_provider
+    # Assert
+    assert external is not None and (
+        external.upstream,
+        external.canonical_model,
+        external.model_aliases,
+        external.anthropic_path_prefix,
+        external.max_requests_per_run,
+    ) == (
+        "https://api.deepseek.com",
+        "deepseek-flash",
+        ("deepseek-v4-flash",),
+        "/anthropic",
+        12,
+    )
+
+
+def test_external_provider_and_local_inference_are_mutually_exclusive(
+    tmp_path: Path, clean_env
+):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  inference_upstreams: [http://local]\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com\n"
+        "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
+        "    canonical_model: deepseek-flash\n",
+    )
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_settings(path)
+
+
+def test_external_provider_typo_is_refused(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  external_provider:\n"
+        "    provider: deepseek\n"
+        "    upstream: https://api.deepseek.com\n"
+        "    upstream_auth_token_env: DEEPSEEK_API_KEY\n"
+        "    canonical_model: deepseek-flash\n"
+        "    max_request_per_run: 12\n",
+    )
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match="unknown keys: max_request_per_run"):
+        load_settings(path)
+
+
 def test_namespaced_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env):
     # Arrange
     os.environ[SCITEX_TIMEOUT_ENV] = "900"

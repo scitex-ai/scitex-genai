@@ -4,7 +4,6 @@ import asyncio
 import hmac
 import json
 import math
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -165,7 +164,7 @@ def create_app(
     async def health() -> dict[str, Any]:
         if relaying:
             members = backend.pool.status()
-            return {
+            status = {
                 "status": "ok",
                 "provider": backend.provider,
                 "upstreams": [upstream.alias for upstream in backend.pool.upstreams],
@@ -174,6 +173,10 @@ def create_app(
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
             }
+            health_status = getattr(backend, "health_status", None)
+            if health_status is not None:
+                status["external"] = health_status()
+            return status
         return {
             "status": "ok",
             "provider": "openai-codex",
@@ -236,6 +239,14 @@ def create_app(
 
         @app.get("/v1/{path:path}")
         async def relay_get(request: Request, path: str) -> Any:
+            models_payload = getattr(backend, "models_payload", None)
+            if path == "models" and models_payload is not None:
+                if not authorized(request):
+                    return JSONResponse(
+                        _openai_error("Invalid API key", "authentication_error", 401),
+                        401,
+                    )
+                return JSONResponse(models_payload())
             return await relay(request)
 
         return app

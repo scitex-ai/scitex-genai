@@ -24,6 +24,7 @@ from pathlib import Path
 from ._accounts import CodexAccountPool
 from ._codex import CodexBackend, CodexTransport
 from ._errors import CredentialError
+from ._external import ExternalProviderBackend, ExternalProviderPolicy
 from ._inference import (
     PREFIX_TELEMETRY_ENV,
     InferenceBackend,
@@ -238,7 +239,46 @@ def main(
         inference_capacity_per_upstream=args.inference_capacity_per_upstream,
         inference_max_queue_size=args.inference_max_queue_size,
     )
-    if settings.inference_upstream:
+    if settings.external_provider is not None:
+        external = settings.external_provider
+        upstream_key = os.getenv(external.upstream_auth_token_env, "").strip()
+        if not upstream_key:
+            raise SystemExit(
+                "refusing to start external-provider relay: "
+                f"{external.upstream_auth_token_env} is unset or empty"
+            )
+        pool = InferenceUpstreamPool.from_urls(
+            [external.upstream],
+            capacity_per_upstream=settings.inference_capacity_per_upstream,
+            max_queue_size=settings.inference_max_queue_size,
+        )
+        backend = ExternalProviderBackend(
+            pool,
+            timeout_s=settings.inference_timeout_s,
+            journal=lambda line: print(line, flush=True),
+            policy=ExternalProviderPolicy(
+                provider=external.provider,
+                upstream_api_key=upstream_key,
+                canonical_model=external.canonical_model,
+                model_aliases=external.model_aliases,
+                anthropic_path_prefix=external.anthropic_path_prefix,
+                max_tokens_per_request=external.max_tokens_per_request,
+                max_requests_per_run=external.max_requests_per_run,
+                max_input_tokens_per_run=external.max_input_tokens_per_run,
+                max_output_tokens_per_run=external.max_output_tokens_per_run,
+                max_total_tokens_per_run=external.max_total_tokens_per_run,
+                max_estimated_usd_per_run=external.max_estimated_usd_per_run,
+                input_usd_per_million_tokens=external.input_usd_per_million_tokens,
+                output_usd_per_million_tokens=external.output_usd_per_million_tokens,
+            ),
+        )
+        print(
+            "scitex-genai-gateway: external provider "
+            f"{external.provider} -> {external.upstream}; outbound model policy: "
+            f"{external.canonical_model} only",
+            flush=True,
+        )
+    elif settings.inference_upstream:
         pool = InferenceUpstreamPool.from_urls(
             settings.inference_upstream,
             capacity_per_upstream=settings.inference_capacity_per_upstream,
