@@ -17,8 +17,10 @@ list only the upstream that is actually reachable.
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
-``HOIST_TIMEOUT_S`` environment variable remains a fallback when the
-configuration field is absent, but a systemd drop-in is no longer needed:
+``HOIST_TIMEOUT_S`` environment variable remains the first fallback when
+the configuration field is absent. The automatically namespaced
+``SCITEX_GATEWAY_INFERENCE_TIMEOUT_S`` remains supported after it. A
+systemd drop-in is no longer needed:
 ``scitex-genai-gateway install-unit`` starts the gateway with this settings
 file.
 
@@ -33,9 +35,13 @@ unit:
    $ scitex-genai-gateway --inference-timeout-s 1800
    $ scitex-genai-gateway install-unit --inference-timeout-s 1800
 
+For ``install-unit``, shared settings may appear before or after the
+subcommand; both forms produce the same unit.
+
 The generated unit carries the latter value in its ``ExecStart`` command.
-Direct values take precedence over the configuration file, which takes
-precedence over the legacy environment fallback.
+Direct values take precedence over the configuration file, then
+``HOIST_TIMEOUT_S``, then ``SCITEX_GATEWAY_INFERENCE_TIMEOUT_S``, then the
+600-second default.
 
 Capacity planning
 -----------------

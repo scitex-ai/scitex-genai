@@ -46,6 +46,8 @@ KEY_PORT = "gateway.port"
 KEY_UPSTREAMS = "gateway.inference_upstreams"
 KEY_TIMEOUT = "gateway.inference_timeout_s"
 
+SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
+
 
 def default_config_path() -> Path:
     """``$SCITEX_DIR/genai/config.yaml`` -- ``~/.scitex/genai/config.yaml`` normally."""
@@ -126,9 +128,16 @@ def load_settings(
     )
     if upstream is None:
         upstream = os.getenv(UPSTREAM_ENV, "")
-    timeout = config.resolve(KEY_TIMEOUT, direct_val=inference_timeout_s, default=None)
+    # Spell this cascade out: ScitexConfig.resolve() would otherwise put its
+    # implicit SCITEX_GATEWAY_INFERENCE_TIMEOUT_S ahead of the older,
+    # documented HOIST_TIMEOUT_S contract.
+    timeout = inference_timeout_s
     if timeout is None:
-        timeout = os.getenv(TIMEOUT_ENV, DEFAULT_TIMEOUT_S)
+        timeout = config.get(KEY_TIMEOUT)
+    if timeout is None:
+        timeout = (
+            os.getenv(TIMEOUT_ENV) or os.getenv(SCITEX_TIMEOUT_ENV) or DEFAULT_TIMEOUT_S
+        )
     return GatewaySettings(
         host=config.resolve(KEY_HOST, direct_val=host, default=DEFAULT_HOST),
         port=config.resolve(KEY_PORT, direct_val=port, default=DEFAULT_PORT, type=int),

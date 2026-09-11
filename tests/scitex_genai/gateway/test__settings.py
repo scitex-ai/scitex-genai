@@ -17,12 +17,14 @@ from scitex_genai.gateway._inference import DEFAULT_TIMEOUT_S, TIMEOUT_ENV, UPST
 from scitex_genai.gateway._settings import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    SCITEX_TIMEOUT_ENV,
     default_config_path,
     load_settings,
 )
 
 ENV_KEYS = (
     UPSTREAM_ENV,
+    SCITEX_TIMEOUT_ENV,
     TIMEOUT_ENV,
     "SCITEX_GATEWAY_HOST",
     "SCITEX_GATEWAY_PORT",
@@ -223,6 +225,7 @@ def test_the_timeout_file_value_beats_the_legacy_environment(tmp_path: Path, cle
         "gateway:\n  inference_timeout_s: 1800\n",
     )
     os.environ[TIMEOUT_ENV] = "900"
+    os.environ[SCITEX_TIMEOUT_ENV] = "600"
 
     # Act
     settings = load_settings(path)
@@ -240,6 +243,46 @@ def test_legacy_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env
 
     # Assert
     assert settings.inference_timeout_s == 1200.0
+
+
+def test_namespaced_timeout_environment_remains_a_fallback(tmp_path: Path, clean_env):
+    # Arrange
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(tmp_path / "none.yaml")
+
+    # Assert
+    assert settings.inference_timeout_s == 900.0
+
+
+def test_legacy_timeout_environment_beats_the_implicit_namespaced_one(
+    tmp_path: Path, clean_env
+):
+    # Arrange
+    os.environ[TIMEOUT_ENV] = "1200"
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(tmp_path / "none.yaml")
+
+    # Assert
+    assert settings.inference_timeout_s == 1200.0
+
+
+def test_direct_timeout_beats_both_environment_names(tmp_path: Path, clean_env):
+    # Arrange
+    os.environ[TIMEOUT_ENV] = "1200"
+    os.environ[SCITEX_TIMEOUT_ENV] = "900"
+
+    # Act
+    settings = load_settings(
+        tmp_path / "none.yaml",
+        inference_timeout_s=1800,
+    )
+
+    # Assert
+    assert settings.inference_timeout_s == 1800.0
 
 
 @pytest.mark.parametrize("value", [0, -1, "nan", "inf", "not-a-number"])

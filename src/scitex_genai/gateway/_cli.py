@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from ._accounts import CodexAccountPool
@@ -43,29 +44,35 @@ from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 INSTALL_UNIT = "install-unit"
 
 
-def _add_settings_args(parser: argparse.ArgumentParser) -> None:
+def _add_settings_args(
+    parser: argparse.ArgumentParser, *, suppress_defaults: bool = False
+) -> None:
     """The flags that describe ONE gateway; shared by serve and install-unit.
 
     Every default is ``None`` on purpose: an unset flag means "the settings
     file decides", so the command line never overrides silently.
     """
+    default = argparse.SUPPRESS if suppress_defaults else None
     parser.add_argument(
         "--config",
         type=Path,
-        default=None,
+        default=default,
         help="settings file (default: ~/.scitex/genai/config.yaml)",
     )
     parser.add_argument(
         "--host",
-        default=None,
+        default=default,
         help="bind address (default: gateway.host, else 127.0.0.1)",
     )
     parser.add_argument(
-        "--port", type=int, default=None, help="port (default: gateway.port, else 8765)"
+        "--port",
+        type=int,
+        default=default,
+        help="port (default: gateway.port, else 8765)",
     )
     parser.add_argument(
         "--inference-upstream",
-        default=None,
+        default=default,
         help=(
             "Comma-separated base URLs of Anthropic-compatible inference "
             "upstreams (vLLM, LiteLLM). When set, /v1/messages is relayed to "
@@ -76,10 +83,11 @@ def _add_settings_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--inference-timeout-s",
         type=float,
-        default=None,
+        default=default,
         help=(
             "Upstream inference timeout in seconds (default: "
-            "gateway.inference_timeout_s, else $HOIST_TIMEOUT_S, else 600)."
+            "gateway.inference_timeout_s, else $HOIST_TIMEOUT_S, else "
+            "$SCITEX_GATEWAY_INFERENCE_TIMEOUT_S, else 600)."
         ),
     )
 
@@ -101,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
         INSTALL_UNIT,
         help="write the systemd user unit for this gateway, reload, enable --now",
     )
-    _add_settings_args(unit)
+    _add_settings_args(unit, suppress_defaults=True)
     unit.add_argument(
         "--unit-dir",
         type=Path,
@@ -188,7 +196,11 @@ def _install_unit(args: argparse.Namespace) -> None:
     print(f"scitex-genai-gateway: {UNIT_NAME} -> {path} ({state})", flush=True)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    server_runner: Callable[..., None] | None = None,
+) -> None:
     args = build_parser().parse_args(argv)
     if args.command == INSTALL_UNIT:
         _install_unit(args)
@@ -219,7 +231,10 @@ def main(argv: list[str] | None = None) -> None:
     key = resolve_gateway_key(create=True)
     print(f"scitex-genai-gateway: key {key.origin}", flush=True)
     app = create_app(backend, api_key=key.value)
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=args.log_level)
+    app.state.scitex_backend = backend
+    (server_runner or uvicorn.run)(
+        app, host=settings.host, port=settings.port, log_level=args.log_level
+    )
 
 
 if __name__ == "__main__":
