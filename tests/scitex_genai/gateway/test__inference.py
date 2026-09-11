@@ -172,24 +172,43 @@ async def test_pool_places_new_conversations_round_robin() -> None:
     for session in ("s1", "s2", "s3", "s4"):
         upstream = await pool.acquire(session)
         placed.append(upstream.alias)
-        await pool.release(upstream)
+        await pool.release(upstream, session_id=session)
     # Assert
     assert placed == ["http://a:1", "http://b:2", "http://c:3", "http://a:1"]
 
 
 @pytest.mark.asyncio
-async def test_pool_keeps_a_conversation_sticky_even_while_it_is_busy() -> None:
+async def test_pool_serializes_overlapping_turns_for_one_conversation() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls("http://a:1,http://b:2")
     # Act
     first = await pool.acquire("s1")
-    concurrent = await pool.acquire("s1")
+    concurrent = asyncio.create_task(pool.acquire("s1"))
+    await _wait_for_queue(pool, 1)
+    while_first_active = (concurrent.done(), first.in_flight)
+    await pool.release(first, session_id="s1")
+    readmitted = await concurrent
+    await pool.release(readmitted, session_id="s1")
     # Assert
-    assert (first.alias, concurrent.alias, first.in_flight) == (
+    assert (first.alias, readmitted.alias, while_first_active) == (
         "http://a:1",
         "http://a:1",
-        2,
+        (False, 1),
     )
+
+
+@pytest.mark.asyncio
+async def test_pool_admits_different_conversations_concurrently() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls("http://only:1", capacity_per_upstream=2)
+    # Act
+    first = await pool.acquire("s1")
+    second = await pool.acquire("s2")
+    observed = (first.in_flight, sum(member.queued for member in pool.upstreams))
+    await pool.release(first, session_id="s1")
+    await pool.release(second, session_id="s2")
+    # Assert
+    assert observed == (2, 0)
 
 
 async def _wait_for_queue(pool: InferenceUpstreamPool, size: int) -> None:
@@ -237,8 +256,10 @@ async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> 
 async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls(
-        "http://only:1", capacity_per_upstream=8,
-        token_capacity_per_upstream=1_000, max_queue_size=2,
+        "http://only:1",
+        capacity_per_upstream=8,
+        token_capacity_per_upstream=1_000,
+        max_queue_size=2,
     )
     first = await pool.acquire("long-a", input_tokens=700)
     second = await pool.acquire("short", input_tokens=200)
@@ -247,11 +268,11 @@ async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> 
 
     # Act
     saturated = pool.status()[0]
-    await pool.release(second, input_tokens=200)
+    await pool.release(second, input_tokens=200, session_id="short")
     still_waiting = not waiting.done()
-    await pool.release(first, input_tokens=700)
+    await pool.release(first, input_tokens=700, session_id="long-a")
     admitted = await waiting
-    await pool.release(admitted, input_tokens=400)
+    await pool.release(admitted, input_tokens=400, session_id="long-b")
 
     # Assert
     assert (
@@ -292,9 +313,9 @@ async def test_token_waiter_keeps_its_cached_home_when_another_member_is_idle() 
 
     # Act
     aliases = [member.alias for member in pool.upstreams if member.in_flight]
-    await pool.release(home, input_tokens=700)
+    await pool.release(home, input_tokens=700, session_id="sticky")
     readmitted = await waiting
-    await pool.release(readmitted, input_tokens=400)
+    await pool.release(readmitted, input_tokens=400, session_id="sticky")
 
     # Assert
     assert (aliases, readmitted.alias) == (["http://a:1"], "http://a:1")
@@ -314,7 +335,7 @@ async def test_queue_bound_refuses_overload_with_503_error() -> None:
     refused = await _raised_async(pool.acquire("third"))
     waiting.cancel()
     cancelled = await _raised_async(waiting)
-    await pool.release(admitted)
+    await pool.release(admitted, session_id="first")
 
     # Assert
     assert (
@@ -343,9 +364,9 @@ async def test_waiting_preserves_sticky_home_even_when_another_member_is_idle() 
         ("http://a:1", 1, 1),
         ("http://b:2", 0, 0),
     ]
-    await pool.release(home)
+    await pool.release(home, session_id="sticky")
     readmitted = await waiting
-    await pool.release(readmitted)
+    await pool.release(readmitted, session_id="sticky")
 
     # Assert
     assert (waiting_state, readmitted.alias) == (expected, "http://a:1")
@@ -365,7 +386,7 @@ async def test_cancelled_waiter_releases_its_queue_slot() -> None:
     waiting.cancel()
     cancelled = await _raised_async(waiting)
     state = pool.status()[0]
-    await pool.release(admitted)
+    await pool.release(admitted, session_id="first")
 
     # Assert
     assert (
@@ -397,7 +418,7 @@ async def test_shutdown_wakes_waiters_and_rejects_new_admission() -> None:
         "queued": 0,
         "capacity": 1,
     }
-    await pool.release(admitted)
+    await pool.release(admitted, session_id="first")
 
     # Assert
     assert (
