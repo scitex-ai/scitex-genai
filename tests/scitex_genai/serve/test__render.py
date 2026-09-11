@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import jsonschema
+import pytest
 import yaml
 
 from scitex_genai.serve._conf import EngineConf, parse_engine_conf
@@ -54,6 +57,26 @@ BASE_ENV = {
     "HF_HUB_ENABLE_HF_TRANSFER": "1",
     "LD_LIBRARY_PATH": "/lib",
 }
+CANARY_DIR = Path(__file__).parents[3] / "examples" / "serve" / "canary"
+CANARY_MANIFEST = json.loads((CANARY_DIR / "qwen38-scheduler-matrix.json").read_text())
+CANARY_SCHEMA = json.loads(
+    (CANARY_DIR / "qwen38-scheduler-matrix.schema.json").read_text()
+)
+
+
+def _canary_profile(profile_id: str) -> dict[str, object]:
+    return next(
+        item for item in CANARY_MANIFEST["profiles"] if item["id"] == profile_id
+    )
+
+
+def _canary_conf(profile: dict[str, object]):
+    path = CANARY_DIR / str(profile["file"])
+    return parse_engine_conf(path.stem, path.read_text(), source=path)
+
+
+def _arg_value(argv: tuple[str, ...], name: str) -> str:
+    return argv[argv.index(name) + 1]
 
 
 def test_cache_dir_is_keyed_by_engine_never_by_job():
@@ -229,6 +252,137 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
         launch.engine_argv.count("--enable-metrics"),
         launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
     ) == (1, 1, "1")
+
+
+def test_scheduler_canary_manifest_conforms_to_its_schema():
+    # Arrange
+    validator = jsonschema.Draft202012Validator(CANARY_SCHEMA)
+
+    # Act
+    errors = sorted(
+        validator.iter_errors(CANARY_MANIFEST), key=lambda error: error.json_path
+    )
+
+    # Assert
+    assert errors == []
+
+
+def test_scheduler_manifest_declares_every_and_only_canary_conf():
+    # Arrange
+    declared = {profile["file"] for profile in CANARY_MANIFEST["profiles"]}
+
+    # Act
+    present = {path.name for path in CANARY_DIR.glob("*.conf")}
+
+    # Assert
+    assert present == declared
+
+
+def test_scheduler_profile_ids_and_files_are_unique():
+    # Arrange
+    profiles = CANARY_MANIFEST["profiles"]
+
+    # Act
+    unique_counts = (
+        len({profile["id"] for profile in profiles}),
+        len({profile["file"] for profile in profiles}),
+    )
+
+    # Assert
+    assert unique_counts == (len(profiles), len(profiles))
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    [profile["id"] for profile in CANARY_MANIFEST["profiles"]],
+)
+def test_scheduler_profile_dry_renders_declared_shape(profile_id: str):
+    # Arrange
+    profile = _canary_profile(profile_id)
+    conf = _canary_conf(profile)
+
+    # Act
+    argv = render(SETTINGS, conf, BASE_ENV).engine_argv
+    observed = (
+        _arg_value(argv, "--schedule-policy"),
+        int(_arg_value(argv, "--chunked-prefill-size")),
+        int(_arg_value(argv, "--max-prefill-tokens")),
+        "--speculative-algorithm" in argv,
+        "--enable-mixed-chunk" in argv,
+        argv.count("--enable-session-radix-cache"),
+        argv.count("--enable-metrics"),
+    )
+
+    # Assert
+    assert observed == (
+        profile["schedule_policy"],
+        profile["chunked_prefill_size"],
+        profile["max_prefill_tokens"],
+        profile["speculation"] == "eagle",
+        profile["mixed_chunk"],
+        1,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    [profile["id"] for profile in CANARY_MANIFEST["profiles"]],
+)
+def test_scheduler_profile_keeps_measured_invariants(profile_id: str):
+    # Arrange
+    profile = _canary_profile(profile_id)
+
+    # Act
+    conf = _canary_conf(profile)
+
+    # Assert
+    assert (
+        conf.engine,
+        conf.tp,
+        conf.max_model_len,
+        conf.gpu_mem_util,
+        conf.max_num_seqs,
+        conf.sglang_image.as_posix(),
+        _arg_value(conf.extra_sglang_args, "--kv-cache-dtype"),
+    ) == (
+        "sglang",
+        2,
+        1_000_000,
+        0.85,
+        8,
+        CANARY_MANIFEST["sglang_image"],
+        "fp8_e4m3",
+    )
+
+
+def test_mixed_chunk_control_cannot_silently_enable_eagle():
+    # Arrange
+    profile = _canary_profile("fcfs-noeagle-mixed-c8192")
+
+    # Act
+    args = _canary_conf(profile).extra_sglang_args
+
+    # Assert
+    assert (
+        "--enable-mixed-chunk" in args,
+        any(arg.startswith("--speculative-") for arg in args),
+    ) == (True, False)
+
+
+def test_lpm_negative_control_changes_only_policy_from_baseline():
+    # Arrange
+    baseline = list(
+        _canary_conf(_canary_profile("fcfs-eagle-c32768")).extra_sglang_args
+    )
+    lpm = list(_canary_conf(_canary_profile("lpm-eagle-c32768")).extra_sglang_args)
+
+    # Act
+    baseline[baseline.index("--schedule-policy") + 1] = "POLICY"
+    lpm[lpm.index("--schedule-policy") + 1] = "POLICY"
+
+    # Assert
+    assert lpm == baseline
 
 
 def test_litellm_config_names_the_engine_then_the_wildcard():

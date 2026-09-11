@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scitex.ai/schemas/qwen38-scheduler-matrix.schema.json",
+  "title": "Qwen3.8 SGLang scheduler canary matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "production_change",
+    "measurement_status",
+    "sglang_commit",
+    "sglang_image",
+    "sglang_image_sha256",
+    "profiles"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": 1},
+    "production_change": {"const": false},
+    "measurement_status": {"const": "unmeasured"},
+    "sglang_commit": {"const": "4ccff141dbe992794f9da6c3aa23535b4f72000d"},
+    "sglang_image": {"type": "string", "pattern": "^/"},
+    "sglang_image_sha256": {
+      "const": "b742f112f8403417c781216e9d4cf9d7eff49f2d6127e682805c40225a74cab2"
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "file",
+          "schedule_policy",
+          "chunked_prefill_size",
+          "max_prefill_tokens",
+          "speculation",
+          "mixed_chunk",
+          "purpose"
+        ],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+          "file": {"type": "string", "pattern": "^[a-z0-9-]+\\.conf$"},
+          "schedule_policy": {"enum": ["fcfs", "lpm"]},
+          "chunked_prefill_size": {"enum": [4096, 8192, 32768]},
+          "max_prefill_tokens": {"const": 32768},
+          "speculation": {"enum": ["eagle", "off"]},
+          "mixed_chunk": {"type": "boolean"},
+          "purpose": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
