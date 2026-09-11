@@ -6,6 +6,25 @@
   "sglang_commit": "4ccff141dbe992794f9da6c3aa23535b4f72000d",
   "sglang_image": "/data/scratch/projects/punim0264/ywatanabe/containers/sglang-qwen38-cu12-amd64-45e39d4c5bcf.sif",
   "sglang_image_sha256": "b742f112f8403417c781216e9d4cf9d7eff49f2d6127e682805c40225a74cab2",
+  "model_manifest_files": [
+    "config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "chat_template.jinja",
+    "model.safetensors.index.json",
+    "crc32.txt"
+  ],
+  "model_manifest_sha256": "ae63fb8baffb044e4d0ee476a03283de640690e50fe3282c95996d9dc016a01c",
+  "runtime_guard": {
+    "purpose": "qwen38-scheduler",
+    "gpu_count": 2,
+    "gpu_model": "H100",
+    "host_memory_gb": 128
+  },
+  "warmup": {
+    "strategy": "shared-version-pinned-jit-cache",
+    "cache_namespace": "/tmp/scitex-genai-canary/qwen38-4ccff141-b742f112"
+  },
   "profiles": [
     {
       "id": "fcfs-eagle-c32768",
@@ -15,6 +34,7 @@
       "max_prefill_tokens": 32768,
       "speculation": "eagle",
       "mixed_chunk": false,
+      "changed_dimensions": [],
       "purpose": "Measured-production-shape baseline"
     },
     {
@@ -25,6 +45,7 @@
       "max_prefill_tokens": 32768,
       "speculation": "eagle",
       "mixed_chunk": false,
+      "changed_dimensions": ["schedule_policy"],
       "purpose": "Negative control for waiting-queue reordering"
     },
     {
@@ -35,6 +56,7 @@
       "max_prefill_tokens": 32768,
       "speculation": "eagle",
       "mixed_chunk": false,
+      "changed_dimensions": ["chunked_prefill_size"],
       "purpose": "Measure whether smaller chunks admit a later warm request"
     },
     {
@@ -45,6 +67,7 @@
       "max_prefill_tokens": 32768,
       "speculation": "eagle",
       "mixed_chunk": false,
+      "changed_dimensions": ["chunked_prefill_size"],
       "purpose": "Measure fairness and cold-prefill overhead at a smaller chunk"
     },
     {
@@ -55,7 +78,12 @@
       "max_prefill_tokens": 32768,
       "speculation": "off",
       "mixed_chunk": true,
-      "purpose": "Control for protecting requests that are already decoding"
+      "changed_dimensions": [
+        "chunked_prefill_size",
+        "speculation",
+        "mixed_chunk"
+      ],
+      "purpose": "Compatibility control changing three dimensions to test protection of already-decoding requests"
     }
   ]
 }

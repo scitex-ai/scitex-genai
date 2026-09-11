@@ -11,6 +11,10 @@
     "sglang_commit",
     "sglang_image",
     "sglang_image_sha256",
+    "model_manifest_files",
+    "model_manifest_sha256",
+    "runtime_guard",
+    "warmup",
     "profiles"
   ],
   "properties": {
@@ -22,6 +26,37 @@
     "sglang_image": {"type": "string", "pattern": "^/"},
     "sglang_image_sha256": {
       "const": "b742f112f8403417c781216e9d4cf9d7eff49f2d6127e682805c40225a74cab2"
+    },
+    "model_manifest_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "model_manifest_sha256": {
+      "const": "ae63fb8baffb044e4d0ee476a03283de640690e50fe3282c95996d9dc016a01c"
+    },
+    "runtime_guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "gpu_count", "gpu_model", "host_memory_gb"],
+      "properties": {
+        "purpose": {"const": "qwen38-scheduler"},
+        "gpu_count": {"const": 2},
+        "gpu_model": {"const": "H100"},
+        "host_memory_gb": {"const": 128}
+      }
+    },
+    "warmup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "cache_namespace"],
+      "properties": {
+        "strategy": {"const": "shared-version-pinned-jit-cache"},
+        "cache_namespace": {
+          "const": "/tmp/scitex-genai-canary/qwen38-4ccff141-b742f112"
+        }
+      }
     },
     "profiles": {
       "type": "array",
@@ -38,6 +73,7 @@
           "max_prefill_tokens",
           "speculation",
           "mixed_chunk",
+          "changed_dimensions",
           "purpose"
         ],
         "properties": {
@@ -48,6 +84,18 @@
           "max_prefill_tokens": {"const": 32768},
           "speculation": {"enum": ["eagle", "off"]},
           "mixed_chunk": {"type": "boolean"},
+          "changed_dimensions": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "schedule_policy",
+                "chunked_prefill_size",
+                "speculation",
+                "mixed_chunk"
+              ]
+            }
+          },
           "purpose": {"type": "string", "minLength": 1}
         }
       }
