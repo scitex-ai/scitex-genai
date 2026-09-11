@@ -50,7 +50,11 @@ def _scenario() -> dict:
 
 @pytest.mark.asyncio
 async def test_refuses_without_explicit_acknowledgement():
-    with pytest.raises(PermissionError, match="isolated-canary"):
+    # Arrange
+    ctx = pytest.raises(PermissionError, match="isolated-canary")
+    # Act
+    # Assert
+    with ctx:
         await run_scenario(
             _scenario(),
             endpoint="http://canary.invalid/v1/chat/completions",
@@ -61,7 +65,11 @@ async def test_refuses_without_explicit_acknowledgement():
 
 @pytest.mark.asyncio
 async def test_requires_an_explicit_http_endpoint():
-    with pytest.raises(ValueError, match="explicit http"):
+    # Arrange
+    ctx = pytest.raises(ValueError, match="explicit http")
+    # Act
+    # Assert
+    with ctx:
         await run_scenario(
             _scenario(),
             endpoint="",
@@ -72,6 +80,7 @@ async def test_requires_an_explicit_http_endpoint():
 
 @pytest.mark.asyncio
 async def test_stream_results_keep_order_ids_usage_and_cache_fields():
+    # Arrange
     seen = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -96,6 +105,22 @@ async def test_stream_results_keep_order_ids_usage_and_cache_fields():
             content="".join(frames),
         )
 
+    expected = (
+        ["cold", "warm"],
+        ["sglang-ab-fcfs-r1-00-cold", "sglang-ab-fcfs-r1-01-warm"],
+        [True, True],
+        {
+            "cached_tokens": 8,
+            "device_hit_tokens": 8,
+            "host_hit_tokens": 1,
+            "storage_hit_tokens": 0,
+            "newly_computed_tokens": 1,
+        },
+        0.25,
+        ["fixed", "same"],
+    )
+
+    # Act
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         rows = await run_scenario(
             _scenario(),
@@ -104,52 +129,64 @@ async def test_stream_results_keep_order_ids_usage_and_cache_fields():
             run_id="fcfs-r1",
             client=client,
         )
+    actual = (
+        [row["request_label"] for row in rows],
+        [row["request_id"] for row in rows],
+        [row["prompt_tokens_match"] for row in rows],
+        rows[0]["cache"],
+        rows[0]["scheduler"]["queue_time_s"],
+        [item[1]["prompt"] for item in seen],
+    )
 
-    assert [row["request_label"] for row in rows] == ["cold", "warm"]
-    assert [row["request_id"] for row in rows] == [
-        "sglang-ab-fcfs-r1-00-cold",
-        "sglang-ab-fcfs-r1-01-warm",
-    ]
-    assert all(row["prompt_tokens_match"] for row in rows)
-    assert rows[0]["cache"] == {
-        "cached_tokens": 8,
-        "device_hit_tokens": 8,
-        "host_hit_tokens": 1,
-        "storage_hit_tokens": 0,
-        "newly_computed_tokens": 1,
-    }
-    assert rows[0]["scheduler"]["queue_time_s"] == 0.25
-    assert [item[1]["prompt"] for item in seen] == ["fixed", "same"]
+    # Assert
+    assert actual == expected
 
 
 def test_manifest_rejects_unfixed_or_reordered_arrivals(tmp_path: Path):
+    # Arrange
     scenario = _scenario()
     scenario["requests"][1]["arrival_ms"] = -1
     path = tmp_path / "bad.json"
     path.write_text(json.dumps(scenario))
-    with pytest.raises(ValueError, match="non-negative and nondecreasing"):
+
+    # Act
+    ctx = pytest.raises(ValueError, match="non-negative and nondecreasing")
+
+    # Assert
+    with ctx:
         load_scenario(path)
 
 
 def test_jsonl_is_one_parseable_object_per_result():
-    rendered = _jsonl([{"request_id": "one"}, {"request_id": "two"}])
-    assert [json.loads(line)["request_id"] for line in rendered.splitlines()] == [
-        "one",
-        "two",
-    ]
+    # Arrange
+    rows = [{"request_id": "one"}, {"request_id": "two"}]
+
+    # Act
+    rendered = _jsonl(rows)
+    request_ids = [json.loads(line)["request_id"] for line in rendered.splitlines()]
+
+    # Assert
+    assert request_ids == ["one", "two"]
 
 
 def test_manifest_requires_the_fixed_seed_in_each_body(tmp_path: Path):
+    # Arrange
     scenario = _scenario()
     scenario["requests"][0]["body"].pop("seed")
     path = tmp_path / "missing-seed.json"
     path.write_text(json.dumps(scenario))
-    with pytest.raises(ValueError, match="seed must equal scenario seed"):
+
+    # Act
+    ctx = pytest.raises(ValueError, match="seed must equal scenario seed")
+
+    # Assert
+    with ctx:
         load_scenario(path)
 
 
 @pytest.mark.asyncio
 async def test_stream_timing_calculates_ttft_tpot_and_e2e():
+    # Arrange
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -162,6 +199,8 @@ async def test_stream_timing_calculates_ttft_tpot_and_e2e():
         )
 
     ticks = iter([10.0, 10.5, 11.0, 12.0])
+
+    # Act
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         row = await _run_request(
             client,
@@ -174,4 +213,5 @@ async def test_stream_timing_calculates_ttft_tpot_and_e2e():
             clock=lambda: next(ticks),
         )
 
+    # Assert
     assert (row["ttft_s"], row["tpot_s"], row["e2e_s"]) == (0.5, 0.5, 2.0)
