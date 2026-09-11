@@ -71,6 +71,24 @@ class InferenceAdmissionError(UpstreamError):
         super().__init__(message, status_code=503)
 
 
+class ModelPolicyError(UpstreamError):
+    """A requested model is outside the gateway's outbound allowlist."""
+
+    error_type = "model_policy"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=400)
+
+
+class BudgetExceededError(UpstreamError):
+    """A request would exceed an external-provider usage ceiling."""
+
+    error_type = "budget_exceeded"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=429)
+
+
 class HomeMemberReloading(GatewayError):
     """The session's sticky member is cooling and too RECENTLY to fail over.
 
