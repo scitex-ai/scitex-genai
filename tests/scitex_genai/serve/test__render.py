@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from scitex_genai.serve._conf import EngineConf
+from scitex_genai.serve._conf import EngineConf, parse_engine_conf
 from scitex_genai.serve._render import CACHE_SUBDIRS, cache_dir, child_env, render
 from scitex_genai.serve._settings import ServeSettings
 
@@ -32,6 +32,22 @@ CONF = EngineConf(
     max_model_len=1048576,
     extra_vllm_args=("--enable-prefix-caching",),
     env={"CUDA_VISIBLE_DEVICES": "1"},
+)
+SGLANG_CONF = EngineConf(
+    key="model-sglang",
+    model_path=Path("/weights/model-a"),
+    served_name="model-a",
+    vllm_port=8769,
+    litellm_port=4004,
+    tunnel_port=18774,
+    max_model_len=1_000_000,
+    engine="sglang",
+    sglang_image=Path("/images/sglang.sif"),
+    tp=2,
+    gpu_mem_util=0.85,
+    max_num_seqs=8,
+    extra_sglang_args=("--kv-cache-dtype", "fp8_e4m3", "--enable-metrics"),
+    env={"CUDA_VISIBLE_DEVICES": "0,1"},
 )
 BASE_ENV = {
     "PATH": "/usr/bin",
@@ -128,6 +144,75 @@ def test_extra_vllm_args_come_before_the_bind():
 
     # Assert
     assert order[0] < order[1]
+
+
+def test_sglang_render_enables_session_cache_and_metrics():
+    # Arrange
+    launch = render(SETTINGS, SGLANG_CONF, BASE_ENV)
+
+    # Act
+    argv = launch.engine_argv
+    container_env = {argv[i + 1] for i, arg in enumerate(argv) if arg == "--env"}
+
+    # Assert
+    assert (
+        argv.count("--enable-session-radix-cache"),
+        argv.count("--enable-metrics"),
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1" in container_env,
+    ) == (1, 1, True)
+
+
+def test_sglang_preflight_validates_the_exact_required_capabilities():
+    # Arrange
+    launch = render(SETTINGS, SGLANG_CONF, BASE_ENV)
+
+    # Act
+    argv = launch.engine_preflight_argv or ()
+    script = argv[argv.index("-c") + 1]
+
+    # Assert
+    assert (
+        bool(argv),
+        "enable_session_radix_cache" in script,
+        "enable_metrics" in script,
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE" in script,
+    ) == (True, True, True, True)
+
+
+def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
+    # Arrange
+    conf = SGLANG_CONF
+
+    # Act
+    argv = render(SETTINGS, conf, BASE_ENV).engine_argv
+
+    # Assert
+    assert (
+        argv[:4],
+        argv[argv.index("--bind") + 1],
+        "/images/sglang.sif" in argv,
+    ) == (
+        ("/usr/bin/apptainer", "exec", "--nv", "--cleanenv"),
+        "/weights/model-a:/weights/model-a:ro",
+        True,
+    )
+
+
+def test_canonical_qwen_profile_renders_session_cache_and_metrics():
+    # Arrange
+    root = Path(__file__).parents[3]
+    text = (root / "examples/serve/qwen38-27b-sglang.conf").read_text()
+    conf = parse_engine_conf("qwen38-27b-sglang", text)
+
+    # Act
+    launch = render(SETTINGS, conf, BASE_ENV)
+
+    # Assert
+    assert (
+        launch.engine_argv.count("--enable-session-radix-cache"),
+        launch.engine_argv.count("--enable-metrics"),
+        launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
+    ) == (1, 1, "1")
 
 
 def test_litellm_config_names_the_engine_then_the_wildcard():

@@ -78,7 +78,7 @@ class EngineRunner:
             parents=True, exist_ok=True
         )
         for log_path in (
-            self.launch.vllm_log,
+            self.launch.engine_log,
             self.launch.litellm_log,
             self.launch.tunnel_log,
         ):
@@ -87,6 +87,18 @@ class EngineRunner:
         Path(self.launch.litellm_config_path).write_text(
             self.launch.litellm_config_text
         )
+        if self.launch.engine_preflight_argv is not None:
+            proc = self._spawn(
+                self.launch.engine_preflight_argv,
+                self.launch.engine_log,
+                self.launch.env,
+            )
+            rc = proc.wait()
+            if rc != 0:
+                raise RuntimeError(
+                    "SGLang image capability validation failed; refusing to start "
+                    f"{self.launch.key} (rc={rc}; see {self.launch.engine_log})"
+                )
 
     # -- the three loops -----------------------------------------------------
     def _spawn(self, argv: tuple[str, ...], log_path: Path, env: dict[str, str]) -> Any:
@@ -156,9 +168,11 @@ class EngineRunner:
         """Start the engine, wait for it, open the tunnel on first health, hold until it exits."""
         self.engine_starts += 1
         self._append(
-            self.launch.vllm_log, f"[{_stamp()}] starting engine {self.launch.key}"
+            self.launch.engine_log, f"[{_stamp()}] starting engine {self.launch.key}"
         )
-        proc = self._spawn(self.launch.vllm_argv, self.launch.vllm_log, self.launch.env)
+        proc = self._spawn(
+            self.launch.engine_argv, self.launch.engine_log, self.launch.env
+        )
         readiness = wait_ready(
             self.launch.health_url,
             process_alive=lambda: proc.poll() is None,
@@ -181,7 +195,7 @@ class EngineRunner:
             self._log(f"[serve] engine {self.launch.key} not ready: {readiness.reason}")
         proc.wait()
         self._append(
-            self.launch.vllm_log,
+            self.launch.engine_log,
             f"[{_stamp()}] engine exited; restart {self.engine_restart_s:.0f}s",
         )
         return readiness

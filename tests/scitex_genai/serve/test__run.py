@@ -74,6 +74,31 @@ def _launch(tmp_path: Path):
     )
 
 
+def _sglang_launch(tmp_path: Path):
+    settings = ServeSettings(
+        base=tmp_path / "base",
+        logs=tmp_path / "logs",
+        cache_root=tmp_path / "cache",
+        vllm_bin=tmp_path / "venv" / "bin" / "vllm",
+        litellm_bin=tmp_path / "venv" / "bin" / "litellm",
+        bastion="bastion.example.org",
+        bastion_user="me",
+        litellm_master_key="sk-local",
+    )
+    conf = EngineConf(
+        key="model-sglang",
+        model_path=tmp_path / "weights",
+        served_name="model-sglang",
+        vllm_port=8768,
+        litellm_port=4003,
+        tunnel_port=18773,
+        max_model_len=1024,
+        engine="sglang",
+        sglang_image=tmp_path / "sglang.sif",
+    )
+    return render(settings, conf, {"PATH": "/usr/bin"})
+
+
 def _runner(
     tmp_path: Path,
     spawner: _Spawner,
@@ -129,6 +154,38 @@ def test_prepare_creates_every_cache_directory(tmp_path: Path):
         Path(launch.env[name]).is_dir()
         for name in ("HF_HOME", "VLLM_CACHE_ROOT", "FLASHINFER_WORKSPACE_BASE")
     )
+
+
+def test_prepare_runs_sglang_capability_preflight(tmp_path: Path):
+    # Arrange
+    spawner = _Spawner()
+    launch = _sglang_launch(tmp_path)
+
+    # Act
+    EngineRunner(launch, popen=spawner).prepare()
+
+    # Assert
+    assert spawner.calls[0][0] == list(launch.engine_preflight_argv)
+
+
+def test_prepare_refuses_an_incompatible_sglang_image(tmp_path: Path):
+    # Arrange
+    class FailingSpawner:
+        def __call__(self, argv, stdout, stderr, env):
+            return _Proc(0, rc=1)
+
+    runner = EngineRunner(_sglang_launch(tmp_path), popen=FailingSpawner())
+
+    # Act
+    try:
+        runner.prepare()
+    except RuntimeError as exc:
+        error = str(exc)
+    else:
+        error = ""
+
+    # Assert
+    assert "capability validation failed; refusing to start" in error
 
 
 def test_run_once_is_ready_when_health_answers(tmp_path: Path):

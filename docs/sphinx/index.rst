@@ -43,6 +43,7 @@ on attribute access — import paths are stable as features land.
 
    installation
    quickstart
+   serving
 
 .. toctree::
    :maxdepth: 2

@@ -43,12 +43,21 @@ from scitex_config import get_scitex_dir, parse_src_file
 REQUIRED = (
     "MODEL_PATH",
     "SERVED_NAME",
-    "VLLM_PORT",
     "LITELLM_PORT",
     "TUNNEL_PORT",
     "MAX_MODEL_LEN",
 )
-KNOWN = REQUIRED + ("TP", "GPU_MEM_UTIL", "MAX_NUM_SEQS", "EXTRA_VLLM_ARGS")
+KNOWN = REQUIRED + (
+    "ENGINE",
+    "ENGINE_PORT",
+    "VLLM_PORT",
+    "SGLANG_IMAGE",
+    "TP",
+    "GPU_MEM_UTIL",
+    "MAX_NUM_SEQS",
+    "EXTRA_VLLM_ARGS",
+    "EXTRA_SGLANG_ARGS",
+)
 CONF_SUFFIX = ".conf"
 _REF = re.compile(
     r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
@@ -108,10 +117,13 @@ class EngineConf:
     litellm_port: int
     tunnel_port: int
     max_model_len: int
+    engine: str = "vllm"
+    sglang_image: Path | None = None
     tp: int = 1
     gpu_mem_util: float = 0.92
     max_num_seqs: int = 8
     extra_vllm_args: tuple[str, ...] = ()
+    extra_sglang_args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     source: Path | None = None
 
@@ -123,6 +135,27 @@ class EngineConf:
         if not Path(self.model_path).is_absolute():
             raise ValueError(
                 f"MODEL_PATH must be absolute, got {str(self.model_path)!r}"
+            )
+        if self.engine not in {"vllm", "sglang"}:
+            raise ValueError(f"ENGINE must be vllm or sglang, got {self.engine!r}")
+        if self.engine == "sglang" and self.sglang_image is None:
+            raise ValueError("SGLANG_IMAGE is required when ENGINE=sglang")
+        if self.sglang_image is not None and not Path(self.sglang_image).is_absolute():
+            raise ValueError(
+                f"SGLANG_IMAGE must be absolute, got {str(self.sglang_image)!r}"
+            )
+        if (
+            self.engine == "sglang"
+            and "--disable-radix-cache" in self.extra_sglang_args
+        ):
+            raise ValueError(
+                "--disable-radix-cache conflicts with session-aware radix caching"
+            )
+        unified = self.env.get("SGLANG_ENABLE_UNIFIED_RADIX_TREE")
+        if self.engine == "sglang" and unified not in (None, "1"):
+            raise ValueError(
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE must be 1 for session-aware "
+                f"radix caching, got {unified!r}"
             )
         ports = {
             "VLLM_PORT": _port("VLLM_PORT", self.vllm_port),
@@ -141,6 +174,11 @@ class EngineConf:
             raise ValueError(f"MAX_MODEL_LEN must be >= 1, got {self.max_model_len}")
         if self.max_num_seqs < 1:
             raise ValueError(f"MAX_NUM_SEQS must be >= 1, got {self.max_num_seqs}")
+
+    @property
+    def engine_port(self) -> int:
+        """Engine listen port; ``vllm_port`` remains the compatible field name."""
+        return self.vllm_port
 
 
 def _values(text: str, source: Path | None) -> dict[str, str]:
@@ -173,6 +211,8 @@ def parse_engine_conf(
     expanded = "\n".join(expand(line, env) for line in text.splitlines())
     values = _values(expanded, None)
     missing = [name for name in REQUIRED if not values.get(name)]
+    if not (values.get("ENGINE_PORT") or values.get("VLLM_PORT")):
+        missing.append("ENGINE_PORT (or legacy VLLM_PORT)")
     if missing:
         where = str(source) if source is not None else f"{key}{CONF_SUFFIX}"
         raise ValueError(f"{where}: unset: {', '.join(missing)}")
@@ -186,14 +226,21 @@ def parse_engine_conf(
         key=key,
         model_path=Path(values["MODEL_PATH"]),
         served_name=values["SERVED_NAME"],
-        vllm_port=_port("VLLM_PORT", values["VLLM_PORT"]),
+        vllm_port=_port(
+            "ENGINE_PORT", values.get("ENGINE_PORT") or values["VLLM_PORT"]
+        ),
         litellm_port=_port("LITELLM_PORT", values["LITELLM_PORT"]),
         tunnel_port=_port("TUNNEL_PORT", values["TUNNEL_PORT"]),
         max_model_len=int(values["MAX_MODEL_LEN"]),
+        engine=(values.get("ENGINE") or "vllm").lower(),
+        sglang_image=(
+            Path(values["SGLANG_IMAGE"]) if values.get("SGLANG_IMAGE") else None
+        ),
         tp=int(values.get("TP") or 1),
         gpu_mem_util=float(values.get("GPU_MEM_UTIL") or 0.92),
         max_num_seqs=int(values.get("MAX_NUM_SEQS") or 8),
         extra_vllm_args=tuple(shlex.split(values.get("EXTRA_VLLM_ARGS") or "")),
+        extra_sglang_args=tuple(shlex.split(values.get("EXTRA_SGLANG_ARGS") or "")),
         env=env,
         source=source,
     )
