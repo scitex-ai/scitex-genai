@@ -300,9 +300,11 @@ class ExternalProviderBackend(InferenceBackend):
         input_tokens: int | None = None
         output_tokens: int | None = None
         reported_model = ""
+        is_stream = "text/event-stream" in content_type
+        model_mismatch = False
         try:
             async for chunk in body:
-                if "text/event-stream" in content_type:
+                if is_stream:
                     pending_line.extend(chunk)
                     while b"\n" in pending_line:
                         raw_line, _, remainder = pending_line.partition(b"\n")
@@ -327,31 +329,41 @@ class ExternalProviderBackend(InferenceBackend):
                             reported_model = seen_model
                     if len(pending_line) > _MAX_AUDIT_BUFFER:
                         pending_line.clear()
-                elif len(captured) < _MAX_AUDIT_BUFFER:
-                    captured.extend(chunk[: _MAX_AUDIT_BUFFER - len(captured)])
-                yield chunk
-        finally:
-            candidates: list[Any] = []
-            raw = bytes(captured)
-            if "text/event-stream" not in content_type:
+                    if reported_model and reported_model != self.policy.canonical_model:
+                        model_mismatch = True
+                        raise ModelPolicyError(
+                            "Provider reported a model outside the outbound policy: "
+                            f"{reported_model!r}"
+                        )
+                    yield chunk
+                else:
+                    if len(captured) + len(chunk) > _MAX_AUDIT_BUFFER:
+                        raise ModelPolicyError(
+                            "Provider response exceeded the effective-model audit limit"
+                        )
+                    captured.extend(chunk)
+            if not is_stream:
                 try:
-                    candidates.append(json.loads(raw))
+                    candidate = json.loads(bytes(captured))
                 except ValueError:
-                    pass
-            for candidate in candidates:
-                seen_input, seen_output, seen_model = _usage_from_payload(candidate)
-                if seen_input is not None:
-                    input_tokens = seen_input
-                if seen_output is not None:
-                    output_tokens = seen_output
-                if seen_model:
-                    reported_model = seen_model
+                    candidate = None
+                input_tokens, output_tokens, reported_model = _usage_from_payload(
+                    candidate
+                )
+                if reported_model and reported_model != self.policy.canonical_model:
+                    model_mismatch = True
+                    raise ModelPolicyError(
+                        "Provider reported a model outside the outbound policy: "
+                        f"{reported_model!r}"
+                    )
+                yield bytes(captured)
+        finally:
             await self.usage.settle(
                 run_key,
                 reserved_input=reserved_input,
                 reserved_output=reserved_output,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
+                input_tokens=None if model_mismatch else input_tokens,
+                output_tokens=None if model_mismatch else output_tokens,
                 reported_model=reported_model,
             )
             self._note(

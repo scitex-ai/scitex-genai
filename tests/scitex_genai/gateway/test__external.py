@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from scitex_genai.gateway._errors import ModelPolicyError
 from scitex_genai.gateway._external import (
     ExternalProviderBackend,
     ExternalProviderPolicy,
@@ -143,7 +144,7 @@ async def test_usage_and_response_reported_model_are_audited_without_payload(
     # Arrange
     upstream = upstream_factory(
         chunks=(
-            b'{"model":"unexpected-provider-label","usage":'
+            b'{"model":"deepseek-flash","usage":'
             b'{"prompt_tokens":7,"completion_tokens":3},"choices":[]}',
         )
     )
@@ -169,7 +170,40 @@ async def test_usage_and_response_reported_model_are_audited_without_payload(
         health["usage"]["estimated_cost_usd"],
         "secret prompt" in json.dumps(health),
         "private" in json.dumps(health),
-    ) == (200, "unexpected-provider-label", 7, 3, 1, 0.0000013, False, False)
+    ) == (200, "deepseek-flash", 7, 3, 0, 0.0000013, False, False)
+
+
+@pytest.mark.asyncio
+async def test_reported_non_flash_model_fails_response_and_is_billed(upstream_factory):
+    # Arrange
+    upstream = upstream_factory(
+        chunks=(
+            b'{"model":"deepseek-v4-pro","usage":'
+            b'{"prompt_tokens":7,"completion_tokens":3},"choices":[]}',
+        )
+    )
+    backend = _backend(upstream)
+    relayed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=json.dumps(_body()).encode(),
+        headers={"x-scitex-run-id": "run"},
+    )
+    raised: BaseException | None = None
+    # Act
+    try:
+        _ = b"".join([chunk async for chunk in relayed.body])
+    except ModelPolicyError as exc:  # stx-allow: test-capture (reason: effective-model failure and post-failure billing share one proof.)
+        raised = exc
+    health = backend.health_status()
+    # Assert
+    assert (
+        isinstance(raised, ModelPolicyError),
+        health["last_reported_model"],
+        health["usage"]["input_tokens"] > 7,
+        health["usage"]["output_tokens"],
+        health["usage"]["reported_model_mismatches"],
+    ) == (True, "deepseek-v4-pro", True, 20, 1)
 
 
 @pytest.mark.asyncio
@@ -372,7 +406,7 @@ async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
     upstream = upstream_factory(
         content_type="text/event-stream",
         chunks=(
-            b'data: {"type":"message_start","message":{"model":"deepseek-v4.1-flash","usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+            b'data: {"type":"message_start","message":{"model":"deepseek-flash","usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
             b'data: {"type":"message_delta","usage":{"output_tokens":5}}\n\n',
         ),
     )
@@ -395,4 +429,4 @@ async def test_anthropic_stream_audits_nested_reported_model(upstream_factory):
         backend.usage.total.input_tokens,
         backend.usage.total.output_tokens,
         backend.usage.total.reported_model_mismatches,
-    ) == (200, "/anthropic/v1/messages", "deepseek-v4.1-flash", 8, 5, 1)
+    ) == (200, "/anthropic/v1/messages", "deepseek-flash", 8, 5, 0)

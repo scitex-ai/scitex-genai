@@ -109,12 +109,16 @@ class ExternalUsageLedger:
         *,
         reserved_input: int,
         reserved_output: int,
-        input_tokens: int | None,
-        output_tokens: int | None,
+        input_tokens: object,
+        output_tokens: object,
         reported_model: str,
     ) -> None:
         async with self._lock:
             counters = self.runs[run_key]
+            input_valid = type(input_tokens) is int and input_tokens >= 0
+            output_valid = type(output_tokens) is int and output_tokens >= 0
+            input_value = int(input_tokens) if input_valid else reserved_input
+            output_value = int(output_tokens) if output_valid else reserved_output
             counters.reserved_input_tokens = max(
                 0, counters.reserved_input_tokens - reserved_input
             )
@@ -127,22 +131,10 @@ class ExternalUsageLedger:
             self.total.reserved_output_tokens = max(
                 0, self.total.reserved_output_tokens - reserved_output
             )
-            if input_tokens is None or output_tokens is None:
-                input_value = (
-                    reserved_input
-                    if input_tokens is None
-                    else max(0, int(input_tokens))
-                )
-                output_value = (
-                    reserved_output
-                    if output_tokens is None
-                    else max(0, int(output_tokens))
-                )
+            if not input_valid or not output_valid:
                 counters.responses_without_usage += 1
                 self.total.responses_without_usage += 1
             else:
-                input_value = max(0, int(input_tokens))
-                output_value = max(0, int(output_tokens))
                 counters.responses_with_usage += 1
                 self.total.responses_with_usage += 1
             counters.input_tokens += input_value

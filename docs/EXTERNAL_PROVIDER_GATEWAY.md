@@ -69,11 +69,14 @@ bearer token is attached to the outbound request.
 `GET /health` reports payload-free counters: request and token totals,
 estimated cost, runs observed, the last model label reported by the provider,
 and response-model mismatches. No prompt, completion, raw run ID, or credential
-is retained. Streaming requests force provider usage reporting when the
-OpenAI-compatible route supports it; missing usage is conservatively charged
-as the full reservation independently for each missing token dimension. A
-partial stream that reports input usage but omits its final output usage cannot
-release the reserved output or cost budget.
+is retained. A provider-reported model other than the canonical Flash model is
+counted, billed, and fails the response; it is never presented as a successful
+Flash result. Streaming requests force provider usage reporting when the
+OpenAI-compatible route supports it. Missing, negative, boolean, non-integral,
+or otherwise malformed usage is conservatively charged as the full reservation
+independently for each invalid token dimension. A partial stream that reports
+valid input usage but omits its final output usage cannot release the reserved
+output or cost budget.
 
 The relay uses the endpoint's native output-limit field: `max_output_tokens`
 for `/v1/responses`, `max_completion_tokens` when explicitly used on chat
