@@ -19,6 +19,7 @@ Create a scenario manifest (keep large prompt bodies out of Git):
     {
       "id": "scholar-cold",
       "arrival_ms": 0,
+      "cache_state": "cold",
       "expected_prompt_tokens": 740000,
       "body": {"model": "qwen", "messages": [], "stream": true,
                "stream_options": {"include_usage": true}, "seed": 42,
@@ -27,6 +28,7 @@ Create a scenario manifest (keep large prompt bodies out of Git):
     {
       "id": "hub-warm",
       "arrival_ms": 1000,
+      "cache_state": "warm",
       "expected_prompt_tokens": 425000,
       "body": {"model": "qwen", "messages": [], "stream": true,
                "stream_options": {"include_usage": true}, "seed": 42,
@@ -38,7 +40,9 @@ Create a scenario manifest (keep large prompt bodies out of Git):
 
 Populate `messages` with the already-tokenized-and-verified A/B corpus and use
 the identical file for every configuration. The command fails if reported
-prompt tokens differ from `expected_prompt_tokens`.
+prompt tokens differ from `expected_prompt_tokens`. Every request in a
+multi-request replay must declare `cache_state` explicitly. Two requests whose
+state is `cold` or `unknown` are conservatively treated as a crash probe.
 
 Run only against an isolated canary:
 
@@ -55,3 +59,24 @@ Set `SCITEX_SGLANG_BENCHMARK_API_KEY` only if the canary requires a bearer
 token. Rows remain in declared arrival order even when requests finish in a
 different order. Vendor telemetry found in SSE `usage`, `meta_info`, cache,
 and scheduler fields is retained; generated text is intentionally omitted.
+
+## Cold + cold is a crash probe
+
+Two concurrent cold long-context requests can exhaust or destabilize an
+engine. Such a manifest must label every relevant request with
+`"cache_state": "cold"`, declare `"risk_class": "crash-probe"` and
+`"target_scope": "dedicated-canary"`, and the command requires both safety
+acknowledgements:
+
+```bash
+scitex-genai-sglang-ab \
+  --scenario /secure/replays/cold-cold.json \
+  --endpoint http://DEDICATED_CANARY/v1/chat/completions \
+  --run-id cold-cold-r01 \
+  --i-understand-this-sends-load-to-an-isolated-canary \
+  --i-understand-this-may-crash-the-isolated-canary
+```
+
+Never point a crash probe at production. The loader rejects an unmarked
+cold+cold scenario, and the runner rejects a marked one without the second
+acknowledgement.

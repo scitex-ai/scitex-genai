@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 ACK_FLAG = "--i-understand-this-sends-load-to-an-isolated-canary"
+CRASH_PROBE_ACK_FLAG = "--i-understand-this-may-crash-the-isolated-canary"
 _CACHE_KEYS = {
     "cached_tokens",
     "cache_hit_tokens",
@@ -53,10 +54,9 @@ _SCHEDULER_KEYS = {
 }
 
 
-def load_scenario(path: Path) -> dict[str, Any]:
-    """Load and strictly validate a version-one replay manifest."""
-    data = json.loads(path.read_text())
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+def _validate_scenario(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Strictly validate a version-one replay manifest, including safety metadata."""
+    if not isinstance(data, Mapping) or data.get("schema_version") != 1:
         raise ValueError("scenario schema_version must be 1")
     if not isinstance(data.get("name"), str) or not data["name"].strip():
         raise ValueError("scenario name must be a non-empty string")
@@ -94,7 +94,36 @@ def load_scenario(path: Path) -> dict[str, Any]:
             raise ValueError(
                 f"request {label} seed must equal scenario seed {data['seed']}"
             )
+        cache_state = request.get("cache_state")
+        if len(requests) > 1 and cache_state is None:
+            raise ValueError(
+                f"request {label} cache_state is required for multi-request replay"
+            )
+        cache_state = cache_state or "unknown"
+        if cache_state not in {"cold", "warm", "unknown"}:
+            raise ValueError(
+                f"request {label} cache_state must be cold, warm, or unknown"
+            )
+    potentially_cold_requests = sum(
+        request.get("cache_state", "unknown") != "warm" for request in requests
+    )
+    risk_class = data.get("risk_class", "standard")
+    if risk_class not in {"standard", "crash-probe"}:
+        raise ValueError("scenario risk_class must be standard or crash-probe")
+    if potentially_cold_requests >= 2 and risk_class != "crash-probe":
+        raise ValueError(
+            "two potentially cold requests (cache_state cold or unknown) require "
+            "risk_class crash-probe"
+        )
+    if risk_class == "crash-probe" and data.get("target_scope") != "dedicated-canary":
+        raise ValueError("a crash-probe requires target_scope dedicated-canary")
     return data
+
+
+def load_scenario(path: Path) -> dict[str, Any]:
+    """Load and strictly validate a version-one replay manifest."""
+    data = json.loads(path.read_text())
+    return dict(_validate_scenario(data))
 
 
 def _request_id(run_id: str, index: int, label: str) -> str:
@@ -214,7 +243,9 @@ async def _run_request(
     )
     tpot = (
         generation_s / (output_tokens - 1)
-        if generation_s is not None and isinstance(output_tokens, int) and output_tokens > 1
+        if generation_s is not None
+        and isinstance(output_tokens, int)
+        and output_tokens > 1
         else None
     )
     result = {
@@ -265,15 +296,21 @@ async def run_scenario(
     *,
     endpoint: str,
     acknowledge_isolated_canary: bool,
+    acknowledge_crash_probe: bool = False,
     run_id: str,
     client: Any | None = None,
     timeout_s: float = 1800.0,
 ) -> list[dict[str, Any]]:
     """Run one fixed replay, returning results in declared arrival order."""
+    scenario = _validate_scenario(scenario)
     if not endpoint or not endpoint.startswith(("http://", "https://")):
         raise ValueError("an explicit http(s) endpoint is required")
     if not acknowledge_isolated_canary:
         raise PermissionError(f"refusing to send load without {ACK_FLAG}")
+    if scenario.get("risk_class") == "crash-probe" and not acknowledge_crash_probe:
+        raise PermissionError(
+            f"refusing crash-probe load without {CRASH_PROBE_ACK_FLAG}"
+        )
     try:
         import httpx
     except ImportError as exc:
@@ -320,6 +357,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, help="JSONL path (default: stdout)")
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument(ACK_FLAG, action="store_true", dest="acknowledge")
+    parser.add_argument(
+        CRASH_PROBE_ACK_FLAG, action="store_true", dest="acknowledge_crash_probe"
+    )
     return parser
 
 
@@ -332,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                 scenario,
                 endpoint=args.endpoint,
                 acknowledge_isolated_canary=args.acknowledge,
+                acknowledge_crash_probe=args.acknowledge_crash_probe,
                 run_id=args.run_id,
                 timeout_s=args.timeout,
             )
@@ -344,7 +385,9 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(lines)
     else:
         sys.stdout.write(lines)
-    return int(any(row["error"] or row["prompt_tokens_match"] is False for row in results))
+    return int(
+        any(row["error"] or row["prompt_tokens_match"] is False for row in results)
+    )
 
 
 def _jsonl(results: list[Mapping[str, Any]]) -> str:
