@@ -311,6 +311,55 @@ def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
     )
 
 
+def test_file_hicache_storage_is_bound_read_write_into_apptainer():
+    # Arrange
+    storage = "/scratch/hicache/model-build-tp2"
+    conf = EngineConf(
+        **{
+            **SGLANG_CONF.__dict__,
+            "extra_sglang_args": (
+                *SGLANG_CONF.extra_sglang_args,
+                "--enable-hierarchical-cache",
+                "--hicache-size",
+                "32",
+                "--hicache-io-backend",
+                "kernel",
+                "--hicache-mem-layout",
+                "page_first",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-backend",
+                "file",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--hicache-storage-backend-extra-config",
+                '{"max_size":"32G","min_free_space":"100G","eviction_ratio":0.9}',
+                "--page-size",
+                "64",
+            ),
+            "env": {
+                **SGLANG_CONF.env,
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": storage,
+            },
+        }
+    )
+
+    # Act
+    launch = render(SETTINGS, conf, BASE_ENV)
+    binds = {
+        launch.engine_argv[index + 1]
+        for index, arg in enumerate(launch.engine_argv)
+        if arg == "--bind"
+    }
+
+    # Assert
+    assert binds == {
+        "/weights/model-a:/weights/model-a:ro",
+        f"{storage}:{storage}:rw",
+    }
+    assert launch.writable_dirs == (Path(storage),)
+
+
 def test_canary_inherits_slurm_cuda_visibility_into_the_container():
     # Arrange
     root = Path(__file__).parents[3]
