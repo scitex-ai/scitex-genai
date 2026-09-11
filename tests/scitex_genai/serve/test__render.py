@@ -176,7 +176,8 @@ def test_sglang_preflight_validates_the_exact_required_capabilities():
         "enable_session_radix_cache" in script,
         "enable_metrics" in script,
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE" in script,
-    ) == (True, True, True, True)
+        "SCITEX_GENAI_EXPECTED_SGLANG_VERSION" in script,
+    ) == (True, True, True, True, True)
 
 
 def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
@@ -196,6 +197,21 @@ def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
         "/weights/model-a:/weights/model-a:ro",
         True,
     )
+
+
+def test_canary_inherits_slurm_cuda_visibility_into_the_container():
+    # Arrange
+    root = Path(__file__).parents[3]
+    path = root / "examples/serve/qwen38-27b-sglang-hicache-l2-canary.conf"
+    conf = parse_engine_conf(path.stem, path.read_text(), source=path)
+    env = {**BASE_ENV, "CUDA_VISIBLE_DEVICES": "3,4"}
+
+    # Act
+    argv = render(SETTINGS, conf, env).engine_argv
+    container_env = {argv[i + 1] for i, arg in enumerate(argv) if arg == "--env"}
+
+    # Assert
+    assert "CUDA_VISIBLE_DEVICES=3,4" in container_env
 
 
 def test_canonical_qwen_profile_renders_session_cache_and_metrics():
