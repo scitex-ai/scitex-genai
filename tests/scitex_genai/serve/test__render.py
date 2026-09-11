@@ -176,7 +176,8 @@ def test_sglang_preflight_validates_the_exact_required_capabilities():
         "enable_session_radix_cache" in script,
         "enable_metrics" in script,
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE" in script,
-    ) == (True, True, True, True)
+        "SCITEX_GENAI_EXPECTED_SGLANG_VERSION" in script,
+    ) == (True, True, True, True, True)
 
 
 def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():

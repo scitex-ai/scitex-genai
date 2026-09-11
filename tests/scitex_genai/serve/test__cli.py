@@ -59,6 +59,87 @@ def test_dry_run_exits_zero(tmp_path: Path):
     assert rc == 0
 
 
+def test_dry_run_can_inspect_canary_outside_slurm(tmp_path: Path):
+    # Arrange
+    config = tmp_path / "config.yaml"
+    config.write_text(SETTINGS.format(base=tmp_path / "base"))
+    root = Path(__file__).parents[3]
+    models = root / "examples/serve"
+
+    # Act
+    rc = main(
+        [
+            "qwen38-27b-sglang-hicache-l2-canary",
+            "--dry-run",
+            "--config",
+            str(config),
+            "--models-dir",
+            str(models),
+        ]
+    )
+
+    # Assert
+    assert rc == 0
+
+
+def test_real_canary_launch_refuses_a_non_slurm_process(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    # Arrange
+    config = tmp_path / "config.yaml"
+    config.write_text(SETTINGS.format(base=tmp_path / "base"))
+    root = Path(__file__).parents[3]
+    models = root / "examples/serve"
+
+    # Act
+    rc = main(
+        [
+            "qwen38-27b-sglang-hicache-l2-canary",
+            "--config",
+            str(config),
+            "--models-dir",
+            str(models),
+        ]
+    )
+
+    # Assert
+    assert (rc, "requires SLURM_JOB_ID" in capsys.readouterr().err) == (2, True)
+
+
+def test_canonical_l2_canary_dry_run_renders_hicache_without_starting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    # Arrange
+    config = tmp_path / "config.yaml"
+    config.write_text(SETTINGS.format(base=tmp_path / "base"))
+    root = Path(__file__).parents[3]
+    models = root / "examples/serve"
+
+    # Act
+    rc = main(
+        [
+            "qwen38-27b-sglang-hicache-l2-canary",
+            "--dry-run",
+            "--config",
+            str(config),
+            "--models-dir",
+            str(models),
+        ]
+    )
+    output = capsys.readouterr().out
+
+    # Assert
+    assert (
+        rc,
+        "--hicache-size 32" in output,
+        "--hicache-write-policy write_through" in output,
+    ) == (
+        0,
+        True,
+        True,
+    )
+
+
 def test_list_prints_the_keys(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     # Arrange
     argv = ["--list", *_site(tmp_path)]
@@ -150,6 +231,36 @@ def test_launch_refuses_an_unknown_key_naming_the_available(
 
     # Assert
     assert (rc, "available: model-a" in capsys.readouterr().err) == (2, True)
+
+
+def test_launch_refuses_to_book_a_lease_from_a_canary_runtime_profile(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    # Arrange
+    config = tmp_path / "config.yaml"
+    config.write_text(SETTINGS.format(base=tmp_path / "base"))
+    root = Path(__file__).parents[3]
+    models = root / "examples/serve"
+    argv = [
+        "launch",
+        "qwen38-27b-sglang-hicache-l2-canary",
+        "--lease",
+        "existing-canary",
+        "--host",
+        "hpc",
+        "--gpus",
+        "1",
+        "--config",
+        str(config),
+        "--models-dir",
+        str(models),
+    ]
+
+    # Act
+    rc = main(argv)
+
+    # Assert
+    assert (rc, "srun --overlap" in capsys.readouterr().err) == (2, True)
 
 
 def test_launch_requires_a_lease_name(tmp_path: Path):

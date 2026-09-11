@@ -26,6 +26,7 @@ import shlex
 import sys
 from pathlib import Path
 
+from ._canary import validate_runtime, write_runtime_manifest
 from ._conf import list_engines, load_engine
 from ._launch import book_serve_lease, render_hold_body
 from ._render import Launch, render
@@ -131,6 +132,15 @@ def _launch_main(argv: list[str]) -> int:
     if args.dry_run:
         print(body, end="")
         return 0
+    canary_keys = [key for key in args.keys if load_engine(key, models_dir).canary_only]
+    if canary_keys:
+        joined = ", ".join(canary_keys)
+        print(
+            "scitex-genai-serve launch: canary-only profiles require a separately "
+            f"held matching lease ({joined}); enter it with srun --overlap",
+            file=sys.stderr,
+        )
+        return 2
     lease = book_serve_lease(
         args.keys,
         settings,
@@ -171,10 +181,21 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as exc:
         print(f"scitex-genai-serve: {exc}", file=sys.stderr)
         return 2
-    launch = render(settings, conf, dict(os.environ))
+    runtime_env = dict(os.environ)
+    manifest = None
+    if not args.dry_run:
+        try:
+            manifest = validate_runtime(conf, runtime_env)
+        except ValueError as exc:
+            print(f"scitex-genai-serve: {exc}", file=sys.stderr)
+            return 2
+    launch = render(settings, conf, runtime_env)
     if args.dry_run:
         print(describe(launch))
         return 0
+    if manifest is not None:
+        path = write_runtime_manifest(launch.cache_dir, manifest)
+        print(f"scitex-genai-serve: canary incarnation manifest -> {path}")
     EngineRunner(launch).run_forever()
     return 0
 
