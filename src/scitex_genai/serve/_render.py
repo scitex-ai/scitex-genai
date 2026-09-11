@@ -48,6 +48,7 @@ CACHE_SUBDIRS = {
 SGLANG_UNIFIED_RADIX_ENV = "SGLANG_ENABLE_UNIFIED_RADIX_TREE"
 SGLANG_SESSION_FLAG = "--enable-session-radix-cache"
 SGLANG_METRICS_FLAG = "--enable-metrics"
+SGLANG_HICACHE_STORAGE_ENV = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class Launch:
     litellm_log: Path
     tunnel_log: Path
     health_url: str
+    writable_dirs: tuple[Path, ...] = ()
 
     @property
     def vllm_argv(self) -> tuple[str, ...]:
@@ -166,6 +168,11 @@ def _sglang_container_prefix(
         if name in env
         for item in ("--env", f"{name}={env[name]}")
     )
+    writable_binds = tuple(
+        item
+        for path in _sglang_writable_dirs(conf, env)
+        for item in ("--bind", f"{path}:{path}:rw")
+    )
     return (
         str(settings.apptainer_bin),
         "exec",
@@ -173,9 +180,22 @@ def _sglang_container_prefix(
         "--cleanenv",
         "--bind",
         f"{conf.model_path}:{conf.model_path}:ro",
+        *writable_binds,
         *container_env,
         str(conf.sglang_image),
     )
+
+
+def _sglang_writable_dirs(
+    conf: EngineConf, env: dict[str, str]
+) -> tuple[Path, ...]:
+    """Host directories that an explicitly configured SGLang backend writes."""
+    if "--hicache-storage-backend" not in conf.extra_sglang_args:
+        return ()
+    index = conf.extra_sglang_args.index("--hicache-storage-backend") + 1
+    if conf.extra_sglang_args[index] != "file":
+        return ()
+    return (Path(env[SGLANG_HICACHE_STORAGE_ENV]),)
 
 
 def sglang_preflight_argv(
@@ -339,4 +359,5 @@ def render(
         litellm_log=logs / f"litellm-{conf.key}.log",
         tunnel_log=logs / f"tunnel-{conf.key}.log",
         health_url=f"http://{LOCAL}:{conf.vllm_port}/health",
+        writable_dirs=_sglang_writable_dirs(conf, env),
     )
