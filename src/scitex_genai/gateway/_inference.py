@@ -57,8 +57,8 @@ import hashlib
 import json
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ._admission import AdmissionController, CacheResidency
@@ -68,6 +68,12 @@ from ._errors import (
     NoAccountAvailable,
     UpstreamReloading,
     UpstreamUnreachable,
+)
+from ._health import (
+    DEFAULT_HEALTH_PROBE_TIMEOUT_S,
+    UpstreamReachability,
+    probe_upstream,
+    timed_out_reachability,
 )
 from ._pool import StickyPool
 
@@ -80,6 +86,8 @@ DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_CAPACITY_PER_UPSTREAM = 8
 DEFAULT_MAX_QUEUE_SIZE = 128
 DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM: int | None = None
+DEFAULT_HEALTH_CACHE_TTL_S = 1.0
+DEFAULT_HEALTH_FAILURE_THRESHOLD = 2
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
 #: are few (one per agent) and eviction only costs a prefix-cache miss, never
@@ -450,6 +458,8 @@ class InferenceUpstream:
     cooldown_until: float = 0.0
     #: When this upstream last went out of rotation (None = healthy).
     cooling_since: float | None = None
+    #: Incremented under the pool lock for race-safe health reconciliation.
+    cooldown_generation: int = 0
 
     @property
     def base_url(self) -> str:
@@ -667,6 +677,40 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         async with self._admission:
             self._admission.notify_all()
 
+    def _cooldown_changed(self, member: InferenceUpstream) -> None:
+        """Record the failure generation while ``StickyPool`` holds its lock."""
+        member.cooldown_generation += 1
+
+    async def cooldown_snapshot(self) -> list[tuple[InferenceUpstream, int]]:
+        """Capture the generation each reachability probe is about to test."""
+        async with self._lock:
+            return [
+                (upstream, upstream.cooldown_generation)
+                for upstream in self.upstreams
+            ]
+
+    async def reconcile_recovered(
+        self,
+        snapshot: list[tuple[InferenceUpstream, int]],
+        observations: list[UpstreamReachability],
+    ) -> None:
+        """Clear only a stale cooldown proven recovered by a current probe."""
+        async with self._admission:
+            changed = False
+            for (upstream, generation), observed in zip(
+                snapshot, observations, strict=True
+            ):
+                if (
+                    observed.reachable
+                    and upstream.cooldown_generation == generation
+                    and upstream.cooldown_until > time.time()
+                ):
+                    upstream.cooldown_until = 0.0
+                    upstream.cooling_since = None
+                    changed = True
+            if changed:
+                self._admission.notify_all()
+
     async def close(self) -> None:
         """Reject new work and wake every queued request during shutdown."""
         async with self._admission:
@@ -711,6 +755,8 @@ class InferenceBackend:
     """Hoist, key, pick an upstream, and relay the exchange verbatim."""
 
     provider = "inference-upstream"
+    active_health_probe = True
+    health_strategy = "local_control_plane"
 
     def __init__(
         self,
@@ -720,6 +766,11 @@ class InferenceBackend:
         telemetry_sink: Callable[[str], None] | None = None,
         wait_for_home_s: float = WAIT_FOR_HOME_S,
         journal: Callable[[str], None] | None = None,
+        health_probe_timeout_s: float = DEFAULT_HEALTH_PROBE_TIMEOUT_S,
+        health_probe: Callable[[str, float], Awaitable[UpstreamReachability]]
+        | None = None,
+        health_cache_ttl_s: float = DEFAULT_HEALTH_CACHE_TTL_S,
+        health_failure_threshold: int = DEFAULT_HEALTH_FAILURE_THRESHOLD,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -732,10 +783,89 @@ class InferenceBackend:
         # ``None`` means the prefix telemetry is off. The library never picks
         # an output on its own; the CLI hands in stdout when the env asks.
         self.telemetry_sink = telemetry_sink
+        if health_probe_timeout_s <= 0:
+            raise ValueError("health_probe_timeout_s must be > 0")
+        if health_cache_ttl_s < 0:
+            raise ValueError("health_cache_ttl_s must be >= 0")
+        if health_failure_threshold < 1:
+            raise ValueError("health_failure_threshold must be >= 1")
+        self.health_probe_timeout_s = health_probe_timeout_s
+        self._health_probe = health_probe
+        self.health_cache_ttl_s = health_cache_ttl_s
+        self.health_failure_threshold = health_failure_threshold
+        self._health_probe_lock = asyncio.Lock()
+        self._health_probe_task: asyncio.Task[list[UpstreamReachability]] | None = None
+        self._health_cache: tuple[float, list[UpstreamReachability]] | None = None
+        self._health_failures = {
+            upstream.alias: 0 for upstream in self.pool.upstreams
+        }
         # SAC/Hermes currently supplies stable identity but no authoritative
         # pre-admission cache-residency result. Record UNKNOWN observations;
         # do not activate cache-priority scheduling from prompt size or history.
         self.cache_admission = AdmissionController()
+
+    async def probe_upstreams(self) -> list[UpstreamReachability]:
+        """Return one coalesced, briefly cached local-control-plane observation."""
+
+        async with self._health_probe_lock:
+            now = time.monotonic()
+            if self._health_cache is not None and self._health_cache[0] > now:
+                return self._health_cache[1]
+            if self._health_probe_task is None:
+                self._health_probe_task = asyncio.create_task(self._probe_upstreams_fresh())
+            task = self._health_probe_task
+        try:
+            observations = await asyncio.shield(task)
+        finally:
+            async with self._health_probe_lock:
+                if self._health_probe_task is task and task.done():
+                    if not task.cancelled() and task.exception() is None:
+                        self._health_cache = (
+                            time.monotonic() + self.health_cache_ttl_s,
+                            task.result(),
+                        )
+                    self._health_probe_task = None
+        return observations
+
+    async def _probe_upstreams_fresh(self) -> list[UpstreamReachability]:
+        """Run one bounded probe generation and reconcile authoritative success."""
+
+        async def run(url: str) -> UpstreamReachability:
+            started = time.monotonic()
+            try:
+                async with asyncio.timeout(self.health_probe_timeout_s):
+                    if self._health_probe is not None:
+                        return await self._health_probe(
+                            url, self.health_probe_timeout_s
+                        )
+                    return await probe_upstream(
+                        url, timeout_s=self.health_probe_timeout_s
+                    )
+            except TimeoutError:
+                return timed_out_reachability(started, monotonic=time.monotonic)
+
+        snapshot = await self.pool.cooldown_snapshot()
+        raw_observations = list(
+            await asyncio.gather(
+                *(run(upstream.base_url) for upstream in self.pool.upstreams)
+            )
+        )
+        await self.pool.reconcile_recovered(snapshot, raw_observations)
+        observations = []
+        for upstream, observed in zip(
+            self.pool.upstreams, raw_observations, strict=True
+        ):
+            failures = 0 if observed.reachable else self._health_failures[upstream.alias] + 1
+            self._health_failures[upstream.alias] = failures
+            ready = observed.reachable or failures < self.health_failure_threshold
+            observations.append(
+                replace(
+                    observed,
+                    ready=ready,
+                    consecutive_failures=failures,
+                )
+            )
+        return observations
 
     def _note(self, line: str) -> None:
         """One journal line. Never affects the request path (see prepare)."""
