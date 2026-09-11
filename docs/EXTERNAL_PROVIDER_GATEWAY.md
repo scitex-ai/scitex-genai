@@ -41,8 +41,8 @@ gateway:
     max_output_tokens_per_run: 200000
     max_total_tokens_per_run: 5200000
     max_estimated_usd_per_run: 1.0
-    input_usd_per_million_tokens: 0.0
-    output_usd_per_million_tokens: 0.0
+    input_usd_per_million_tokens: 1.0
+    output_usd_per_million_tokens: 1.0
 ```
 
 Set the two secrets only on their respective sides:
@@ -51,7 +51,9 @@ Set the two secrets only on their respective sides:
 - SAC resolves the normal SciTeX gateway token and injects that token into the
   container under a neutral name. It must not inject `DEEPSEEK_API_KEY`.
 
-The price fields are explicit deployment data because provider prices change.
+The `1.0` price rows above are an intentionally conservative example, not a
+claim about the current DeepSeek tariff. The price fields are explicit
+deployment data because provider prices change.
 A non-zero `max_estimated_usd_per_run` is meaningful only when both current
 price fields are configured. Input reservation uses request bytes plus a
 protocol allowance, rather than a chars-per-token guess, so it errs toward an

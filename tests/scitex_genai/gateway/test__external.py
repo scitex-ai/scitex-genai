@@ -235,6 +235,19 @@ async def test_cost_budget_rejects_before_upstream(upstream_factory):
     ) == (429, "budget_exceeded", [])
 
 
+def test_cost_ceiling_without_prices_is_refused():
+    # Arrange
+    values = {
+        "provider": "deepseek",
+        "upstream_api_key": "vendor-secret",
+        "max_estimated_usd_per_run": 1.0,
+    }
+    # Act
+    # Assert
+    with pytest.raises(ValueError, match="requires a non-zero"):
+        ExternalProviderPolicy(**values)
+
+
 @pytest.mark.asyncio
 async def test_stream_usage_is_collected_and_include_usage_is_forced(upstream_factory):
     # Arrange

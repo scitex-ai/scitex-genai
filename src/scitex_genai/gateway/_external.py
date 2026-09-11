@@ -111,6 +111,14 @@ class ExternalProviderPolicy:
             value = float(self.max_estimated_usd_per_run)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("max_estimated_usd_per_run must be finite and positive")
+            if not (
+                self.input_usd_per_million_tokens
+                or self.output_usd_per_million_tokens
+            ):
+                raise ValueError(
+                    "max_estimated_usd_per_run requires a non-zero input or "
+                    "output token price"
+                )
             object.__setattr__(self, "max_estimated_usd_per_run", value)
 
     @property
