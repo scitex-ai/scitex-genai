@@ -789,7 +789,8 @@ async def test_disconnect_before_retry_headers_aborts_replayed_first_turn(
 
     # Act
     disconnected.set()
-    cancelled = await _raised_async(cold)
+    disconnected_response = await cold
+    disconnected_body = await _collect(disconnected_response.body)
     request_paths = [request["path"] for request in upstream.requests]
     request_rids = [
         json.loads(request["body"])["rid"]
@@ -805,14 +806,14 @@ async def test_disconnect_before_retry_headers_aborts_replayed_first_turn(
     # Assert: both cold attempts were explicitly aborted, the retry received a
     # fresh rid, and the downstream disconnect cannot strand admission.
     assert (
-        isinstance(cancelled, asyncio.CancelledError),
+        (disconnected_response.status_code, disconnected_body),
         request_paths,
         len(set(request_rids)),
         abort_rids == [request_rids[1], request_rids[3]],
         pool.status()[0]["in_flight"],
         backend.continuation_qos.snapshot()["replay_safe_first_turns"],
     ) == (
-        True,
+        (499, b""),
         [
             "/v1/responses",
             "/v1/responses",

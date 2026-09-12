@@ -811,6 +811,16 @@ class RelayedResponse:
     feedback_headers: dict[str, str] = field(default_factory=dict)
 
 
+class _ClientDisconnected(Exception):
+    """Internal control flow for an observed downstream close before headers."""
+
+
+async def _empty_body() -> AsyncIterator[bytes]:
+    """A valid empty streaming body for a request whose client is already gone."""
+    if False:
+        yield b""
+
+
 @dataclass
 class _FirstTurnAttempt:
     """A replay-safe first turn currently waiting for response headers."""
@@ -1364,7 +1374,7 @@ class InferenceBackend:
                                 first_attempt.released.set_result(None)
                             response = await send_task
                         elif disconnect_task is not None and disconnect_task in done:
-                            raise asyncio.CancelledError
+                            raise _ClientDisconnected
                         else:
                             abort_ok = await self._abort_request(
                                 upstream, dispatch_request_id, headers=forwarded
@@ -1402,12 +1412,18 @@ class InferenceBackend:
                                 continue
                     else:
                         response = await client.send(request, stream=True)
-                except asyncio.CancelledError:
+                except (_ClientDisconnected, asyncio.CancelledError) as exc:
                     # Cancellation before a response body exists must not leak a
                     # capacity slot; streaming cancellation is handled by _drain.
+                    observed_disconnect = isinstance(exc, _ClientDisconnected)
+                    outcome = (
+                        "client_disconnected_before_response"
+                        if observed_disconnect
+                        else "relay_cancelled_before_response"
+                    )
                     self._note(
                         f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
-                        "client_disconnected_before_response "
+                        f"{outcome} "
                         f"after {time.monotonic() - started:.1f}s"
                     )
                     abort_ok = False
@@ -1471,6 +1487,13 @@ class InferenceBackend:
                             InferenceAdmissionError(
                                 "Preempted first-turn client disconnected"
                             )
+                        )
+                    if observed_disconnect:
+                        return RelayedResponse(
+                            status_code=499,
+                            content_type="application/json",
+                            body=_empty_body(),
+                            feedback_headers=feedback_headers,
                         )
                     raise
                 except httpx.TransportError as exc:
