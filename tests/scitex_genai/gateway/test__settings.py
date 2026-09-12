@@ -38,6 +38,9 @@ ENV_KEYS = (
     "SCITEX_GATEWAY_INFERENCE_CAPACITY_PER_UPSTREAM",
     "SCITEX_GATEWAY_INFERENCE_MAX_QUEUE_SIZE",
     "SCITEX_GATEWAY_INFERENCE_TOKEN_CAPACITY_PER_UPSTREAM",
+    "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_ENABLED",
+    "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_MAX_RETRIES",
+    "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_MIN_PREEMPT_TOKENS",
 )
 
 
@@ -94,6 +97,9 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         settings.inference_capacity_per_upstream,
         settings.inference_max_queue_size,
         settings.inference_token_capacity_per_upstream,
+        settings.inference_continuation_qos_enabled,
+        settings.inference_continuation_qos_max_retries,
+        settings.inference_continuation_qos_min_preempt_tokens,
     ) == (
         DEFAULT_HOST,
         DEFAULT_PORT,
@@ -103,9 +109,10 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         DEFAULT_CAPACITY_PER_UPSTREAM,
         DEFAULT_MAX_QUEUE_SIZE,
         None,
+        False,
+        1,
+        0,
     )
-
-
 def test_the_file_supplies_host_port_and_upstreams(tmp_path: Path, clean_env):
     # Arrange
     path = _write(tmp_path / "config.yaml", FULL)
@@ -261,6 +268,27 @@ def test_file_and_direct_values_resolve_token_capacity(tmp_path: Path, clean_env
     ) == (1_600_000, 1_700_000)
 
 
+def test_continuation_qos_is_opt_in_and_resolves_bounds(tmp_path: Path, clean_env):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  inference_continuation_qos_enabled: true\n"
+        "  inference_continuation_qos_max_retries: 2\n"
+        "  inference_continuation_qos_min_preempt_tokens: 400000\n",
+    )
+
+    # Act
+    settings = load_settings(path)
+
+    # Assert
+    assert (
+        settings.inference_continuation_qos_enabled,
+        settings.inference_continuation_qos_max_retries,
+        settings.inference_continuation_qos_min_preempt_tokens,
+    ) == (True, 2, 400_000)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -269,6 +297,8 @@ def test_file_and_direct_values_resolve_token_capacity(tmp_path: Path, clean_env
         ("inference_max_queue_size", -1),
         ("inference_max_queue_size", 1.5),
         ("inference_token_capacity_per_upstream", 0),
+        ("inference_continuation_qos_max_retries", -1),
+        ("inference_continuation_qos_min_preempt_tokens", -1),
     ],
 )
 def test_invalid_admission_bounds_are_refused(tmp_path: Path, clean_env, field, value):
