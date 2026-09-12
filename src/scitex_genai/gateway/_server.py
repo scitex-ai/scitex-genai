@@ -219,6 +219,7 @@ def create_app(
                     "active_members": sum(member["active"] for member in members),
                     "in_flight": sum(member["in_flight"] for member in members),
                     "queued": sum(member["queued"] for member in members),
+                    "draining": backend.pool.draining,
                     "cache_admission": backend.cache_admission.snapshot(),
                     "continuation_qos": backend.continuation_qos.snapshot(),
                     "external": backend.health_status(),
@@ -248,8 +249,11 @@ def create_app(
             admission_eligible_members = sum(
                 member["admission_eligible"] for member in members
             )
+            draining = backend.pool.draining
             status = {
-                "status": "ok" if active_members else "degraded",
+                "status": (
+                    "draining" if draining else ("ok" if active_members else "degraded")
+                ),
                 "provider": backend.provider,
                 "health_strategy": backend.health_strategy,
                 "upstreams": [
@@ -264,10 +268,11 @@ def create_app(
                 "active_members": active_members,
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
+                "draining": draining,
                 "cache_admission": backend.cache_admission.snapshot(),
                 "continuation_qos": backend.continuation_qos.snapshot(),
             }
-            if not active_members:
+            if not active_members and not draining:
                 status["reason"] = (
                     "no_inference_upstream_reachable"
                     if not reachable_members
@@ -280,7 +285,11 @@ def create_app(
                 status["input_tokens_queued"] = sum(
                     member["input_tokens_queued"] for member in members
                 )
-            return status if active_members else JSONResponse(status, status_code=503)
+            return (
+                status
+                if active_members or draining
+                else JSONResponse(status, status_code=503)
+            )
         return {
             "status": "ok",
             "provider": "openai-codex",
@@ -364,6 +373,31 @@ def create_app(
         return app
 
     if relaying:
+
+        @app.post("/admin/drain")
+        async def begin_drain(request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            await backend.pool.close()
+            members = backend.pool.status()
+            return {
+                "draining": True,
+                "in_flight": sum(member["in_flight"] for member in members),
+                "queued": sum(member["queued"] for member in members),
+            }
+
+        @app.post("/admin/resume")
+        async def cancel_drain(request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            await backend.pool.resume()
+            return {"draining": False}
 
         async def relay(request: Request) -> Any:
             path = request.url.path

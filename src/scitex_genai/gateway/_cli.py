@@ -23,6 +23,12 @@ from pathlib import Path
 
 from ._accounts import CodexAccountPool
 from ._codex import CodexBackend, CodexTransport
+from ._drain import (
+    DEFAULT_DRAIN_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    DrainError,
+    restart_when_drained,
+)
 from ._errors import CredentialError
 from ._external import ExternalProviderBackend, ExternalProviderPolicy
 from ._inference import (
@@ -43,6 +49,7 @@ from ._settings import load_settings
 from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 
 INSTALL_UNIT = "install-unit"
+RESTART_UNIT = "restart-unit"
 
 
 def _add_settings_args(
@@ -179,6 +186,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the unit only; skip daemon-reload and enable --now",
     )
+    restart = commands.add_parser(
+        RESTART_UNIT,
+        help="close admission, wait until empty, then restart the systemd user unit",
+    )
+    restart.add_argument(
+        "--config",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="settings file used to derive the default loopback health URL",
+    )
+    restart.add_argument(
+        "--health-url",
+        default=None,
+        help="gateway health URL (default: http://127.0.0.1:<configured port>/health)",
+    )
+    restart.add_argument(
+        "--port",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="configured gateway port used to derive the default health URL",
+    )
+    restart.add_argument(
+        "--drain-timeout-s",
+        type=float,
+        default=DEFAULT_DRAIN_TIMEOUT_S,
+        help=f"maximum drain wait in seconds (default: {DEFAULT_DRAIN_TIMEOUT_S:g})",
+    )
+    restart.add_argument(
+        "--poll-interval-s",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL_S,
+        help=f"health polling interval in seconds (default: {DEFAULT_POLL_INTERVAL_S:g})",
+    )
     return parser
 
 
@@ -270,10 +310,27 @@ def main(
     argv: list[str] | None = None,
     *,
     server_runner: Callable[..., None] | None = None,
+    drain_runner: Callable[..., None] | None = None,
 ) -> None:
     args = build_parser().parse_args(argv)
     if args.command == INSTALL_UNIT:
         _install_unit(args)
+        return
+    if args.command == RESTART_UNIT:
+        settings = load_settings(
+            getattr(args, "config", None), port=getattr(args, "port", None)
+        )
+        health_url = args.health_url or f"http://127.0.0.1:{settings.port}/health"
+        key = resolve_gateway_key()
+        try:
+            (drain_runner or restart_when_drained)(
+                health_url=health_url,
+                api_key=key.value,
+                timeout_s=args.drain_timeout_s,
+                poll_interval_s=args.poll_interval_s,
+            )
+        except (DrainError, ValueError) as exc:
+            raise SystemExit(f"refusing to restart: {exc}") from exc
         return
     try:
         __import__("uvicorn")

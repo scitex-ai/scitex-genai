@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from scitex_genai.gateway._cli import INSTALL_UNIT, build_parser, main
+from scitex_genai.gateway._cli import INSTALL_UNIT, RESTART_UNIT, build_parser, main
 from scitex_genai.gateway._secrets import (
     GATEWAY_KEY_ENV,
     default_secrets_path,
@@ -76,6 +76,45 @@ def test_install_unit_is_recognised():
 
     # Assert
     assert args.command == INSTALL_UNIT
+
+
+def test_restart_unit_has_bounded_drain_controls():
+    # Arrange
+    parser = build_parser()
+    # Act
+    args = parser.parse_args(
+        [RESTART_UNIT, "--drain-timeout-s", "90", "--poll-interval-s", "0.5"]
+    )
+    # Assert
+    assert (args.command, args.drain_timeout_s, args.poll_interval_s) == (
+        RESTART_UNIT,
+        90.0,
+        0.5,
+    )
+
+
+def test_restart_unit_uses_configured_port_and_resolved_key(
+    tmp_path: Path, gateway_key_env
+):
+    # Arrange
+    gateway_key_env("test-key")
+    path = tmp_path / "config.yaml"
+    path.write_text("gateway:\n  port: 18772\n")
+    calls = []
+    # Act
+    main(
+        [RESTART_UNIT, "--config", str(path), "--drain-timeout-s", "123"],
+        drain_runner=lambda **kwargs: calls.append(kwargs),
+    )
+    # Assert
+    assert calls == [
+        {
+            "health_url": "http://127.0.0.1:18772/health",
+            "api_key": "test-key",
+            "timeout_s": 123.0,
+            "poll_interval_s": 2.0,
+        }
+    ]
 
 
 def test_install_unit_takes_the_settings_flags():

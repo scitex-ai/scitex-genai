@@ -777,6 +777,16 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             self._closing = True
             self._admission.notify_all()
 
+    async def resume(self) -> None:
+        """Reopen admission after an operator-aborted drain."""
+        async with self._admission:
+            self._closing = False
+            self._admission.notify_all()
+
+    @property
+    def draining(self) -> bool:
+        return self._closing
+
     def status(self) -> list[dict[str, Any]]:
         return [upstream.status(closing=self._closing) for upstream in self.upstreams]
 

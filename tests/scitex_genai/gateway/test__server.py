@@ -205,6 +205,69 @@ async def test_relay_app_serves_messages_from_the_upstream_pool(
 
 
 @pytest.mark.asyncio
+async def test_authenticated_drain_closes_admission_and_health_reports_it(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(chunks=(b"{}",))
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+
+    # Act
+    async with _serving(backend) as test_client:
+        denied = await test_client.post("/admin/drain")
+        drained = await test_client.post(
+            "/admin/drain", headers={"x-api-key": "relay-secret"}
+        )
+        health = await test_client.get("/health")
+        refused = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={"x-api-key": "relay-secret"},
+        )
+
+    # Assert
+    assert (
+        denied.status_code,
+        drained.json(),
+        health.status_code,
+        health.json()["status"],
+        health.json()["draining"],
+        refused.status_code,
+    ) == (
+        401,
+        {"draining": True, "in_flight": 0, "queued": 0},
+        200,
+        "draining",
+        True,
+        503,
+    )
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resume_reopens_admission(upstream_factory) -> None:
+    # Arrange
+    upstream = upstream_factory(chunks=(b"{}",))
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+
+    # Act
+    async with _serving(backend) as test_client:
+        await test_client.post(
+            "/admin/drain", headers={"x-api-key": "relay-secret"}
+        )
+        resumed = await test_client.post(
+            "/admin/resume", headers={"x-api-key": "relay-secret"}
+        )
+        response = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={"x-api-key": "relay-secret"},
+        )
+
+    # Assert
+    assert (resumed.json(), response.status_code) == ({"draining": False}, 200)
+
+
+@pytest.mark.asyncio
 async def test_relay_app_streams_sse_from_the_upstream(upstream_factory) -> None:
     # Arrange
     frames = (

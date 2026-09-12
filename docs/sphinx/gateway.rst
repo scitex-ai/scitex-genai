@@ -85,6 +85,26 @@ allocated server is reachable.
 The engine's request limit (for example SGLang
 ``--max-running-requests``) remains authoritative.
 
+Drained deployment restart
+--------------------------
+
+Restart through the package command, not ``systemctl restart`` directly::
+
+   scitex-genai-gateway restart-unit --drain-timeout-s 1800
+
+The command first closes authenticated inference admission, then polls the
+live ``/health`` counters until both ``in_flight`` and ``queued`` are zero.
+Only that proved-empty state permits the systemd restart. An unreachable or
+malformed health response, or an expired deadline, refuses the restart and
+reopens admission with an actionable error. This prevents a deployment
+restart from cutting through a long agent turn and forcing a cold prefix
+replay.
+
+This guard is grounded in the 2026-09-12 deployment observation: a direct
+gateway restart overlapped an active approximately 672,000-token Hub turn,
+and its retry arrived without the prior prefix cache benefit. The drain
+command turns that timing-dependent failure into a checked precondition.
+
 Continuation handoff (opt in)
 -----------------------------
 

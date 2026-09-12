@@ -18,6 +18,16 @@ scitex-genai-gateway \
 
 `python -m scitex_genai` accepts the same arguments.
 
+For a deployed inference gateway, drain before restarting:
+
+```bash
+scitex-genai-gateway restart-unit --drain-timeout-s 1800
+```
+
+This closes new admission, waits for live `/health` evidence that both
+`in_flight` and `queued` are zero, and only then restarts the systemd user
+unit. A failed or timed-out drain refuses the restart and reopens admission.
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | HTTP bind address. |
