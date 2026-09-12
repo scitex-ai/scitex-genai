@@ -81,6 +81,7 @@ class RecordingUpstream:
         block_until: threading.Event | None = None,
         abort_releases: bool = False,
         abort_status: int = 200,
+        block_before_first_chunk: threading.Event | None = None,
         block_after_first_chunk: threading.Event | None = None,
     ) -> None:
         self.status = status
@@ -89,8 +90,10 @@ class RecordingUpstream:
         self.block_until = block_until
         self.abort_releases = abort_releases
         self.abort_status = abort_status
+        self.block_before_first_chunk = block_before_first_chunk
         self.block_after_first_chunk = block_after_first_chunk
         self.request_started = threading.Event()
+        self.response_headers_sent = threading.Event()
         self.requests: list[dict[str, Any]] = []
         upstream = self
 
@@ -111,8 +114,9 @@ class RecordingUpstream:
                 )
                 upstream.request_started.set()
                 if self.path == "/abort_request" and upstream.abort_releases:
-                    assert upstream.block_until is not None
-                    upstream.block_until.set()
+                    release = upstream.block_until or upstream.block_before_first_chunk
+                    assert release is not None
+                    release.set()
                 if upstream.block_until is not None:
                     upstream.block_until.wait(timeout=10)
                 response_status = (
@@ -124,6 +128,12 @@ class RecordingUpstream:
                 self.send_header("content-type", upstream.content_type)
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
+                upstream.response_headers_sent.set()
+                if (
+                    upstream.block_before_first_chunk is not None
+                    and self.path != "/abort_request"
+                ):
+                    upstream.block_before_first_chunk.wait(timeout=10)
                 for index, chunk in enumerate(upstream.chunks):
                     self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                     self.wfile.flush()

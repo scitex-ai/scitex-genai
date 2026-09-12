@@ -805,6 +805,133 @@ async def test_real_disconnect_before_headers_does_not_log_asgi_error(
 
 
 @pytest.mark.asyncio
+async def test_real_disconnect_after_upstream_headers_aborts_before_downstream_200(
+    upstream_factory, caplog
+) -> None:
+    """An upstream header without body data must not orphan admission.
+
+    This reproduces the live SGLang failure observed on 2026-09-12: SGLang
+    accepted a 637k-token request and returned HTTP headers, but its stream
+    produced no body data.  The caller later disconnected while the gateway
+    retained the slot indefinitely.
+    """
+    release_body = threading.Event()
+    upstream = upstream_factory(
+        block_before_first_chunk=release_body,
+        abort_releases=True,
+    )
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    app = create_app(
+        InferenceBackend(pool, continuation_qos_enabled=True),
+        api_key="relay-secret",
+    )
+    server = _build_uvicorn_server(
+        app,
+        host="127.0.0.1",
+        port=0,
+        log_level="error",
+        timeout_graceful_shutdown=5,
+    )
+    caplog.set_level(logging.ERROR, logger="uvicorn.error")
+    serve_task = asyncio.create_task(server.serve())
+    for _ in range(1000):
+        if server.started:
+            break
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    payload = json.dumps({"model": "m", "input": "cold", "stream": True}).encode()
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST /v1/responses HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"X-API-Key: relay-secret\r\n"
+        b"X-SciTeX-Session-ID: cold\r\n"
+        + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+        + payload
+    )
+    await writer.drain()
+    headers_sent = await asyncio.to_thread(upstream.response_headers_sent.wait, 5)
+    # No downstream response headers are committed until the first upstream
+    # body byte proves that the streaming path is alive.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(reader.read(1), timeout=0.1)
+    no_response_yet = True
+
+    writer.close()
+    await writer.wait_closed()
+    for _ in range(1000):
+        if len(upstream.requests) >= 2 and pool.status()[0]["in_flight"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    server.should_exit = True
+    await asyncio.wait_for(serve_task, timeout=2)
+
+    assert (
+        headers_sent,
+        no_response_yet,
+        [request["path"] for request in upstream.requests],
+        pool.status()[0]["in_flight"],
+    ) == (True, True, ["/v1/responses", "/abort_request"], 0)
+
+
+@pytest.mark.asyncio
+async def test_asgi_disconnect_removes_request_waiting_for_admission(
+    upstream_factory,
+) -> None:
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    occupying = await pool.acquire("occupying")
+    app = create_app(InferenceBackend(pool), api_key="relay-secret")
+    incoming: asyncio.Queue[dict] = asyncio.Queue()
+    payload = json.dumps({"model": "m", "input": "queued", "stream": True}).encode()
+    await incoming.put({"type": "http.request", "body": payload, "more_body": False})
+    sent: list[dict] = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [
+            (b"x-api-key", b"relay-secret"),
+            (b"x-scitex-session-id", b"queued"),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("gateway.test", 80),
+    }
+
+    async def receive() -> dict:
+        return await incoming.get()
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    request_task = asyncio.create_task(app(scope, receive, send))
+    for _ in range(100):
+        if pool.status()[0]["queued"] == 1:
+            break
+        await asyncio.sleep(0)
+    await incoming.put({"type": "http.disconnect"})
+    await asyncio.wait_for(request_task, timeout=1)
+    state = pool.status()[0]
+    await pool.release(occupying)
+
+    assert (
+        state["in_flight"],
+        state["queued"],
+        sent[0]["status"],
+        len(upstream.requests),
+    ) == (1, 0, 499, 0)
+
+
+@pytest.mark.asyncio
 async def test_relay_app_relays_get_paths_to_the_upstream(upstream_factory) -> None:
     # Arrange
     upstream = upstream_factory(chunks=(b'{"data":[]}',))
