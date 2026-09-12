@@ -1257,7 +1257,9 @@ async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
 
     # Act
     upstream.abort_status = 200
+    reapers = tuple(backend._cleanup_reapers)
     await _wait_for_in_flight(pool, 0)
+    await asyncio.wait_for(asyncio.gather(*reapers), timeout=2)
     snapshot = backend.continuation_qos.snapshot()
     await backend.close()
 
