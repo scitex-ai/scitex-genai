@@ -749,6 +749,86 @@ async def test_client_cancellation_during_handoff_leaks_no_capacity(
 
 
 @pytest.mark.asyncio
+async def test_disconnect_before_retry_headers_aborts_replayed_first_turn(
+    upstream_factory,
+) -> None:
+    # Arrange: reproduce a cold first turn preempted for a known continuation,
+    # then make its fresh-rid retry block before response headers.
+    release = __import__("threading").Event()
+    release.set()
+    upstream = upstream_factory(block_until=release, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=2)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+    known = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+    )
+    await _collect(known.body)
+    release.clear()
+    disconnected = asyncio.Event()
+
+    async def client_disconnected() -> bool:
+        return disconnected.is_set()
+
+    cold = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "cold"},
+            client_disconnected=client_disconnected,
+        )
+    )
+    await _wait_for_requests(upstream, 2)
+    continuation = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+    )
+    release.clear()
+    await _collect(continuation.body)
+    await _wait_for_requests(upstream, 5)
+
+    # Act
+    disconnected.set()
+    cancelled = await _raised_async(cold)
+    request_paths = [request["path"] for request in upstream.requests]
+    request_rids = [
+        json.loads(request["body"])["rid"]
+        for request in upstream.requests
+        if request["path"] == "/v1/responses"
+    ]
+    abort_rids = [
+        json.loads(request["body"])["rid"]
+        for request in upstream.requests
+        if request["path"] == "/abort_request"
+    ]
+
+    # Assert: both cold attempts were explicitly aborted, the retry received a
+    # fresh rid, and the downstream disconnect cannot strand admission.
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        request_paths,
+        len(set(request_rids)),
+        abort_rids == [request_rids[1], request_rids[3]],
+        pool.status()[0]["in_flight"],
+        backend.continuation_qos.snapshot()["replay_safe_first_turns"],
+    ) == (
+        True,
+        [
+            "/v1/responses",
+            "/v1/responses",
+            "/abort_request",
+            "/v1/responses",
+            "/v1/responses",
+            "/abort_request",
+        ],
+        4,
+        True,
+        0,
+        0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_continuation_qos_is_disabled_and_body_compatible_by_default(
     upstream_factory,
 ) -> None:
