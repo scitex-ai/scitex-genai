@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hashlib
 import json
 import re
@@ -1008,6 +1009,73 @@ async def test_cancelled_chunk_wait_retains_capacity_when_abort_fails(
         isinstance(cancelled, asyncio.CancelledError),
         pool.status()[0]["in_flight"],
     ) == ((False, 1), True, 0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_chunk_wait_retrieves_concurrent_end_of_stream(
+    upstream_factory,
+) -> None:
+    # Arrange: this scheduler-controlled response ends its read task and then
+    # cancels the relay reader before the shielded parent can retrieve the
+    # resulting StopAsyncIteration.  This is the ordering observed when a
+    # client closed a replay just as the real SGLang stream ended.
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    member = await pool.acquire("new", input_tokens=10)
+    reader: dict[str, asyncio.Task[bytes]] = {}
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+
+    class EndingResponse:
+        def aiter_bytes(self):
+            async def ending_stream():
+                loop.call_soon(reader["task"].cancel)
+                if False:
+                    yield b""
+
+            return ending_stream()
+
+        async def aclose(self) -> None:
+            return None
+
+    class ClosingClient:
+        async def aclose(self) -> None:
+            return None
+
+    relayed = backend._drain(
+        ClosingClient(),
+        EndingResponse(),
+        member,
+        input_tokens=10,
+        session_id="new",
+        request_id="rid-ending",
+    )
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+    # Act
+    try:
+        reader["task"] = asyncio.create_task(anext(relayed))
+        cancelled = await _raised_async(reader["task"])
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await backend.close()
+
+    # Assert
+    unretrieved = [
+        context
+        for context in unhandled
+        if context.get("message") == "Task exception was never retrieved"
+    ]
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        pool.status()[0]["in_flight"],
+        unretrieved,
+    ) == (True, 0, [])
 
 
 @pytest.mark.asyncio
