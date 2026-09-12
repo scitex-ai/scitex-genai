@@ -1240,11 +1240,23 @@ class InferenceBackend:
                     await continuation_handoff.victim_released
             while len(attempted) < len(self.pool.upstreams):
                 try:
-                    upstream = await self.pool.acquire(
+                    upstream = await self._acquire_while_connected(
                         routing_session,
                         exclude=attempted,
                         input_tokens=input_tokens,
                         priority=qos_kind == "continuation",
+                        client_disconnected=client_disconnected,
+                    )
+                except _ClientDisconnected:
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} <- queue "
+                        "client_disconnected_before_admission"
+                    )
+                    return RelayedResponse(
+                        status_code=499,
+                        content_type="application/json",
+                        body=_empty_body(),
+                        feedback_headers=feedback_headers,
                     )
                 except HomeMemberReloading as exc:
                     if waited < self.wait_for_home_s:
@@ -1315,6 +1327,9 @@ class InferenceBackend:
                 send_task: asyncio.Task[Any] | None = None
                 preempt_task: asyncio.Task[Any] | None = None
                 disconnect_task: asyncio.Task[None] | None = None
+                disconnect_stop: asyncio.Event | None = None
+                first_chunk_task: asyncio.Task[bytes] | None = None
+                stream: AsyncIterator[bytes] | None = None
                 first_attempt = None
                 if (
                     qos_kind == "first-turn"
@@ -1333,10 +1348,15 @@ class InferenceBackend:
                         headers=forwarded,
                     )
                     if self.continuation_qos.enabled:
-                        send_task = asyncio.create_task(client.send(request, stream=True))
+                        send_task = asyncio.create_task(
+                            client.send(request, stream=True)
+                        )
                     if rid_confirmed and client_disconnected is not None:
+                        disconnect_stop = asyncio.Event()
                         disconnect_task = asyncio.create_task(
-                            self._wait_for_client_disconnect(client_disconnected)
+                            self._wait_for_client_disconnect(
+                                client_disconnected, stop=disconnect_stop
+                            )
                         )
                     if first_attempt is not None:
                         preempt_task = asyncio.create_task(first_attempt.preempt.wait())
@@ -1350,19 +1370,15 @@ class InferenceBackend:
                             waiters,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        # Headers win a simultaneous race: once an upstream
-                        # response exists there is no longer an eligible
-                        # pre-response request to replay.
+                        # Upstream headers end preemption eligibility, but do
+                        # not prove that a streaming body exists. Keep the
+                        # downstream monitor alive until the first body byte.
                         if send_task is not None and send_task in done:
-                            for task in (preempt_task, disconnect_task):
+                            for task in (preempt_task,):
                                 if task is not None:
                                     task.cancel()
                             await asyncio.gather(
-                                *(
-                                    task
-                                    for task in (preempt_task, disconnect_task)
-                                    if task is not None
-                                ),
+                                *(task for task in (preempt_task,) if task is not None),
                                 return_exceptions=True,
                             )
                             if (
@@ -1380,7 +1396,10 @@ class InferenceBackend:
                                 upstream, dispatch_request_id, headers=forwarded
                             )
                             if not abort_ok:
-                                if first_attempt.released is not None and not first_attempt.released.done():
+                                if (
+                                    first_attempt.released is not None
+                                    and not first_attempt.released.done()
+                                ):
                                     first_attempt.released.set_exception(
                                         InferenceAdmissionError(
                                             "Continuation QoS could not confirm upstream abort"
@@ -1397,10 +1416,15 @@ class InferenceBackend:
                                 )
                                 await asyncio.shield(client.aclose())
                                 await release_slot()
-                                if first_attempt.released is not None and not first_attempt.released.done():
+                                if (
+                                    first_attempt.released is not None
+                                    and not first_attempt.released.done()
+                                ):
                                     first_attempt.released.set_result(None)
                                 barrier = first_attempt.resume_after
-                                self.continuation_qos.unregister_first_turn(first_attempt)
+                                self.continuation_qos.unregister_first_turn(
+                                    first_attempt
+                                )
                                 first_attempt = None
                                 if barrier is not None:
                                     await barrier
@@ -1412,6 +1436,27 @@ class InferenceBackend:
                                 continue
                     else:
                         response = await client.send(request, stream=True)
+
+                    # Do not commit an HTTP 200 to the caller merely because
+                    # the upstream sent response headers. SGLang has been
+                    # observed returning headers and then orphaning the body
+                    # stream. Prime one body chunk while the ASGI disconnect
+                    # monitor can still abort the request deterministically.
+                    stream = response.aiter_bytes()
+                    first_chunk_task = asyncio.create_task(anext(stream))
+                    if disconnect_task is not None:
+                        done, _ = await asyncio.wait(
+                            (first_chunk_task, disconnect_task),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if first_chunk_task not in done:
+                            raise _ClientDisconnected
+                        disconnect_stop.set()
+                        await asyncio.gather(disconnect_task, return_exceptions=True)
+                    try:
+                        first_chunk = await first_chunk_task
+                    except StopAsyncIteration:
+                        first_chunk = None
                 except (_ClientDisconnected, asyncio.CancelledError) as exc:
                     # Cancellation before a response body exists must not leak a
                     # capacity slot; streaming cancellation is handled by _drain.
@@ -1448,7 +1493,15 @@ class InferenceBackend:
                                 if send_task.done()
                                 else await asyncio.shield(send_task)
                             )
-                            async for _ in cancelled_response.aiter_bytes():
+                            cancelled_stream = (
+                                stream or cancelled_response.aiter_bytes()
+                            )
+                            if first_chunk_task is not None:
+                                try:
+                                    await asyncio.shield(first_chunk_task)
+                                except StopAsyncIteration:
+                                    pass
+                            async for _ in cancelled_stream:
                                 pass
                             await cancelled_response.aclose()
                             safe_to_release = True
@@ -1457,10 +1510,22 @@ class InferenceBackend:
                     if preempt_task is not None and not preempt_task.done():
                         preempt_task.cancel()
                     if disconnect_task is not None and not disconnect_task.done():
+                        disconnect_stop.set()
                         disconnect_task.cancel()
+                    if (
+                        abort_ok
+                        and first_chunk_task is not None
+                        and not first_chunk_task.done()
+                    ):
+                        first_chunk_task.cancel()
                     pending = [
                         task
-                        for task in (send_task, preempt_task, disconnect_task)
+                        for task in (
+                            send_task,
+                            preempt_task,
+                            disconnect_task,
+                            first_chunk_task,
+                        )
                         if task is not None
                     ]
                     if pending:
@@ -1526,11 +1591,14 @@ class InferenceBackend:
                         f"{time.monotonic() - started:.1f}s; out of rotation for "
                         f"{UNREACHABLE_COOLDOWN_S:.0f}s"
                     )
-                    failures.append(f"{upstream.alias} ({exc.__class__.__name__}: {exc})")
+                    failures.append(
+                        f"{upstream.alias} ({exc.__class__.__name__}: {exc})"
+                    )
                     continue
                 finally:
                     if disconnect_task is not None:
                         if not disconnect_task.done():
+                            disconnect_stop.set()
                             disconnect_task.cancel()
                         await asyncio.gather(disconnect_task, return_exceptions=True)
                     if first_attempt is not None:
@@ -1548,12 +1616,16 @@ class InferenceBackend:
                 handed_to_stream = True
                 return RelayedResponse(
                     status_code=response.status_code,
-                    content_type=response.headers.get("content-type", "application/json"),
+                    content_type=response.headers.get(
+                        "content-type", "application/json"
+                    ),
                     feedback_headers=feedback_headers,
                     body=self._drain(
                         client,
                         response,
                         upstream,
+                        stream=stream,
+                        first_chunk=first_chunk,
                         tag=f"conv={routing_session[:8] or '-'} <- {upstream.alias} "
                         f"status={response.status_code}",
                         started=started,
@@ -1563,9 +1635,7 @@ class InferenceBackend:
                         request_id=dispatch_request_id if rid_confirmed else "",
                         request_headers=forwarded,
                         successful_session=(
-                            qos_session
-                            if 200 <= response.status_code < 300
-                            else ""
+                            qos_session if 200 <= response.status_code < 300 else ""
                         ),
                     ),
                 )
@@ -1577,6 +1647,8 @@ class InferenceBackend:
     @staticmethod
     async def _wait_for_client_disconnect(
         client_disconnected: Callable[[], Awaitable[bool]],
+        *,
+        stop: asyncio.Event | None = None,
     ) -> None:
         """Poll Starlette's non-blocking ASGI disconnect observation.
 
@@ -1585,13 +1657,58 @@ class InferenceBackend:
         observation must not kill a healthy inference request; it is retried
         until headers arrive and the monitor is cancelled.
         """
-        while True:
+        while stop is None or not stop.is_set():
             try:
                 if await client_disconnected():
                     return
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(0.05)
+            if stop is None:
+                await asyncio.sleep(0.05)
+            else:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+
+    async def _acquire_while_connected(
+        self,
+        session_id: str,
+        *,
+        exclude: set[str],
+        input_tokens: int,
+        priority: bool,
+        client_disconnected: Callable[[], Awaitable[bool]] | None,
+    ) -> InferenceUpstream:
+        """Remove a queued admission ticket as soon as its caller disappears."""
+        acquire = asyncio.create_task(
+            self.pool.acquire(
+                session_id,
+                exclude=exclude,
+                input_tokens=input_tokens,
+                priority=priority,
+            )
+        )
+        if client_disconnected is None:
+            return await acquire
+        stop = asyncio.Event()
+        disconnected = asyncio.create_task(
+            self._wait_for_client_disconnect(client_disconnected, stop=stop)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                (acquire, disconnected), return_when=asyncio.FIRST_COMPLETED
+            )
+            if acquire in done:
+                return await acquire
+            acquire.cancel()
+            await asyncio.gather(acquire, return_exceptions=True)
+            raise _ClientDisconnected
+        finally:
+            if not disconnected.done():
+                stop.set()
+                disconnected.cancel()
+            await asyncio.gather(disconnected, return_exceptions=True)
 
     async def _abort_request(
         self,
@@ -1678,6 +1795,8 @@ class InferenceBackend:
         response: Any,
         upstream: InferenceUpstream,
         *,
+        stream: AsyncIterator[bytes] | None = None,
+        first_chunk: bytes | None = None,
         tag: str = "",
         started: float | None = None,
         input_tokens: int = 0,
@@ -1689,7 +1808,7 @@ class InferenceBackend:
     ) -> AsyncIterator[bytes]:
         sent = 0
         outcome = "complete"
-        stream = response.aiter_bytes()
+        stream = stream or response.aiter_bytes()
         next_chunk: asyncio.Task[bytes] | None = None
         release_capacity = True
 
@@ -1706,6 +1825,9 @@ class InferenceBackend:
                 next_chunk = None
 
         try:
+            if first_chunk is not None:
+                sent += len(first_chunk)
+                yield first_chunk
             while True:
                 next_chunk = asyncio.create_task(anext(stream))
                 try:
