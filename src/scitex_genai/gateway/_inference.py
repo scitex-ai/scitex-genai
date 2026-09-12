@@ -1047,6 +1047,7 @@ class ContinuationQoS:
             "cleanup_reaper_recoveries": 0,
             "cleanup_reaper_attempts": 0,
             "cleanup_reaper_cancellations": 0,
+            "non_addressable_cleanup_releases": 0,
         }
 
     def classify(self, explicit_session: str) -> str:
@@ -1127,6 +1128,9 @@ class ContinuationQoS:
             0, self._counters["cleanup_reapers_active"] - 1
         )
         self._counters["cleanup_reaper_cancellations"] += 1
+
+    def non_addressable_cleanup_released(self) -> None:
+        self._counters["non_addressable_cleanup_releases"] += 1
 
     @staticmethod
     def finish_continuation(handoff: _ContinuationHandoff | None) -> None:
@@ -1940,6 +1944,8 @@ class InferenceBackend:
         session_id: str,
     ) -> None:
         """Retain admission and retry abort until engine cleanup is confirmed."""
+        if not request_id:
+            raise ValueError("cleanup reaper requires a non-empty request id")
         self.continuation_qos.cleanup_held()
 
         async def reap() -> None:
@@ -2124,12 +2130,25 @@ class InferenceBackend:
             await response.aclose()
             await client.aclose()
         finally:
-            if release_capacity:
+            if release_capacity or not request_id:
                 await self.pool.release(
                     upstream,
                     input_tokens=input_tokens,
                     session_id=session_id,
                 )
+                if not release_capacity:
+                    # A reaper without an engine address can never prove
+                    # cleanup and therefore can never terminate. This is the
+                    # native Anthropic route today: SGLang owns cancellation
+                    # when its StreamingResponse transport closes, but does
+                    # not propagate the gateway's ``rid``. Treat the closed
+                    # transport as the terminal boundary and expose the event
+                    # in health instead of permanently poisoning admission.
+                    self.continuation_qos.non_addressable_cleanup_released()
+                    self._note(
+                        "[relay] released admission after non-addressable "
+                        "upstream transport closed; no cleanup reaper created"
+                    )
             else:
                 self._schedule_cleanup_reaper(
                     upstream,
