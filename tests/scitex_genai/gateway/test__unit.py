@@ -150,9 +150,7 @@ def test_continuation_qos_is_baked_into_execstart_only_when_explicit():
     }
 
     # Act
-    enabled = _exec_argv(
-        render_unit(**settings)
-    )
+    enabled = _exec_argv(render_unit(**settings))
     disabled = _exec_argv(render_unit(inference_continuation_qos_enabled=False))
 
     # Assert
@@ -165,6 +163,21 @@ def test_continuation_qos_is_baked_into_execstart_only_when_explicit():
             "400000",
         ],
         ["--no-inference-continuation-qos"],
+    )
+
+
+def test_cache_report_capability_is_baked_into_execstart_only_when_explicit():
+    # Arrange
+    values = (True, False)
+
+    # Act
+    enabled = _exec_argv(render_unit(inference_cache_report_enabled=values[0]))
+    disabled = _exec_argv(render_unit(inference_cache_report_enabled=values[1]))
+
+    # Assert
+    assert (enabled[3:], disabled[3:]) == (
+        ["--inference-cache-report"],
+        ["--no-inference-cache-report"],
     )
 
 
