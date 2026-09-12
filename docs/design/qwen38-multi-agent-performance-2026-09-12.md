@@ -205,6 +205,27 @@ guard proving the cold request begins within 30 seconds after the last of ten
 cache-hot arrivals. Repeat each measured cell at least five times after three
 warm-ups.
 
+## Live promotion evidence
+
+The guarded profile was promoted on 2026-09-12 after the production TP=2
+engine passed these checks on two H100 GPUs:
+
+- Live `server_args` reported LPM scheduling, 8,192-token prefill chunks,
+  FP8 E4M3 KV, cache reporting, and the EAGLE 3/1/4 tuple.
+- L2 exposed 1,263,680 ordinary-KV tokens per TP rank and accepted 370,688
+  tokens during the observed continuation.
+- L3 reopened 15,345,057,792 bytes and 6,556 entries per TP rank after an
+  engine restart.
+- The first resumed long request after that restart loaded 379,776 tokens
+  from storage and computed 2,112 prompt tokens: 99.45% measured storage
+  reuse for that request.
+- The gateway returned HTTP 200 with `reachable=true` and `ready=true`; the
+  observed generation gauge was 137 tokens/s before the controlled restart.
+
+These measurements establish working persistence and reuse for the observed
+request. They do not establish eight-agent concurrency or starvation bounds;
+those remain separate admission tests.
+
 ## Pending capacity
 
 The additional two-H100 lease, job `30409720`, was pending for priority at the
