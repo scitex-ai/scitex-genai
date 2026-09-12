@@ -815,6 +815,7 @@ async def test_real_disconnect_after_upstream_headers_aborts_before_downstream_2
     produced no body data.  The caller later disconnected while the gateway
     retained the slot indefinitely.
     """
+    # Arrange
     release_body = threading.Event()
     upstream = upstream_factory(
         block_before_first_chunk=release_body,
@@ -852,11 +853,15 @@ async def test_real_disconnect_after_upstream_headers_aborts_before_downstream_2
     )
     await writer.drain()
     headers_sent = await asyncio.to_thread(upstream.response_headers_sent.wait, 5)
+
+    # Act
     # No downstream response headers are committed until the first upstream
     # body byte proves that the streaming path is alive.
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(reader.read(1), timeout=0.1)
-    no_response_yet = True
+    read_task = asyncio.create_task(reader.read(1))
+    await asyncio.sleep(0.1)
+    no_response_yet = not read_task.done()
+    read_task.cancel()
+    await asyncio.gather(read_task, return_exceptions=True)
 
     writer.close()
     await writer.wait_closed()
@@ -867,6 +872,7 @@ async def test_real_disconnect_after_upstream_headers_aborts_before_downstream_2
     server.should_exit = True
     await asyncio.wait_for(serve_task, timeout=2)
 
+    # Assert
     assert (
         headers_sent,
         no_response_yet,
@@ -879,6 +885,7 @@ async def test_real_disconnect_after_upstream_headers_aborts_before_downstream_2
 async def test_asgi_disconnect_removes_request_waiting_for_admission(
     upstream_factory,
 ) -> None:
+    # Arrange
     upstream = upstream_factory()
     pool = InferenceUpstreamPool.from_urls(
         upstream.url, capacity_per_upstream=1, max_queue_size=1
@@ -918,11 +925,14 @@ async def test_asgi_disconnect_removes_request_waiting_for_admission(
         if pool.status()[0]["queued"] == 1:
             break
         await asyncio.sleep(0)
+
+    # Act
     await incoming.put({"type": "http.disconnect"})
     await asyncio.wait_for(request_task, timeout=1)
     state = pool.status()[0]
     await pool.release(occupying)
 
+    # Assert
     assert (
         state["in_flight"],
         state["queued"],
