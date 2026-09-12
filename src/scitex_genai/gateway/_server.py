@@ -180,6 +180,7 @@ def create_app(
                     "in_flight": sum(member["in_flight"] for member in members),
                     "queued": sum(member["queued"] for member in members),
                     "cache_admission": backend.cache_admission.snapshot(),
+                    "continuation_qos": backend.continuation_qos.snapshot(),
                     "external": backend.health_status(),
                 }
                 if any("token_capacity" in member for member in members):
@@ -224,6 +225,7 @@ def create_app(
                 "in_flight": sum(member["in_flight"] for member in members),
                 "queued": sum(member["queued"] for member in members),
                 "cache_admission": backend.cache_admission.snapshot(),
+                "continuation_qos": backend.continuation_qos.snapshot(),
             }
             if not active_members:
                 status["reason"] = (

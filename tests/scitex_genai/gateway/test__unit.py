@@ -141,6 +141,33 @@ def test_explicit_admission_bounds_are_baked_into_execstart():
     ]
 
 
+def test_continuation_qos_is_baked_into_execstart_only_when_explicit():
+    # Arrange
+    settings = {
+        "inference_continuation_qos_enabled": True,
+        "inference_continuation_qos_max_retries": 2,
+        "inference_continuation_qos_min_preempt_tokens": 400_000,
+    }
+
+    # Act
+    enabled = _exec_argv(
+        render_unit(**settings)
+    )
+    disabled = _exec_argv(render_unit(inference_continuation_qos_enabled=False))
+
+    # Assert
+    assert (enabled[3:], disabled[3:]) == (
+        [
+            "--inference-continuation-qos",
+            "--inference-continuation-qos-max-retries",
+            "2",
+            "--inference-continuation-qos-min-preempt-tokens",
+            "400000",
+        ],
+        ["--no-inference-continuation-qos"],
+    )
+
+
 @pytest.mark.parametrize(
     "given",
     [

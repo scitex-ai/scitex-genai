@@ -46,6 +46,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ._settings import (
+    check_bool,
     check_count,
     check_host,
     check_port,
@@ -74,6 +75,9 @@ def gateway_command(
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
     inference_token_capacity_per_upstream: int | None = None,
+    inference_continuation_qos_enabled: bool | None = None,
+    inference_continuation_qos_max_retries: int | None = None,
+    inference_continuation_qos_min_preempt_tokens: int | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> list[str]:
@@ -124,6 +128,37 @@ def gateway_command(
                 )
             ),
         ]
+    if inference_continuation_qos_enabled is not None:
+        argv.append(
+            "--inference-continuation-qos"
+            if check_bool(
+                "inference_continuation_qos_enabled",
+                inference_continuation_qos_enabled,
+            )
+            else "--no-inference-continuation-qos"
+        )
+    if inference_continuation_qos_max_retries is not None:
+        argv += [
+            "--inference-continuation-qos-max-retries",
+            str(
+                check_count(
+                    "inference_continuation_qos_max_retries",
+                    inference_continuation_qos_max_retries,
+                    minimum=0,
+                )
+            ),
+        ]
+    if inference_continuation_qos_min_preempt_tokens is not None:
+        argv += [
+            "--inference-continuation-qos-min-preempt-tokens",
+            str(
+                check_count(
+                    "inference_continuation_qos_min_preempt_tokens",
+                    inference_continuation_qos_min_preempt_tokens,
+                    minimum=0,
+                )
+            ),
+        ]
     return argv
 
 
@@ -138,6 +173,9 @@ def render_unit(
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
     inference_token_capacity_per_upstream: int | None = None,
+    inference_continuation_qos_enabled: bool | None = None,
+    inference_continuation_qos_max_retries: int | None = None,
+    inference_continuation_qos_min_preempt_tokens: int | None = None,
 ) -> str:
     """The unit text, byte-for-byte what ``install_unit`` writes."""
     argv = gateway_command(
@@ -149,6 +187,13 @@ def render_unit(
         inference_max_queue_size=inference_max_queue_size,
         inference_token_capacity_per_upstream=(
             inference_token_capacity_per_upstream
+        ),
+        inference_continuation_qos_enabled=inference_continuation_qos_enabled,
+        inference_continuation_qos_max_retries=(
+            inference_continuation_qos_max_retries
+        ),
+        inference_continuation_qos_min_preempt_tokens=(
+            inference_continuation_qos_min_preempt_tokens
         ),
         config=config,
         interpreter=interpreter,
@@ -194,6 +239,9 @@ def install_unit(
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
     inference_token_capacity_per_upstream: int | None = None,
+    inference_continuation_qos_enabled: bool | None = None,
+    inference_continuation_qos_max_retries: int | None = None,
+    inference_continuation_qos_min_preempt_tokens: int | None = None,
     interpreter: str | None = None,
 ) -> Path:
     """Write the unit, then reload the user manager and ``enable --now`` it.
@@ -216,6 +264,15 @@ def install_unit(
             inference_max_queue_size=inference_max_queue_size,
             inference_token_capacity_per_upstream=(
                 inference_token_capacity_per_upstream
+            ),
+            inference_continuation_qos_enabled=(
+                inference_continuation_qos_enabled
+            ),
+            inference_continuation_qos_max_retries=(
+                inference_continuation_qos_max_retries
+            ),
+            inference_continuation_qos_min_preempt_tokens=(
+                inference_continuation_qos_min_preempt_tokens
             ),
             config=config,
             interpreter=interpreter,

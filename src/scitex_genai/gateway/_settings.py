@@ -39,6 +39,9 @@ from scitex_config import ScitexConfig, get_scitex_dir, load_yaml
 
 from ._inference import (
     DEFAULT_CAPACITY_PER_UPSTREAM,
+    DEFAULT_CONTINUATION_QOS_ENABLED,
+    DEFAULT_CONTINUATION_QOS_MAX_RETRIES,
+    DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS,
     DEFAULT_MAX_QUEUE_SIZE,
     DEFAULT_TIMEOUT_S,
     DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
@@ -56,6 +59,9 @@ KEY_TIMEOUT = "gateway.inference_timeout_s"
 KEY_CAPACITY = "gateway.inference_capacity_per_upstream"
 KEY_MAX_QUEUE = "gateway.inference_max_queue_size"
 KEY_TOKEN_CAPACITY = "gateway.inference_token_capacity_per_upstream"
+KEY_CONTINUATION_QOS = "gateway.inference_continuation_qos_enabled"
+KEY_CONTINUATION_RETRIES = "gateway.inference_continuation_qos_max_retries"
+KEY_CONTINUATION_MIN_TOKENS = "gateway.inference_continuation_qos_min_preempt_tokens"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
@@ -160,6 +166,16 @@ def check_count(name: str, value: Any, *, minimum: int) -> int:
     return number
 
 
+def check_bool(name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if isinstance(value, str) and value.lower() in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
 def upstream_string(value: Any) -> str:
     """The comma-separated form the server takes; a list, a string or nothing."""
     if value is None:
@@ -182,6 +198,13 @@ class GatewaySettings:
     inference_max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE
     inference_token_capacity_per_upstream: int | None = (
         DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM
+    )
+    inference_continuation_qos_enabled: bool = DEFAULT_CONTINUATION_QOS_ENABLED
+    inference_continuation_qos_max_retries: int = (
+        DEFAULT_CONTINUATION_QOS_MAX_RETRIES
+    )
+    inference_continuation_qos_min_preempt_tokens: int = (
+        DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
     )
     external_provider: ExternalGatewaySettings | None = None
 
@@ -224,6 +247,32 @@ class GatewaySettings:
                 "inference_max_queue_size", self.inference_max_queue_size, minimum=0
             ),
         )
+        object.__setattr__(
+            self,
+            "inference_continuation_qos_enabled",
+            check_bool(
+                "inference_continuation_qos_enabled",
+                self.inference_continuation_qos_enabled,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "inference_continuation_qos_max_retries",
+            check_count(
+                "inference_continuation_qos_max_retries",
+                self.inference_continuation_qos_max_retries,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "inference_continuation_qos_min_preempt_tokens",
+            check_count(
+                "inference_continuation_qos_min_preempt_tokens",
+                self.inference_continuation_qos_min_preempt_tokens,
+                minimum=0,
+            ),
+        )
 
 
 def load_settings(
@@ -236,6 +285,9 @@ def load_settings(
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
     inference_token_capacity_per_upstream: int | None = None,
+    inference_continuation_qos_enabled: bool | None = None,
+    inference_continuation_qos_max_retries: int | None = None,
+    inference_continuation_qos_min_preempt_tokens: int | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -283,6 +335,21 @@ def load_settings(
             KEY_TOKEN_CAPACITY,
             direct_val=inference_token_capacity_per_upstream,
             default=DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
+        ),
+        inference_continuation_qos_enabled=config.resolve(
+            KEY_CONTINUATION_QOS,
+            direct_val=inference_continuation_qos_enabled,
+            default=DEFAULT_CONTINUATION_QOS_ENABLED,
+        ),
+        inference_continuation_qos_max_retries=config.resolve(
+            KEY_CONTINUATION_RETRIES,
+            direct_val=inference_continuation_qos_max_retries,
+            default=DEFAULT_CONTINUATION_QOS_MAX_RETRIES,
+        ),
+        inference_continuation_qos_min_preempt_tokens=config.resolve(
+            KEY_CONTINUATION_MIN_TOKENS,
+            direct_val=inference_continuation_qos_min_preempt_tokens,
+            default=DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS,
         ),
         external_provider=ExternalGatewaySettings.from_mapping(
             external_mapping

@@ -18,6 +18,10 @@ list only the upstream that is actually reachable.
      inference_max_queue_size: 128
      # Optional weighted guard; choose from measured engine KV capacity.
      inference_token_capacity_per_upstream: 1600000
+     # Opt in only for a verified SGLang OpenAI endpoint with /abort_request.
+     inference_continuation_qos_enabled: false
+     inference_continuation_qos_max_retries: 1
+     inference_continuation_qos_min_preempt_tokens: 400000
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
@@ -80,6 +84,46 @@ allocated server is reachable.
 
 The engine's request limit (for example SGLang
 ``--max-running-requests``) remains authoritative.
+
+Continuation handoff (opt in)
+-----------------------------
+
+``inference_continuation_qos_enabled`` defaults to false. When enabled, only
+the canonical ``X-SciTeX-Session-ID`` header participates (legacy session
+headers remain routing-only). A session is a ``continuation`` only after the
+entire body of a 2xx upstream response reaches clean EOF;
+body-derived affinity keys remain unclassified. This is conversation-history
+QoS, not a claim that an engine prefix is currently resident.
+
+For supported OpenAI routes, the gateway replaces any caller ``rid`` with a
+fresh opaque SGLang request ID. If a proven continuation targets an upstream
+where a first turn is still waiting for response headers, the gateway posts
+that ID to the same upstream's ``/abort_request``, closes the old transport,
+waits for its capacity release, runs the continuation, and then replays the
+fully buffered first-turn body. It never preempts after response headers have
+been exposed. Retry count is bounded by
+``inference_continuation_qos_max_retries`` (default 1), and an unconfirmed
+abort refuses the continuation instead of dispatching both requests together.
+Only first turns at or above
+``inference_continuation_qos_min_preempt_tokens`` are eligible. That threshold
+defaults to 0 for simple semantics; deployments should set it from measured
+harmful cold-prefill sizes (400,000 estimated tokens in the current measured
+fleet), rather than making small requests pay an abort/replay cycle.
+
+The corresponding CLI/unit flags are ``--inference-continuation-qos`` (or
+``--no-inference-continuation-qos``) and
+``--inference-continuation-qos-max-retries`` plus
+``--inference-continuation-qos-min-preempt-tokens``. ``/health`` reports only bounded,
+content-free counters under ``continuation_qos``; all classification state is
+ephemeral and disappears on gateway restart.
+
+Client cancellation and stream errors use the same explicit abort before
+capacity is released. If an abort cannot be confirmed and the original stream
+cannot reach EOF, the reservation transfers to a visible background cleanup
+reaper. It retries abort with bounded backoff until confirmation, then releases
+the slot exactly once. Health counters expose pending reapers, attempts, and
+recoveries; shutdown cancels and awaits those tasks without pretending the
+engine state was reclaimed.
 
 Request count is not enough when agents have very different context lengths.
 When ``inference_token_capacity_per_upstream`` is set, the gateway also limits

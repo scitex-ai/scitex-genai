@@ -53,10 +53,12 @@ carrying its own scheduler.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
+import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -88,6 +90,9 @@ DEFAULT_MAX_QUEUE_SIZE = 128
 DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM: int | None = None
 DEFAULT_HEALTH_CACHE_TTL_S = 1.0
 DEFAULT_HEALTH_FAILURE_THRESHOLD = 2
+DEFAULT_CONTINUATION_QOS_ENABLED = False
+DEFAULT_CONTINUATION_QOS_MAX_RETRIES = 1
+DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS = 0
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
 #: are few (one per agent) and eviction only costs a prefix-cache miss, never
@@ -177,6 +182,16 @@ def request_session_key(headers: Mapping[str, str]) -> str:
     return ""
 
 
+def continuation_qos_session_key(headers: Mapping[str, str]) -> str:
+    """QoS identity from the gateway-owned canonical header only."""
+    canonical = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() == "x-scitex-session-id"
+    }
+    return request_session_key(canonical)
+
+
 def accepts_session_id(path: str) -> bool:
     """Whether the pinned SGLang protocol model propagates top-level sessions.
 
@@ -186,6 +201,20 @@ def accepts_session_id(path: str) -> bool:
     """
     route = path.split("?", 1)[0].rstrip("/")
     return route in {"/v1/chat/completions", "/v1/responses"}
+
+
+def inject_request_id(body: bytes | None, request_id: str) -> tuple[bytes | None, bool]:
+    """Inject an SGLang abort handle only into a valid JSON object body."""
+    if not body or not request_id:
+        return body, False
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return body, False
+    if not isinstance(payload, dict):
+        return body, False
+    payload["rid"] = request_id
+    return json.dumps(payload).encode(), True
 
 
 def as_blocks(content: Any) -> list[Any]:
@@ -491,6 +520,11 @@ class InferenceUpstream:
         return status
 
 
+@dataclass(frozen=True)
+class _PoolTicket:
+    priority: bool = False
+
+
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
     """Sticky per-conversation pool with bounded per-upstream admission.
 
@@ -532,7 +566,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             failover_after_s=HOME_FAILOVER_AFTER_S,
         )
         self._admission = asyncio.Condition(self._lock)
-        self._waiters: dict[str, deque[object]] = {
+        self._waiters: dict[str, deque[_PoolTicket]] = {
             upstream.alias: deque() for upstream in self.upstreams
         }
         self._active_sessions: set[str] = set()
@@ -561,12 +595,24 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             token_capacity_per_upstream=token_capacity_per_upstream,
         )
 
+    async def route_alias(
+        self, session_id: str, *, exclude: set[str] | None = None
+    ) -> str:
+        """Resolve and pin a session's target without consuming capacity."""
+        async with self._admission:
+            if self._closing:
+                raise InferenceAdmissionError("Inference gateway is shutting down")
+            return self._select_locked(
+                session_id, exclude or set(), now=time.time()
+            ).alias
+
     async def acquire(
         self,
         session_id: str = "",
         *,
         exclude: set[str] | None = None,
         input_tokens: int = 0,
+        priority: bool = False,
     ) -> InferenceUpstream:
         """Place first for cache locality, then wait for that member's capacity."""
         if input_tokens < 0:
@@ -596,9 +642,24 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 raise InferenceAdmissionError(
                     f"Inference queue is full ({total_queued}/{self.max_queue_size})"
                 )
-            ticket = object()
+            ticket = _PoolTicket(priority=priority)
             waiters = self._waiters[selected.alias]
-            waiters.append(ticket)
+            # A proven continuation may take the next slot. This is deliberately
+            # not a general priority API: callers opt in explicitly, and the
+            # gateway only does so for a stable session with a prior 2xx reply.
+            if priority:
+                # FIFO within the continuation class, ahead of ordinary work.
+                index = next(
+                    (
+                        position
+                        for position, queued_ticket in enumerate(waiters)
+                        if not queued_ticket.priority
+                    ),
+                    len(waiters),
+                )
+                waiters.insert(index, ticket)
+            else:
+                waiters.append(ticket)
             selected.queued += 1
             selected.input_tokens_queued += input_tokens
             queued = True
@@ -751,6 +812,153 @@ class RelayedResponse:
     feedback_headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class _FirstTurnAttempt:
+    """A replay-safe first turn currently waiting for response headers."""
+
+    upstream_alias: str
+    preempt: asyncio.Event = field(default_factory=asyncio.Event)
+    resume_after: asyncio.Future[None] | None = None
+    released: asyncio.Future[None] | None = None
+
+
+@dataclass
+class _ContinuationHandoff:
+    resume_first_turn: asyncio.Future[None]
+    victim_released: asyncio.Future[None]
+
+
+class ContinuationQoS:
+    """Ephemeral session-success classification and cooperative preemption.
+
+    This is intentionally not called cache residency: a successful request is
+    evidence of conversation history only. Engine cache state can disappear at
+    any time and is neither queried nor inferred here.
+    """
+
+    def __init__(
+        self, *, enabled: bool = False, max_retries: int = 1, min_preempt_tokens: int = 0
+    ) -> None:
+        if max_retries < 0:
+            raise ValueError("continuation_qos_max_retries must be >= 0")
+        if min_preempt_tokens < 0:
+            raise ValueError("continuation_qos_min_preempt_tokens must be >= 0")
+        self.enabled = enabled
+        self.max_retries = max_retries
+        self.min_preempt_tokens = min_preempt_tokens
+        self._successful: OrderedDict[str, None] = OrderedDict()
+        self._first_turns: dict[str, deque[_FirstTurnAttempt]] = {}
+        self._counters = {
+            "first_turn": 0,
+            "continuation": 0,
+            "unclassified": 0,
+            "preemptions_requested": 0,
+            "first_turns_preempted": 0,
+            "first_turn_retries": 0,
+            "retry_budget_exhausted": 0,
+            "abort_failures": 0,
+            "unconfirmed_cleanup_holds": 0,
+            "cleanup_reapers_active": 0,
+            "cleanup_reaper_recoveries": 0,
+            "cleanup_reaper_attempts": 0,
+            "cleanup_reaper_cancellations": 0,
+        }
+
+    def classify(self, explicit_session: str) -> str:
+        if not explicit_session:
+            kind = "unclassified"
+        elif explicit_session in self._successful:
+            kind = "continuation"
+        else:
+            kind = "first-turn"
+        self._counters[kind.replace("-", "_")] += 1
+        return kind
+
+    def mark_successful(self, explicit_session: str) -> None:
+        if not explicit_session:
+            return
+        self._successful.pop(explicit_session, None)
+        self._successful[explicit_session] = None
+        while len(self._successful) > MAX_ROUTES:
+            self._successful.popitem(last=False)
+
+    def register_first_turn(self, upstream_alias: str) -> _FirstTurnAttempt:
+        attempt = _FirstTurnAttempt(upstream_alias)
+        self._first_turns.setdefault(upstream_alias, deque()).append(attempt)
+        return attempt
+
+    def unregister_first_turn(self, attempt: _FirstTurnAttempt) -> None:
+        attempts = self._first_turns.get(attempt.upstream_alias)
+        if attempts is None:
+            return
+        try:
+            attempts.remove(attempt)
+        except ValueError:
+            pass
+        if not attempts:
+            self._first_turns.pop(attempt.upstream_alias, None)
+
+    def request_preemption(self, upstream_alias: str) -> _ContinuationHandoff | None:
+        """Signal one replay-safe first turn and return its continuation barrier."""
+        attempts = self._first_turns.get(upstream_alias, ())
+        victim = next((item for item in attempts if not item.preempt.is_set()), None)
+        if victim is None:
+            return None
+        barrier = asyncio.get_running_loop().create_future()
+        released = asyncio.get_running_loop().create_future()
+        victim.resume_after = barrier
+        victim.released = released
+        victim.preempt.set()
+        self._counters["preemptions_requested"] += 1
+        return _ContinuationHandoff(barrier, released)
+
+    def preempted(self) -> None:
+        self._counters["first_turns_preempted"] += 1
+
+    def retried(self) -> None:
+        self._counters["first_turn_retries"] += 1
+
+    def exhausted(self) -> None:
+        self._counters["retry_budget_exhausted"] += 1
+
+    def abort_failed(self) -> None:
+        self._counters["abort_failures"] += 1
+
+    def cleanup_held(self) -> None:
+        self._counters["unconfirmed_cleanup_holds"] += 1
+        self._counters["cleanup_reapers_active"] += 1
+
+    def cleanup_recovered(self) -> None:
+        self._counters["cleanup_reapers_active"] = max(
+            0, self._counters["cleanup_reapers_active"] - 1
+        )
+        self._counters["cleanup_reaper_recoveries"] += 1
+
+    def cleanup_reaper_attempted(self) -> None:
+        self._counters["cleanup_reaper_attempts"] += 1
+
+    def cleanup_reaper_cancelled(self) -> None:
+        self._counters["cleanup_reapers_active"] = max(
+            0, self._counters["cleanup_reapers_active"] - 1
+        )
+        self._counters["cleanup_reaper_cancellations"] += 1
+
+    @staticmethod
+    def finish_continuation(handoff: _ContinuationHandoff | None) -> None:
+        if handoff is not None and not handoff.resume_first_turn.done():
+            handoff.resume_first_turn.set_result(None)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "mode": "enabled" if self.enabled else "disabled",
+            "max_retries": self.max_retries,
+            "min_preempt_tokens": self.min_preempt_tokens,
+            "known_successful_sessions": len(self._successful),
+            "replay_safe_first_turns": sum(map(len, self._first_turns.values())),
+            **self._counters,
+        }
+
+
 class InferenceBackend:
     """Hoist, key, pick an upstream, and relay the exchange verbatim."""
 
@@ -771,6 +979,11 @@ class InferenceBackend:
         | None = None,
         health_cache_ttl_s: float = DEFAULT_HEALTH_CACHE_TTL_S,
         health_failure_threshold: int = DEFAULT_HEALTH_FAILURE_THRESHOLD,
+        continuation_qos_enabled: bool = DEFAULT_CONTINUATION_QOS_ENABLED,
+        continuation_qos_max_retries: int = DEFAULT_CONTINUATION_QOS_MAX_RETRIES,
+        continuation_qos_min_preempt_tokens: int = (
+            DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
+        ),
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -803,6 +1016,12 @@ class InferenceBackend:
         # pre-admission cache-residency result. Record UNKNOWN observations;
         # do not activate cache-priority scheduling from prompt size or history.
         self.cache_admission = AdmissionController()
+        self.continuation_qos = ContinuationQoS(
+            enabled=continuation_qos_enabled,
+            max_retries=continuation_qos_max_retries,
+            min_preempt_tokens=continuation_qos_min_preempt_tokens,
+        )
+        self._cleanup_reapers: set[asyncio.Task[None]] = set()
 
     async def probe_upstreams(self) -> list[UpstreamReachability]:
         """Return one coalesced, briefly cached local-control-plane observation."""
@@ -966,13 +1185,20 @@ class InferenceBackend:
                 "Inference relay requires scitex-genai[gateway]"
             ) from exc
 
+        explicit_session = request_session_key(headers)
+        qos_session = continuation_qos_session_key(headers)
         body, session = self.prepare(
             body,
             hoist=hoists_on(path),
-            affinity_key=request_session_key(headers),
+            affinity_key=explicit_session,
             inject_session_id=accepts_session_id(path),
         )
         routing_session = session or ""
+        qos_kind = (
+            self.continuation_qos.classify(qos_session)
+            if self.continuation_qos.enabled
+            else "disabled"
+        )
         self.cache_admission.observe(CacheResidency.UNKNOWN)
         feedback_headers = {
             "x-scitex-admission-mode": "observe-only",
@@ -988,107 +1214,388 @@ class InferenceBackend:
         attempted: set[str] = set()
         failures: list[str] = []
         waited = 0.0
-        while len(attempted) < len(self.pool.upstreams):
-            try:
-                upstream = await self.pool.acquire(
-                    routing_session, exclude=attempted, input_tokens=input_tokens
+        replay_count = 0
+        continuation_handoff: _ContinuationHandoff | None = None
+        handed_to_stream = False
+        try:
+            if qos_kind == "continuation":
+                target_alias = await self.pool.route_alias(routing_session)
+                continuation_handoff = self.continuation_qos.request_preemption(
+                    target_alias
                 )
-            except HomeMemberReloading as exc:
-                if waited < self.wait_for_home_s:
-                    # Wait it out here rather than hand the caller a 503: the
-                    # home is reloading, the request stays open, and the
-                    # upstream is tried again as soon as its cooldown lapses.
-                    # Time passed, so an upstream that gave no response is a
-                    # candidate again.
-                    slice_s = min(max(exc.retry_after_s, 0.1), WAIT_SLICE_S)
-                    self._note(
-                        f"[relay] conv={routing_session[:8] or '-'} waiting {slice_s:.0f}s "
-                        f"for its home (waited {waited:.0f}s of "
-                        f"{self.wait_for_home_s:.0f}s): {exc}"
+                if continuation_handoff is not None:
+                    # Do not overlap at the engine: capacity=2 means gateway
+                    # admission alone cannot tell that the continuation is
+                    # queued behind a long prefill inside SGLang.
+                    await continuation_handoff.victim_released
+            while len(attempted) < len(self.pool.upstreams):
+                try:
+                    upstream = await self.pool.acquire(
+                        routing_session,
+                        exclude=attempted,
+                        input_tokens=input_tokens,
+                        priority=qos_kind == "continuation",
                     )
-                    await asyncio.sleep(slice_s)
-                    waited += slice_s
-                    attempted.clear()
+                except HomeMemberReloading as exc:
+                    if waited < self.wait_for_home_s:
+                        # Wait it out here rather than hand the caller a 503: the
+                        # home is reloading, the request stays open, and the
+                        # upstream is tried again as soon as its cooldown lapses.
+                        # Time passed, so an upstream that gave no response is a
+                        # candidate again.
+                        slice_s = min(max(exc.retry_after_s, 0.1), WAIT_SLICE_S)
+                        self._note(
+                            f"[relay] conv={routing_session[:8] or '-'} waiting {slice_s:.0f}s "
+                            f"for its home (waited {waited:.0f}s of "
+                            f"{self.wait_for_home_s:.0f}s): {exc}"
+                        )
+                        await asyncio.sleep(slice_s)
+                        waited += slice_s
+                        attempted.clear()
+                        continue
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} held: {exc} "
+                        f"(retry after {exc.retry_after_s:.0f}s; waited {waited:.0f}s)"
+                    )
+                    raise UpstreamReloading(
+                        f"{exc}. Retry this conversation after "
+                        f"{exc.retry_after_s:.0f}s; it stays pinned to its home "
+                        f"upstream while that upstream reloads.",
+                        retry_after_s=exc.retry_after_s,
+                    ) from exc
+                except NoAccountAvailable as exc:
+                    failures.append(str(exc))
+                    break
+                attempted.add(upstream.alias)
+                started = time.monotonic()
+                self._note(
+                    f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
+                    f"{method} {path} bytes={len(body or b'')} "
+                    f"estimated_input_tokens={input_tokens} "
+                    f"admitted_input_tokens={upstream.input_tokens_in_flight}"
+                )
+                dispatch_request_id = (
+                    secrets.token_urlsafe(24)
+                    if self.continuation_qos.enabled and accepts_session_id(path)
+                    else ""
+                )
+                dispatch_body, rid_confirmed = inject_request_id(
+                    body, dispatch_request_id
+                )
+                client = httpx.AsyncClient(timeout=self.timeout_s)
+                slot_owned = True
+
+                async def release_slot() -> None:
+                    nonlocal slot_owned
+                    if not slot_owned:
+                        return
+                    # Transfer ownership before awaiting. If this task is
+                    # cancelled during shield, the one release keeps running
+                    # and no cleanup path can decrement a later request.
+                    slot_owned = False
+                    task = asyncio.create_task(
+                        self.pool.release(
+                            upstream,
+                            input_tokens=input_tokens,
+                            session_id=routing_session,
+                        )
+                    )
+                    await asyncio.shield(task)
+
+                send_task: asyncio.Task[Any] | None = None
+                preempt_task: asyncio.Task[Any] | None = None
+                first_attempt = None
+                if (
+                    qos_kind == "first-turn"
+                    and rid_confirmed
+                    and input_tokens >= self.continuation_qos.min_preempt_tokens
+                    and replay_count < self.continuation_qos.max_retries
+                ):
+                    first_attempt = self.continuation_qos.register_first_turn(
+                        upstream.alias
+                    )
+                try:
+                    request = client.build_request(
+                        method,
+                        upstream.base_url + (upstream_path or path),
+                        content=dispatch_body,
+                        headers=forwarded,
+                    )
+                    if first_attempt is None:
+                        if self.continuation_qos.enabled:
+                            send_task = asyncio.create_task(
+                                client.send(request, stream=True)
+                            )
+                            response = await asyncio.shield(send_task)
+                        else:
+                            response = await client.send(request, stream=True)
+                    else:
+                        send_task = asyncio.create_task(client.send(request, stream=True))
+                        preempt_task = asyncio.create_task(first_attempt.preempt.wait())
+                        done, _ = await asyncio.wait(
+                            (send_task, preempt_task),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        # Headers win a simultaneous race: once an upstream
+                        # response exists there is no longer an eligible
+                        # pre-response request to replay.
+                        if send_task in done:
+                            preempt_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await preempt_task
+                            if (
+                                first_attempt.preempt.is_set()
+                                and first_attempt.released is not None
+                                and not first_attempt.released.done()
+                            ):
+                                first_attempt.released.set_result(None)
+                            response = await send_task
+                        else:
+                            abort_ok = await self._abort_request(
+                                upstream, dispatch_request_id, headers=forwarded
+                            )
+                            if not abort_ok:
+                                if first_attempt.released is not None and not first_attempt.released.done():
+                                    first_attempt.released.set_exception(
+                                        InferenceAdmissionError(
+                                            "Continuation QoS could not confirm upstream abort"
+                                        )
+                                    )
+                                response = await send_task
+                            else:
+                                send_task.cancel()
+                                await asyncio.gather(send_task, return_exceptions=True)
+                                self.continuation_qos.preempted()
+                                self._note(
+                                    f"[relay] conv={routing_session[:8] or '-'} <- "
+                                    f"{upstream.alias} cooperatively_preempted_before_response"
+                                )
+                                await asyncio.shield(client.aclose())
+                                await release_slot()
+                                if first_attempt.released is not None and not first_attempt.released.done():
+                                    first_attempt.released.set_result(None)
+                                barrier = first_attempt.resume_after
+                                self.continuation_qos.unregister_first_turn(first_attempt)
+                                first_attempt = None
+                                if barrier is not None:
+                                    await barrier
+                                replay_count += 1
+                                self.continuation_qos.retried()
+                                if replay_count >= self.continuation_qos.max_retries:
+                                    self.continuation_qos.exhausted()
+                                attempted.clear()
+                                continue
+                except asyncio.CancelledError:
+                    # Cancellation before a response body exists must not leak a
+                    # capacity slot; streaming cancellation is handled by _drain.
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
+                        "client_disconnected_before_response "
+                        f"after {time.monotonic() - started:.1f}s"
+                    )
+                    abort_ok = False
+                    safe_to_release = not self.continuation_qos.enabled
+                    if rid_confirmed:
+                        abort_ok = await asyncio.shield(
+                            self._abort_request(
+                                upstream, dispatch_request_id, headers=forwarded
+                            )
+                        )
+                    if abort_ok and send_task is not None and not send_task.done():
+                        send_task.cancel()
+                        safe_to_release = True
+                    elif abort_ok:
+                        safe_to_release = True
+                    elif send_task is not None:
+                        # Without a confirmed engine abort, retain the gateway
+                        # slot until the upstream really finishes.
+                        try:
+                            cancelled_response = (
+                                send_task.result()
+                                if send_task.done()
+                                else await asyncio.shield(send_task)
+                            )
+                            async for _ in cancelled_response.aiter_bytes():
+                                pass
+                            await cancelled_response.aclose()
+                            safe_to_release = True
+                        except BaseException:  # task/transport state is unknown
+                            safe_to_release = False
+                    if preempt_task is not None and not preempt_task.done():
+                        preempt_task.cancel()
+                    pending = [
+                        task
+                        for task in (send_task, preempt_task)
+                        if task is not None
+                    ]
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    await asyncio.shield(client.aclose())
+                    if safe_to_release:
+                        await release_slot()
+                    elif rid_confirmed:
+                        slot_owned = False  # ownership transfers to the reaper
+                        self._schedule_cleanup_reaper(
+                            upstream,
+                            dispatch_request_id,
+                            headers=forwarded,
+                            input_tokens=input_tokens,
+                            session_id=routing_session,
+                        )
+                    if (
+                        first_attempt is not None
+                        and first_attempt.preempt.is_set()
+                        and first_attempt.released is not None
+                        and not first_attempt.released.done()
+                    ):
+                        first_attempt.released.set_exception(
+                            InferenceAdmissionError(
+                                "Preempted first-turn client disconnected"
+                            )
+                        )
+                    raise
+                except httpx.TransportError as exc:
+                    await client.aclose()
+                    safe_to_release = not rid_confirmed
+                    if rid_confirmed:
+                        safe_to_release = await self._abort_request(
+                            upstream, dispatch_request_id, headers=forwarded
+                        )
+                    if safe_to_release:
+                        await release_slot()
+                    else:
+                        slot_owned = False  # ownership transfers to the reaper
+                        self._schedule_cleanup_reaper(
+                            upstream,
+                            dispatch_request_id,
+                            headers=forwarded,
+                            input_tokens=input_tokens,
+                            session_id=routing_session,
+                        )
+                        raise InferenceAdmissionError(
+                            "Upstream request state is unknown after transport "
+                            "failure; capacity remains reserved because abort "
+                            "could not be confirmed"
+                        ) from exc
+                    await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
+                        f"no response ({exc.__class__.__name__}) after "
+                        f"{time.monotonic() - started:.1f}s; out of rotation for "
+                        f"{UNREACHABLE_COOLDOWN_S:.0f}s"
+                    )
+                    failures.append(f"{upstream.alias} ({exc.__class__.__name__}: {exc})")
                     continue
-                self._note(
-                    f"[relay] conv={routing_session[:8] or '-'} held: {exc} "
-                    f"(retry after {exc.retry_after_s:.0f}s; waited {waited:.0f}s)"
-                )
-                raise UpstreamReloading(
-                    f"{exc}. Retry this conversation after "
-                    f"{exc.retry_after_s:.0f}s; it stays pinned to its home "
-                    f"upstream while that upstream reloads.",
-                    retry_after_s=exc.retry_after_s,
-                ) from exc
-            except NoAccountAvailable as exc:
-                failures.append(str(exc))
-                break
-            attempted.add(upstream.alias)
-            started = time.monotonic()
-            self._note(
-                f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
-                f"{method} {path} bytes={len(body or b'')} "
-                f"estimated_input_tokens={input_tokens} "
-                f"admitted_input_tokens={upstream.input_tokens_in_flight}"
-            )
-            client = httpx.AsyncClient(timeout=self.timeout_s)
-            try:
-                request = client.build_request(
-                    method,
-                    upstream.base_url + (upstream_path or path),
-                    content=body,
-                    headers=forwarded,
-                )
-                response = await client.send(request, stream=True)
-            except asyncio.CancelledError:
-                # Cancellation before a response body exists must not leak a
-                # capacity slot; streaming cancellation is handled by _drain.
-                self._note(
-                    f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
-                    "client_disconnected_before_response "
-                    f"after {time.monotonic() - started:.1f}s"
-                )
-                await asyncio.shield(client.aclose())
-                await asyncio.shield(
-                    self.pool.release(
+                finally:
+                    if first_attempt is not None:
+                        if (
+                            first_attempt.preempt.is_set()
+                            and first_attempt.released is not None
+                            and not first_attempt.released.done()
+                        ):
+                            first_attempt.released.set_exception(
+                                InferenceAdmissionError(
+                                    "First-turn handoff did not complete"
+                                )
+                            )
+                        self.continuation_qos.unregister_first_turn(first_attempt)
+                handed_to_stream = True
+                return RelayedResponse(
+                    status_code=response.status_code,
+                    content_type=response.headers.get("content-type", "application/json"),
+                    feedback_headers=feedback_headers,
+                    body=self._drain(
+                        client,
+                        response,
                         upstream,
+                        tag=f"conv={routing_session[:8] or '-'} <- {upstream.alias} "
+                        f"status={response.status_code}",
+                        started=started,
                         input_tokens=input_tokens,
                         session_id=routing_session,
-                    )
+                        continuation_handoff=continuation_handoff,
+                        request_id=dispatch_request_id if rid_confirmed else "",
+                        request_headers=forwarded,
+                        successful_session=(
+                            qos_session
+                            if 200 <= response.status_code < 300
+                            else ""
+                        ),
+                    ),
                 )
+            raise UpstreamUnreachable(self._refusal(failures))
+        finally:
+            if not handed_to_stream:
+                self.continuation_qos.finish_continuation(continuation_handoff)
+
+    async def _abort_request(
+        self,
+        upstream: InferenceUpstream,
+        request_id: str,
+        *,
+        headers: Mapping[str, str],
+    ) -> bool:
+        """Ask pinned SGLang to remove a request before closing its transport."""
+        if not request_id:
+            return False
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=min(self.timeout_s, 5.0)) as client:
+                response = await client.post(
+                    upstream.base_url + "/abort_request",
+                    json={"rid": request_id},
+                    headers=headers,
+                )
+            if 200 <= response.status_code < 300:
+                return True
+            detail = f"HTTP {response.status_code}"
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            detail = exc.__class__.__name__
+        self.continuation_qos.abort_failed()
+        self._note(
+            f"[relay] rid abort failed on {upstream.alias}: {detail}; "
+            "continuation not dispatched"
+        )
+        return False
+
+    def _schedule_cleanup_reaper(
+        self,
+        upstream: InferenceUpstream,
+        request_id: str,
+        *,
+        headers: Mapping[str, str],
+        input_tokens: int,
+        session_id: str,
+    ) -> None:
+        """Retain admission and retry abort until engine cleanup is confirmed."""
+        self.continuation_qos.cleanup_held()
+
+        async def reap() -> None:
+            delay_s = 0.1
+            try:
+                while True:
+                    await asyncio.sleep(delay_s)
+                    self.continuation_qos.cleanup_reaper_attempted()
+                    if await self._abort_request(upstream, request_id, headers=headers):
+                        release = asyncio.create_task(
+                            self.pool.release(
+                                upstream,
+                                input_tokens=input_tokens,
+                                session_id=session_id,
+                            )
+                        )
+                        await asyncio.shield(release)
+                        self.continuation_qos.cleanup_recovered()
+                        return
+                    delay_s = min(5.0, delay_s * 2)
+            except asyncio.CancelledError:
+                self.continuation_qos.cleanup_reaper_cancelled()
                 raise
-            except httpx.TransportError as exc:
-                await client.aclose()
-                await self.pool.release(
-                    upstream,
-                    input_tokens=input_tokens,
-                    session_id=routing_session,
-                )
-                await self.pool.cool_down(upstream, UNREACHABLE_COOLDOWN_S)
-                self._note(
-                    f"[relay] conv={routing_session[:8] or '-'} <- {upstream.alias} "
-                    f"no response ({exc.__class__.__name__}) after "
-                    f"{time.monotonic() - started:.1f}s; out of rotation for "
-                    f"{UNREACHABLE_COOLDOWN_S:.0f}s"
-                )
-                failures.append(f"{upstream.alias} ({exc.__class__.__name__}: {exc})")
-                continue
-            return RelayedResponse(
-                status_code=response.status_code,
-                content_type=response.headers.get("content-type", "application/json"),
-                feedback_headers=feedback_headers,
-                body=self._drain(
-                    client,
-                    response,
-                    upstream,
-                    tag=f"conv={routing_session[:8] or '-'} <- {upstream.alias} "
-                    f"status={response.status_code}",
-                    started=started,
-                    input_tokens=input_tokens,
-                    session_id=routing_session,
-                ),
-            )
-        raise UpstreamUnreachable(self._refusal(failures))
+
+        task = asyncio.create_task(reap())
+        self._cleanup_reapers.add(task)
+        task.add_done_callback(self._cleanup_reapers.discard)
 
     def _refusal(self, failures: list[str]) -> str:
         urls = ", ".join(upstream.alias for upstream in self.pool.upstreams)
@@ -1110,31 +1617,82 @@ class InferenceBackend:
         started: float | None = None,
         input_tokens: int = 0,
         session_id: str = "",
+        continuation_handoff: _ContinuationHandoff | None = None,
+        successful_session: str = "",
+        request_id: str = "",
+        request_headers: Mapping[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
         sent = 0
         outcome = "complete"
+        stream = response.aiter_bytes()
+        next_chunk: asyncio.Task[bytes] | None = None
+        release_capacity = True
+
+        async def drain_to_eof() -> None:
+            nonlocal next_chunk
+            while True:
+                if next_chunk is None:
+                    next_chunk = asyncio.create_task(anext(stream))
+                try:
+                    await asyncio.shield(next_chunk)
+                except StopAsyncIteration:
+                    next_chunk = None
+                    return
+                next_chunk = None
+
         try:
-            async for chunk in response.aiter_bytes():
+            while True:
+                next_chunk = asyncio.create_task(anext(stream))
+                try:
+                    chunk = await asyncio.shield(next_chunk)
+                except StopAsyncIteration:
+                    next_chunk = None
+                    break
+                next_chunk = None
                 sent += len(chunk)
                 yield chunk
+            self.continuation_qos.mark_successful(successful_session)
         except (asyncio.CancelledError, GeneratorExit):
             outcome = "client_disconnected"
+            aborted = False
+            if request_id:
+                aborted = await asyncio.shield(
+                    self._abort_request(
+                        upstream,
+                        request_id,
+                        headers=request_headers or {},
+                    )
+                )
+            if not aborted:
+                # The pinned engine cannot be trusted to notice transport
+                # closure. Keep capacity until clean EOF when explicit abort
+                # could not be confirmed.
+                release_capacity = False
+                await drain_to_eof()
+                release_capacity = True
+            elif next_chunk is not None:
+                if not next_chunk.done():
+                    next_chunk.cancel()
+                await asyncio.gather(next_chunk, return_exceptions=True)
             raise
         except BaseException:
             outcome = "stream_error"
+            if request_id:
+                release_capacity = await asyncio.shield(
+                    self._abort_request(
+                        upstream,
+                        request_id,
+                        headers=request_headers or {},
+                    )
+                )
             raise
         finally:
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 self._note(f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s")
-            # ALWAYS, on every path — including a client that disconnected
-            # mid-stream, which cancels this generator. An unreleased counter
-            # marks that upstream busy FOREVER, so the balancer would route
-            # away from a card that is actually idle: a leak that degrades into
-            # the exact pile-up this routing exists to prevent, and one that
-            # gets worse with every failed request. Shielded because the
-            # server's cancel scope re-cancels at every await, and the release
-            # must finish even after the response is gone.
+            # Close transport on every path. Capacity is released only after
+            # clean EOF or confirmed abort; ambiguous engine state transfers
+            # ownership to the tracked background abort reaper.
             await asyncio.shield(
                 self._finish(
                     client,
@@ -1142,8 +1700,12 @@ class InferenceBackend:
                     upstream,
                     input_tokens=input_tokens,
                     session_id=session_id,
+                    release_capacity=release_capacity,
+                    request_id=request_id,
+                    request_headers=request_headers or {},
                 )
             )
+            self.continuation_qos.finish_continuation(continuation_handoff)
 
     async def _finish(
         self,
@@ -1153,17 +1715,34 @@ class InferenceBackend:
         *,
         input_tokens: int = 0,
         session_id: str = "",
+        release_capacity: bool = True,
+        request_id: str = "",
+        request_headers: Mapping[str, str] | None = None,
     ) -> None:
         try:
             await response.aclose()
             await client.aclose()
         finally:
-            await self.pool.release(
-                upstream,
-                input_tokens=input_tokens,
-                session_id=session_id,
-            )
+            if release_capacity:
+                await self.pool.release(
+                    upstream,
+                    input_tokens=input_tokens,
+                    session_id=session_id,
+                )
+            else:
+                self._schedule_cleanup_reaper(
+                    upstream,
+                    request_id,
+                    headers=request_headers or {},
+                    input_tokens=input_tokens,
+                    session_id=session_id,
+                )
 
     async def close(self) -> None:
         """Stop admission and wake requests waiting for capacity."""
+        tasks = tuple(self._cleanup_reapers)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.pool.close()

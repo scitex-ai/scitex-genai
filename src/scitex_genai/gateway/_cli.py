@@ -119,6 +119,35 @@ def _add_settings_args(
             "unset disables the token budget)."
         ),
     )
+    parser.add_argument(
+        "--inference-continuation-qos",
+        action=argparse.BooleanOptionalAction,
+        default=default,
+        help=(
+            "Enable opt-in continuation handoff/preemption for explicit stable "
+            "session IDs (default: gateway.inference_continuation_qos_enabled, "
+            "else disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-continuation-qos-max-retries",
+        type=int,
+        default=default,
+        help=(
+            "Maximum transparent retries of a cooperatively preempted first turn "
+            "(default: gateway.inference_continuation_qos_max_retries, else 1)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-continuation-qos-min-preempt-tokens",
+        type=int,
+        default=default,
+        help=(
+            "Minimum estimated first-turn input tokens eligible for preemption "
+            "(default: gateway.inference_continuation_qos_min_preempt_tokens, "
+            "else 0)."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,6 +251,13 @@ def _install_unit(args: argparse.Namespace) -> None:
         inference_token_capacity_per_upstream=(
             args.inference_token_capacity_per_upstream
         ),
+        inference_continuation_qos_enabled=args.inference_continuation_qos,
+        inference_continuation_qos_max_retries=(
+            args.inference_continuation_qos_max_retries
+        ),
+        inference_continuation_qos_min_preempt_tokens=(
+            args.inference_continuation_qos_min_preempt_tokens
+        ),
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -253,6 +289,13 @@ def main(
         inference_max_queue_size=args.inference_max_queue_size,
         inference_token_capacity_per_upstream=(
             args.inference_token_capacity_per_upstream
+        ),
+        inference_continuation_qos_enabled=args.inference_continuation_qos,
+        inference_continuation_qos_max_retries=(
+            args.inference_continuation_qos_max_retries
+        ),
+        inference_continuation_qos_min_preempt_tokens=(
+            args.inference_continuation_qos_min_preempt_tokens
         ),
     )
     if settings.external_provider is not None:
@@ -311,6 +354,15 @@ def main(
             timeout_s=settings.inference_timeout_s,
             telemetry_sink=_telemetry_sink(),
             journal=lambda line: print(line, flush=True),
+            continuation_qos_enabled=(
+                settings.inference_continuation_qos_enabled
+            ),
+            continuation_qos_max_retries=(
+                settings.inference_continuation_qos_max_retries
+            ),
+            continuation_qos_min_preempt_tokens=(
+                settings.inference_continuation_qos_min_preempt_tokens
+            ),
         )
         print(announce(settings.host, settings.port, pool), flush=True)
     else:
