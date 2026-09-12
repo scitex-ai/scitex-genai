@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -192,6 +192,7 @@ class ExternalProviderBackend(InferenceBackend):
         *,
         body: bytes | None,
         headers: Mapping[str, str],
+        client_disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> RelayedResponse:
         if method.upper() != "POST":
             # Never expose vendor model discovery: it advertises models the
@@ -278,6 +279,7 @@ class ExternalProviderBackend(InferenceBackend):
                 body=encoded,
                 headers=outbound_headers,
                 upstream_path=upstream_path,
+                client_disconnected=client_disconnected,
             )
         except Exception:
             await self.usage.settle(

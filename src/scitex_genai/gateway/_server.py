@@ -271,7 +271,11 @@ def create_app(
             body = await request.body()
             try:
                 relayed = await backend.relay(
-                    request.method, target, body=body or None, headers=request.headers
+                    request.method,
+                    target,
+                    body=body or None,
+                    headers=request.headers,
+                    client_disconnected=request.is_disconnected,
                 )
             except UpstreamError as exc:
                 return JSONResponse(
