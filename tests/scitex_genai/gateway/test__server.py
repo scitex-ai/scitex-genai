@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import threading
 from contextlib import asynccontextmanager, suppress
@@ -719,6 +720,88 @@ async def test_sigterm_closes_queue_before_uvicorn_drains_admitted_request(
         admitted_response.status_code,
         serve_task.done(),
     ) == (True, 503, "inference_admission", True, 200, True)
+
+
+@pytest.mark.asyncio
+async def test_real_disconnect_before_headers_does_not_log_asgi_error(
+    upstream_factory, caplog
+) -> None:
+    # Arrange: a real socket is required because ASGITransport does not emit
+    # the http.disconnect event observed by Starlette in production.
+    release_upstream = threading.Event()
+    upstream = upstream_factory(
+        block_until=release_upstream,
+        abort_releases=True,
+    )
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    app = create_app(
+        InferenceBackend(pool, continuation_qos_enabled=True),
+        api_key="relay-secret",
+    )
+    server_errors: list[BaseException] = []
+
+    class ObservedApp:
+        state = app.state
+
+        async def __call__(self, scope, receive, send) -> None:
+            try:
+                await app(scope, receive, send)
+            except BaseException as exc:
+                server_errors.append(exc)
+                raise
+
+    server = _build_uvicorn_server(
+        ObservedApp(),
+        host="127.0.0.1",
+        port=0,
+        log_level="error",
+        timeout_graceful_shutdown=5,
+    )
+    caplog.set_level(logging.ERROR, logger="uvicorn.error")
+    serve_task = asyncio.create_task(server.serve())
+    for _ in range(1000):
+        if server.started:
+            break
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    payload = json.dumps({"model": "m", "input": "cold", "stream": True}).encode()
+    _, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST /v1/responses HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"X-API-Key: relay-secret\r\n"
+        b"X-SciTeX-Session-ID: cold\r\n"
+        + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+        + payload
+    )
+    await writer.drain()
+    started = await asyncio.to_thread(upstream.request_started.wait, 2)
+
+    # Act
+    writer.close()
+    await writer.wait_closed()
+    for _ in range(1000):
+        if len(upstream.requests) >= 2 and pool.status()[0]["in_flight"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    server.should_exit = True
+    await asyncio.wait_for(serve_task, timeout=2)
+    asgi_errors = [
+        record.getMessage()
+        for record in caplog.records
+        if "Exception in ASGI application" in record.getMessage()
+    ]
+
+    # Assert
+    assert (
+        started,
+        [request["path"] for request in upstream.requests],
+        pool.status()[0]["in_flight"],
+        server_errors,
+        asgi_errors,
+        serve_task.done(),
+    ) == (True, ["/v1/responses", "/abort_request"], 0, [], [], True)
 
 
 @pytest.mark.asyncio
