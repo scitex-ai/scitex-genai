@@ -219,6 +219,22 @@ async def _wait_for_queue(pool: InferenceUpstreamPool, size: int) -> None:
     raise AssertionError(f"queue did not reach {size}: {pool.status()}")
 
 
+async def _wait_for_requests(upstream, size: int) -> None:
+    for _ in range(200):
+        if len(upstream.requests) >= size:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"upstream saw {len(upstream.requests)} requests, wanted {size}")
+
+
+async def _wait_for_in_flight(pool: InferenceUpstreamPool, value: int) -> None:
+    for _ in range(200):
+        if pool.status()[0]["in_flight"] == value:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"in_flight did not reach {value}: {pool.status()}")
+
+
 @pytest.mark.asyncio
 async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> None:
     # Arrange
@@ -250,6 +266,39 @@ async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> 
         await pool.release(member)
     # Assert
     assert (saturated, pool.status()[0]["in_flight"]) == (expected, 0)
+
+
+@pytest.mark.asyncio
+async def test_priority_waiters_are_fifo_ahead_of_ordinary_work() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, max_queue_size=3
+    )
+    active = await pool.acquire("active")
+    ordinary = asyncio.create_task(pool.acquire("ordinary"))
+    await _wait_for_queue(pool, 1)
+    priority_one = asyncio.create_task(pool.acquire("priority-1", priority=True))
+    await _wait_for_queue(pool, 2)
+    priority_two = asyncio.create_task(pool.acquire("priority-2", priority=True))
+    await _wait_for_queue(pool, 3)
+
+    # Act
+    await pool.release(active, session_id="active")
+    first = await priority_one
+    order = ["priority-1"]
+    await pool.release(first, session_id="priority-1")
+    second = await priority_two
+    order.append("priority-2")
+    await pool.release(second, session_id="priority-2")
+    third = await ordinary
+    order.append("ordinary")
+    await pool.release(third, session_id="ordinary")
+
+    # Assert
+    assert (order, pool.status()[0]["in_flight"]) == (
+        ["priority-1", "priority-2", "ordinary"],
+        0,
+    )
 
 
 @pytest.mark.asyncio
@@ -592,6 +641,438 @@ async def test_relay_streams_the_upstream_sse_verbatim(upstream_factory) -> None
     received = await _collect(relayed.body)
     # Assert
     assert (relayed.content_type, received) == ("text/event-stream", b"".join(frames))
+
+
+@pytest.mark.asyncio
+async def test_continuation_qos_aborts_then_retries_first_turn(upstream_factory) -> None:
+    # Arrange: gateway capacity is deliberately 2. The handoff must happen
+    # before dispatch even though a second gateway slot is available.
+    release = __import__("threading").Event()
+    release.set()
+    upstream = upstream_factory(block_until=release, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=2)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+
+    known = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+    )
+    await _collect(known.body)
+    release.clear()
+
+    # Act
+    first_task = asyncio.create_task(
+        backend.relay(
+            "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "new"}
+        )
+    )
+    await _wait_for_requests(upstream, 2)
+    continuation_task = asyncio.create_task(
+        backend.relay(
+            "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+        )
+    )
+    continuation = await continuation_task
+    await _collect(continuation.body)
+    retried = await first_task
+    await _collect(retried.body)
+
+    # Assert: initial success, cold attempt, explicit abort, continuation,
+    # transparent cold retry. The gateway owns/overrides every SGLang rid.
+    paths = [request["path"] for request in upstream.requests]
+    abort = json.loads(upstream.requests[2]["body"])["rid"]
+    cold_rid = json.loads(upstream.requests[1]["body"])["rid"]
+    retry_rid = json.loads(upstream.requests[4]["body"])["rid"]
+    snapshot = backend.continuation_qos.snapshot()
+    assert (
+        paths,
+        abort == cold_rid,
+        retry_rid != cold_rid,
+        pool.status()[0]["in_flight"],
+        snapshot["first_turns_preempted"],
+        snapshot["first_turn_retries"],
+    ) == (
+        [
+            "/v1/responses",
+            "/v1/responses",
+            "/abort_request",
+            "/v1/responses",
+            "/v1/responses",
+        ],
+        True,
+        True,
+        0,
+        1,
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_cancellation_during_handoff_leaks_no_capacity(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release = __import__("threading").Event()
+    release.set()
+    upstream = upstream_factory(block_until=release, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=2)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+    known = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+    )
+    await _collect(known.body)
+    release.clear()
+    first_task = asyncio.create_task(
+        backend.relay(
+            "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "new"}
+        )
+    )
+    await _wait_for_requests(upstream, 2)
+    continuation = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "known"}
+    )
+
+    # Act
+    first_task.cancel()
+    cancelled = await _raised_async(first_task)
+    await anext(continuation.body)
+    await continuation.body.aclose()
+
+    # Assert
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        pool.status()[0]["in_flight"],
+        backend.continuation_qos.snapshot()["replay_safe_first_turns"],
+    ) == (True, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_continuation_qos_is_disabled_and_body_compatible_by_default(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    original = {"model": "m", "input": "hello", "rid": "caller-rid"}
+    # Act
+    relayed = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=json.dumps(original).encode(),
+        headers={"x-scitex-session-id": "stable"},
+    )
+    await _collect(relayed.body)
+
+    # Assert
+    assert (
+        json.loads(upstream.requests[0]["body"])["rid"],
+        backend.continuation_qos.snapshot()["mode"],
+    ) == ("caller-rid", "disabled")
+
+
+@pytest.mark.asyncio
+async def test_partial_2xx_stream_does_not_establish_a_continuation(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(chunks=(b"first", b"second"))
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url),
+        continuation_qos_enabled=True,
+    )
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+    first = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "stable"}
+    )
+    await anext(first.body)
+    await first.body.aclose()
+
+    # Act
+    again = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "stable"}
+    )
+    classified = backend.continuation_qos.snapshot()
+    await _collect(again.body)
+
+    # Assert
+    assert (
+        classified["first_turn"],
+        classified["continuation"],
+    ) == (2, 0)
+
+
+@pytest.mark.asyncio
+async def test_only_canonical_session_header_classifies_qos(upstream_factory) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url),
+        continuation_qos_enabled=True,
+    )
+    body = json.dumps({"model": "m", "input": "hello"}).encode()
+
+    # Act
+    legacy = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-session-id": "legacy"}
+    )
+    await _collect(legacy.body)
+    canonical = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=body,
+        headers={"x-scitex-session-id": "canonical"},
+    )
+    await _collect(canonical.body)
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert
+    assert (
+        snapshot["unclassified"],
+        snapshot["first_turn"],
+        snapshot["known_successful_sessions"],
+    ) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_before_headers_aborts_engine_and_releases_capacity(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release = __import__("threading").Event()
+    upstream = upstream_factory(block_until=release, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+    task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "new"},
+        )
+    )
+    await _wait_for_requests(upstream, 1)
+
+    # Act
+    task.cancel()
+    cancelled = await _raised_async(task)
+
+    # Assert
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        [request["path"] for request in upstream.requests],
+        pool.status()[0]["in_flight"],
+    ) == (True, ["/v1/responses", "/abort_request"], 0)
+
+
+@pytest.mark.asyncio
+async def test_invalid_body_is_never_registered_for_preemption(upstream_factory) -> None:
+    # Arrange
+    release = __import__("threading").Event()
+    upstream = upstream_factory(block_until=release, abort_releases=True)
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url),
+        continuation_qos_enabled=True,
+    )
+    task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=b"not-json",
+            headers={"x-scitex-session-id": "new"},
+        )
+    )
+    await _wait_for_requests(upstream, 1)
+
+    # Act
+    while_waiting = backend.continuation_qos.snapshot()["replay_safe_first_turns"]
+    release.set()
+    relayed = await task
+    await _collect(relayed.body)
+
+    # Assert
+    assert (
+        while_waiting,
+        [request["path"] for request in upstream.requests],
+    ) == (0, ["/v1/responses"])
+
+
+@pytest.mark.asyncio
+async def test_small_first_turn_is_below_configured_preemption_threshold(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release = __import__("threading").Event()
+    upstream = upstream_factory(block_until=release)
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url),
+        continuation_qos_enabled=True,
+        continuation_qos_min_preempt_tokens=1000,
+    )
+    task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=b'{"model":"m","input":"tiny"}',
+            headers={"x-scitex-session-id": "new"},
+        )
+    )
+    await _wait_for_requests(upstream, 1)
+
+    # Act
+    snapshot = backend.continuation_qos.snapshot()
+    release.set()
+    relayed = await task
+    await _collect(relayed.body)
+
+    # Assert
+    assert (
+        snapshot["min_preempt_tokens"],
+        snapshot["replay_safe_first_turns"],
+    ) == (1000, 0)
+
+
+@pytest.mark.asyncio
+async def test_failed_midstream_abort_retains_capacity_until_upstream_eof(
+    upstream_factory,
+) -> None:
+    # Arrange
+    finish = __import__("threading").Event()
+    upstream = upstream_factory(
+        chunks=(b"first", b"second"),
+        abort_status=500,
+        block_after_first_chunk=finish,
+    )
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = json.dumps({"model": "m", "input": "hello", "stream": True}).encode()
+    relayed = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=body,
+        headers={"x-scitex-session-id": "new"},
+    )
+    await anext(relayed.body)
+
+    # Act
+    close_task = asyncio.create_task(relayed.body.aclose())
+    await _wait_for_requests(upstream, 2)
+    before_eof = (close_task.done(), pool.status()[0]["in_flight"])
+    finish.set()
+    await close_task
+    request_rid = json.loads(upstream.requests[0]["body"])["rid"]
+    abort_rid = json.loads(upstream.requests[1]["body"])["rid"]
+
+    # Assert
+    assert (
+        before_eof,
+        pool.status()[0]["in_flight"],
+        request_rid == abort_rid,
+    ) == ((False, 1), 0, True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_chunk_wait_retains_capacity_when_abort_fails(
+    upstream_factory,
+) -> None:
+    # Arrange
+    finish = __import__("threading").Event()
+    upstream = upstream_factory(
+        chunks=(b"first", b"second"),
+        abort_status=500,
+        block_after_first_chunk=finish,
+    )
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    relayed = await backend.relay(
+        "POST",
+        "/v1/responses",
+        body=b'{"model":"m","input":"hello","stream":true}',
+        headers={"x-scitex-session-id": "new"},
+    )
+    await anext(relayed.body)
+    waiting = asyncio.create_task(anext(relayed.body))
+    await asyncio.sleep(0.02)
+
+    # Act
+    waiting.cancel()
+    await _wait_for_requests(upstream, 2)
+    before_eof = (waiting.done(), pool.status()[0]["in_flight"])
+    finish.set()
+    cancelled = await _raised_async(waiting)
+
+    # Assert
+    assert (
+        before_eof,
+        isinstance(cancelled, asyncio.CancelledError),
+        pool.status()[0]["in_flight"],
+    ) == ((False, 1), True, 0)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(abort_status=500)
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    member = await pool.acquire("held", input_tokens=10)
+    backend._schedule_cleanup_reaper(
+        member,
+        "rid-held",
+        headers={},
+        input_tokens=10,
+        session_id="held",
+    )
+    await _wait_for_requests(upstream, 1)
+
+    # Act
+    upstream.abort_status = 200
+    await _wait_for_in_flight(pool, 0)
+    snapshot = backend.continuation_qos.snapshot()
+    await backend.close()
+
+    # Assert
+    assert (
+        snapshot["cleanup_reapers_active"],
+        snapshot["cleanup_reaper_attempts"] >= 2,
+        snapshot["cleanup_reaper_recoveries"],
+        pool.status()[0]["in_flight"],
+    ) == (0, True, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_visible_reaper_without_double_release(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(abort_status=500)
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    member = await pool.acquire("held")
+    backend._schedule_cleanup_reaper(
+        member,
+        "rid-held",
+        headers={},
+        input_tokens=0,
+        session_id="held",
+    )
+    await _wait_for_requests(upstream, 1)
+    before = backend.continuation_qos.snapshot()["cleanup_reapers_active"]
+
+    # Act
+    await backend.close()
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert
+    assert (
+        before,
+        snapshot["cleanup_reapers_active"],
+        snapshot["cleanup_reaper_cancellations"],
+        pool.status()[0]["in_flight"],
+    ) == (1, 0, 1, 1)
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
+from scitex_config import get_scitex_dir
 
 from scitex_genai.gateway._secrets import GATEWAY_KEY_ENV
 
@@ -44,7 +45,11 @@ def isolate_the_scitex_store(tmp_path_factory: pytest.TempPathFactory) -> Iterat
         name: os.environ.get(name) for name in ("SCITEX_DIR", GATEWAY_KEY_ENV)
     }
     os.environ["SCITEX_DIR"] = str(tmp_path_factory.mktemp("scitex"))
-    os.environ.pop(GATEWAY_KEY_ENV, None)
+    # scitex-config loads dotenv on every path resolution. A present blank
+    # value prevents python-dotenv from repopulating the developer's real key,
+    # while resolve_gateway_key still treats it as unset after ``strip()``.
+    get_scitex_dir()
+    os.environ[GATEWAY_KEY_ENV] = " "
     yield
     for name, value in previous.items():
         if value is None:
@@ -74,11 +79,17 @@ class RecordingUpstream:
         content_type: str = "application/json",
         chunks: tuple[bytes, ...] = (b'{"ok": true}',),
         block_until: threading.Event | None = None,
+        abort_releases: bool = False,
+        abort_status: int = 200,
+        block_after_first_chunk: threading.Event | None = None,
     ) -> None:
         self.status = status
         self.content_type = content_type
         self.chunks = chunks
         self.block_until = block_until
+        self.abort_releases = abort_releases
+        self.abort_status = abort_status
+        self.block_after_first_chunk = block_after_first_chunk
         self.request_started = threading.Event()
         self.requests: list[dict[str, Any]] = []
         upstream = self
@@ -99,15 +110,29 @@ class RecordingUpstream:
                     }
                 )
                 upstream.request_started.set()
+                if self.path == "/abort_request" and upstream.abort_releases:
+                    assert upstream.block_until is not None
+                    upstream.block_until.set()
                 if upstream.block_until is not None:
                     upstream.block_until.wait(timeout=10)
-                self.send_response(upstream.status)
+                response_status = (
+                    upstream.abort_status
+                    if self.path == "/abort_request"
+                    else upstream.status
+                )
+                self.send_response(response_status)
                 self.send_header("content-type", upstream.content_type)
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
-                for chunk in upstream.chunks:
+                for index, chunk in enumerate(upstream.chunks):
                     self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                     self.wfile.flush()
+                    if (
+                        index == 0
+                        and upstream.block_after_first_chunk is not None
+                        and self.path != "/abort_request"
+                    ):
+                        upstream.block_after_first_chunk.wait(timeout=10)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
 

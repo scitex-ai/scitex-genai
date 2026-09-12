@@ -61,7 +61,10 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
         args.inference_capacity_per_upstream,
         args.inference_max_queue_size,
         args.inference_token_capacity_per_upstream,
-    ) == (None, None, None, None, None, None, None, None)
+        args.inference_continuation_qos,
+        args.inference_continuation_qos_max_retries,
+        args.inference_continuation_qos_min_preempt_tokens,
+    ) == (None, None, None, None, None, None, None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -132,6 +135,11 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "9",
         "--inference-token-capacity-per-upstream",
         "1600000",
+        "--inference-continuation-qos",
+        "--inference-continuation-qos-max-retries",
+        "2",
+        "--inference-continuation-qos-min-preempt-tokens",
+        "400000",
     ]
 
     # Act
@@ -148,6 +156,9 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "inference_capacity_per_upstream",
         "inference_max_queue_size",
         "inference_token_capacity_per_upstream",
+        "inference_continuation_qos",
+        "inference_continuation_qos_max_retries",
+        "inference_continuation_qos_min_preempt_tokens",
     )
     assert tuple(getattr(before, name) for name in names) == tuple(
         getattr(after, name) for name in names
