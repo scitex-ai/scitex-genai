@@ -128,6 +128,8 @@ _HOP_BY_HOP = frozenset(
     {"host", "content-length", "connection", "transfer-encoding"}
 ).union(_SESSION_ID_HEADERS)
 _SESSION_KEY_DOMAIN = b"scitex-genai-session-affinity\0"
+_REQUEST_PREFIX_DOMAIN = b"scitex-genai-request-prefix-v1\0"
+_REQUEST_PREFIX_BYTES = 16_384
 
 # First pass (7 conversations) showed ALL agents identical at 1k and ALL
 # distinct at 4k, so the entire divergence happens in that band. These
@@ -156,6 +158,167 @@ def estimate_input_tokens(body: bytes | None) -> int:
     if not body:
         return 0
     return max(1, (len(body) + 3) // 4)
+
+
+def request_prefix_fingerprint(body: bytes | None) -> str:
+    """Return an opaque identifier for the first 16 KiB of the relayed body.
+
+    The bounded prefix is where changing timestamps, agent identity, or tool
+    schemas destroy radix-cache reuse.  Only a domain-separated digest leaves
+    this process; prompt bytes and secrets never do.  The byte limit is part of
+    the fingerprint version, so equal identifiers are comparable across runs.
+    """
+    if not body:
+        return "none"
+    prefix = body[:_REQUEST_PREFIX_BYTES]
+    return hashlib.sha256(_REQUEST_PREFIX_DOMAIN + prefix).hexdigest()[:16]
+
+
+def inject_cache_report_request(
+    body: bytes | None, path: str, *, enabled: bool
+) -> tuple[bytes | None, bool]:
+    """Ask a configured SGLang OpenAI endpoint for per-tier cache details.
+
+    This is deliberately opt-in: ``return_cached_tokens_details`` is an SGLang
+    extension and must not leak to an arbitrary OpenAI-compatible provider.
+    Anthropic Messages is left untouched because SGLang already reports
+    ``cache_read_input_tokens`` there without an extension field.
+    """
+    route = path.split("?", 1)[0].rstrip("/")
+    if not enabled or route not in {"/v1/chat/completions", "/v1/completions"}:
+        return body, False
+    try:
+        payload = json.loads(body or b"")
+    except (TypeError, ValueError):
+        return body, False
+    if not isinstance(payload, dict):
+        return body, False
+    changed = payload.get("return_cached_tokens_details") is not True
+    payload["return_cached_tokens_details"] = True
+    if payload.get("stream") is True:
+        options = payload.get("stream_options")
+        if not isinstance(options, dict):
+            options = {}
+            payload["stream_options"] = options
+        if options.get("include_usage") is not True:
+            options["include_usage"] = True
+            changed = True
+    return (json.dumps(payload).encode() if changed else body), True
+
+
+@dataclass
+class ResponseTokenReport:
+    """Payload-free token/cache facts observed in an upstream response."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    device_cached_tokens: int | None = None
+    host_cached_tokens: int | None = None
+    storage_cached_tokens: int | None = None
+    storage_backend: str | None = None
+    _buffer: bytearray = field(default_factory=bytearray, repr=False)
+    _line_buffer: bytearray = field(default_factory=bytearray, repr=False)
+
+    def feed(self, chunk: bytes) -> None:
+        """Observe JSON or SSE incrementally without retaining large output."""
+        if len(self._buffer) < 1_048_576:
+            room = 1_048_576 - len(self._buffer)
+            self._buffer.extend(chunk[:room])
+        self._line_buffer.extend(chunk)
+        while b"\n" in self._line_buffer:
+            raw_line, _, remainder = self._line_buffer.partition(b"\n")
+            self._line_buffer = bytearray(remainder)
+            line = raw_line.strip()
+            if line.startswith(b"data:"):
+                candidate = line[5:].strip()
+                if candidate and candidate != b"[DONE]":
+                    self._parse(candidate)
+        if len(self._line_buffer) > 1_048_576:
+            self._line_buffer.clear()
+
+    def finish(self) -> None:
+        """Parse a non-streaming JSON response after EOF, if applicable."""
+        self._parse(bytes(self._buffer).strip())
+
+    def _parse(self, candidate: bytes) -> None:
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            return
+        self._observe(payload)
+
+    def _observe(self, payload: Any) -> None:
+        if isinstance(payload, list):
+            for item in payload:
+                self._observe(item)
+            return
+        if not isinstance(payload, dict):
+            return
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            self.input_tokens = _integer(
+                usage.get("prompt_tokens", usage.get("input_tokens")),
+                self.input_tokens,
+            )
+            self.output_tokens = _integer(
+                usage.get("completion_tokens", usage.get("output_tokens")),
+                self.output_tokens,
+            )
+            self.cached_tokens = _integer(
+                usage.get("cache_read_input_tokens"), self.cached_tokens
+            )
+            self.cache_creation_tokens = _integer(
+                usage.get("cache_creation_input_tokens"), self.cache_creation_tokens
+            )
+            details = usage.get("prompt_tokens_details") or usage.get(
+                "input_tokens_details"
+            )
+            if isinstance(details, dict):
+                self.cached_tokens = _integer(
+                    details.get("cached_tokens"), self.cached_tokens
+                )
+        extension = payload.get("sglext")
+        if isinstance(extension, dict):
+            details = extension.get("cached_tokens_details")
+            if isinstance(details, dict):
+                self.device_cached_tokens = _integer(
+                    details.get("device"), self.device_cached_tokens
+                )
+                self.host_cached_tokens = _integer(
+                    details.get("host"), self.host_cached_tokens
+                )
+                self.storage_cached_tokens = _integer(
+                    details.get("storage"), self.storage_cached_tokens
+                )
+                backend = details.get("storage_backend")
+                if isinstance(backend, str) and backend:
+                    self.storage_backend = backend
+        # Responses and Anthropic message_start nest their usage one level down.
+        for key in ("response", "message"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                self._observe(nested)
+
+    def fields(self) -> str:
+        values: tuple[tuple[str, Any], ...] = (
+            ("reported_input_tokens", self.input_tokens),
+            ("reported_output_tokens", self.output_tokens),
+            ("cached_tokens", self.cached_tokens),
+            ("cache_creation_tokens", self.cache_creation_tokens),
+            ("cache_device_tokens", self.device_cached_tokens),
+            ("cache_host_tokens", self.host_cached_tokens),
+            ("cache_storage_tokens", self.storage_cached_tokens),
+            ("cache_storage_backend", self.storage_backend),
+        )
+        return " ".join(
+            f"{name}={value}" for name, value in values if value is not None
+        )
+
+
+def _integer(value: Any, previous: int | None) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else previous
 
 
 def request_session_key(headers: Mapping[str, str]) -> str:
@@ -745,8 +908,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         """Capture the generation each reachability probe is about to test."""
         async with self._lock:
             return [
-                (upstream, upstream.cooldown_generation)
-                for upstream in self.upstreams
+                (upstream, upstream.cooldown_generation) for upstream in self.upstreams
             ]
 
     async def reconcile_recovered(
@@ -846,7 +1008,11 @@ class ContinuationQoS:
     """
 
     def __init__(
-        self, *, enabled: bool = False, max_retries: int = 1, min_preempt_tokens: int = 0
+        self,
+        *,
+        enabled: bool = False,
+        max_retries: int = 1,
+        min_preempt_tokens: int = 0,
     ) -> None:
         if max_retries < 0:
             raise ValueError("continuation_qos_max_retries must be >= 0")
@@ -993,6 +1159,7 @@ class InferenceBackend:
         continuation_qos_min_preempt_tokens: int = (
             DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
         ),
+        cache_report_enabled: bool = False,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -1018,9 +1185,7 @@ class InferenceBackend:
         self._health_probe_lock = asyncio.Lock()
         self._health_probe_task: asyncio.Task[list[UpstreamReachability]] | None = None
         self._health_cache: tuple[float, list[UpstreamReachability]] | None = None
-        self._health_failures = {
-            upstream.alias: 0 for upstream in self.pool.upstreams
-        }
+        self._health_failures = {upstream.alias: 0 for upstream in self.pool.upstreams}
         # SAC/Hermes currently supplies stable identity but no authoritative
         # pre-admission cache-residency result. Record UNKNOWN observations;
         # do not activate cache-priority scheduling from prompt size or history.
@@ -1030,6 +1195,7 @@ class InferenceBackend:
             max_retries=continuation_qos_max_retries,
             min_preempt_tokens=continuation_qos_min_preempt_tokens,
         )
+        self.cache_report_enabled = cache_report_enabled
         self._cleanup_reapers: set[asyncio.Task[None]] = set()
 
     async def probe_upstreams(self) -> list[UpstreamReachability]:
@@ -1040,7 +1206,9 @@ class InferenceBackend:
             if self._health_cache is not None and self._health_cache[0] > now:
                 return self._health_cache[1]
             if self._health_probe_task is None:
-                self._health_probe_task = asyncio.create_task(self._probe_upstreams_fresh())
+                self._health_probe_task = asyncio.create_task(
+                    self._probe_upstreams_fresh()
+                )
             task = self._health_probe_task
         try:
             observations = await asyncio.shield(task)
@@ -1064,9 +1232,7 @@ class InferenceBackend:
             async def request_observation() -> UpstreamReachability:
                 if self._health_probe is not None:
                     return await self._health_probe(url, self.health_probe_timeout_s)
-                return await probe_upstream(
-                    url, timeout_s=self.health_probe_timeout_s
-                )
+                return await probe_upstream(url, timeout_s=self.health_probe_timeout_s)
 
             try:
                 return await asyncio.wait_for(
@@ -1086,7 +1252,9 @@ class InferenceBackend:
         for upstream, observed in zip(
             self.pool.upstreams, raw_observations, strict=True
         ):
-            failures = 0 if observed.reachable else self._health_failures[upstream.alias] + 1
+            failures = (
+                0 if observed.reachable else self._health_failures[upstream.alias] + 1
+            )
             self._health_failures[upstream.alias] = failures
             ready = observed.reachable or failures < self.health_failure_threshold
             observations.append(
@@ -1203,6 +1371,11 @@ class InferenceBackend:
             affinity_key=explicit_session,
             inject_session_id=accepts_session_id(path),
         )
+        input_tokens = estimate_input_tokens(body)
+        prefix_fingerprint = request_prefix_fingerprint(body)
+        body, cache_report_requested = inject_cache_report_request(
+            body, path, enabled=self.cache_report_enabled
+        )
         routing_session = session or ""
         qos_kind = (
             self.continuation_qos.classify(qos_session)
@@ -1215,7 +1388,7 @@ class InferenceBackend:
             "x-scitex-cache-residency": CacheResidency.UNKNOWN.value,
             "x-scitex-session-key": (session or "")[:12] or "none",
         }
-        input_tokens = estimate_input_tokens(body)
+        request_started = time.monotonic()
         forwarded = {
             name: value
             for name, value in headers.items()
@@ -1294,7 +1467,10 @@ class InferenceBackend:
                     f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
                     f"{method} {path} bytes={len(body or b'')} "
                     f"estimated_input_tokens={input_tokens} "
-                    f"admitted_input_tokens={upstream.input_tokens_in_flight}"
+                    f"admitted_input_tokens={upstream.input_tokens_in_flight} "
+                    f"prefix_fingerprint={prefix_fingerprint} "
+                    f"cache_report_requested={str(cache_report_requested).lower()} "
+                    f"queue_s={started - request_started:.3f}"
                 )
                 dispatch_request_id = (
                     secrets.token_urlsafe(24)
@@ -1457,6 +1633,7 @@ class InferenceBackend:
                         first_chunk = await first_chunk_task
                     except StopAsyncIteration:
                         first_chunk = None
+                    ttft_s = time.monotonic() - started
                 except (_ClientDisconnected, asyncio.CancelledError) as exc:
                     # Cancellation before a response body exists must not leak a
                     # capacity slot; streaming cancellation is handled by _drain.
@@ -1629,6 +1806,8 @@ class InferenceBackend:
                         tag=f"conv={routing_session[:8] or '-'} <- {upstream.alias} "
                         f"status={response.status_code}",
                         started=started,
+                        request_started=request_started,
+                        ttft_s=ttft_s,
                         input_tokens=input_tokens,
                         session_id=routing_session,
                         continuation_handoff=continuation_handoff,
@@ -1799,6 +1978,8 @@ class InferenceBackend:
         first_chunk: bytes | None = None,
         tag: str = "",
         started: float | None = None,
+        request_started: float | None = None,
+        ttft_s: float | None = None,
         input_tokens: int = 0,
         session_id: str = "",
         continuation_handoff: _ContinuationHandoff | None = None,
@@ -1811,6 +1992,7 @@ class InferenceBackend:
         stream = stream or response.aiter_bytes()
         next_chunk: asyncio.Task[bytes] | None = None
         release_capacity = True
+        token_report = ResponseTokenReport()
 
         async def drain_to_eof() -> None:
             nonlocal next_chunk
@@ -1826,6 +2008,7 @@ class InferenceBackend:
 
         try:
             if first_chunk is not None:
+                token_report.feed(first_chunk)
                 sent += len(first_chunk)
                 yield first_chunk
             while True:
@@ -1836,6 +2019,7 @@ class InferenceBackend:
                     next_chunk = None
                     break
                 next_chunk = None
+                token_report.feed(chunk)
                 sent += len(chunk)
                 yield chunk
             self.continuation_qos.mark_successful(successful_session)
@@ -1884,7 +2068,19 @@ class InferenceBackend:
                 next_chunk = None
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
-                self._note(f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s")
+                total = (
+                    time.monotonic() - request_started
+                    if request_started is not None
+                    else took
+                )
+                token_report.finish()
+                reported = token_report.fields()
+                suffix = f" {reported}" if reported else ""
+                self._note(
+                    f"[relay] {tag} outcome={outcome} bytes={sent} "
+                    f"ttft_s={ttft_s if ttft_s is not None else 0.0:.3f} "
+                    f"upstream_s={took:.3f} total_s={total:.3f}{suffix}"
+                )
             # Close transport on every path. Capacity is released only after
             # clean EOF or confirmed abort; ambiguous engine state transfers
             # ownership to the tracked background abort reaper.

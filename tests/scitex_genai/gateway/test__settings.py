@@ -41,6 +41,7 @@ ENV_KEYS = (
     "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_ENABLED",
     "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_MAX_RETRIES",
     "SCITEX_GATEWAY_INFERENCE_CONTINUATION_QOS_MIN_PREEMPT_TOKENS",
+    "SCITEX_GATEWAY_INFERENCE_CACHE_REPORT_ENABLED",
 )
 
 
@@ -100,6 +101,7 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         settings.inference_continuation_qos_enabled,
         settings.inference_continuation_qos_max_retries,
         settings.inference_continuation_qos_min_preempt_tokens,
+        settings.inference_cache_report_enabled,
     ) == (
         DEFAULT_HOST,
         DEFAULT_PORT,
@@ -112,7 +114,29 @@ def test_a_missing_file_gives_the_package_defaults(tmp_path: Path, clean_env):
         False,
         1,
         0,
+        False,
     )
+
+
+def test_cache_report_is_an_explicit_configured_sglang_capability(
+    tmp_path: Path, clean_env
+) -> None:
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml", FULL + "  inference_cache_report_enabled: true\n"
+    )
+
+    # Act
+    configured = load_settings(path)
+    overridden = load_settings(path, inference_cache_report_enabled=False)
+
+    # Assert
+    assert (
+        configured.inference_cache_report_enabled,
+        overridden.inference_cache_report_enabled,
+    ) == (True, False)
+
+
 def test_the_file_supplies_host_port_and_upstreams(tmp_path: Path, clean_env):
     # Arrange
     path = _write(tmp_path / "config.yaml", FULL)

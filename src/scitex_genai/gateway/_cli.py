@@ -148,6 +148,15 @@ def _add_settings_args(
             "else 0)."
         ),
     )
+    parser.add_argument(
+        "--inference-cache-report",
+        action=argparse.BooleanOptionalAction,
+        default=default,
+        help=(
+            "Request SGLang per-tier cache details on supported OpenAI routes "
+            "(default: gateway.inference_cache_report_enabled, else disabled)."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -258,6 +267,7 @@ def _install_unit(args: argparse.Namespace) -> None:
         inference_continuation_qos_min_preempt_tokens=(
             args.inference_continuation_qos_min_preempt_tokens
         ),
+        inference_cache_report_enabled=args.inference_cache_report,
         config=args.config,
         unit_dir=args.unit_dir,
         enable=not args.no_enable,
@@ -297,6 +307,7 @@ def main(
         inference_continuation_qos_min_preempt_tokens=(
             args.inference_continuation_qos_min_preempt_tokens
         ),
+        inference_cache_report_enabled=args.inference_cache_report,
     )
     if settings.external_provider is not None:
         external = settings.external_provider
@@ -354,15 +365,14 @@ def main(
             timeout_s=settings.inference_timeout_s,
             telemetry_sink=_telemetry_sink(),
             journal=lambda line: print(line, flush=True),
-            continuation_qos_enabled=(
-                settings.inference_continuation_qos_enabled
-            ),
+            continuation_qos_enabled=(settings.inference_continuation_qos_enabled),
             continuation_qos_max_retries=(
                 settings.inference_continuation_qos_max_retries
             ),
             continuation_qos_min_preempt_tokens=(
                 settings.inference_continuation_qos_min_preempt_tokens
             ),
+            cache_report_enabled=settings.inference_cache_report_enabled,
         )
         print(announce(settings.host, settings.port, pool), flush=True)
     else:

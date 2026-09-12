@@ -181,6 +181,13 @@ def create_app(
                     "queued": sum(member["queued"] for member in members),
                     "cache_admission": backend.cache_admission.snapshot(),
                     "continuation_qos": backend.continuation_qos.snapshot(),
+                    "cache_report": {
+                        "mode": (
+                            "sglang-openai-enabled"
+                            if backend.cache_report_enabled
+                            else "disabled"
+                        )
+                    },
                     "external": backend.health_status(),
                 }
                 if any("token_capacity" in member for member in members):
@@ -226,6 +233,13 @@ def create_app(
                 "queued": sum(member["queued"] for member in members),
                 "cache_admission": backend.cache_admission.snapshot(),
                 "continuation_qos": backend.continuation_qos.snapshot(),
+                "cache_report": {
+                    "mode": (
+                        "sglang-openai-enabled"
+                        if backend.cache_report_enabled
+                        else "disabled"
+                    )
+                },
             }
             if not active_members:
                 status["reason"] = (
@@ -250,7 +264,9 @@ def create_app(
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request) -> Any:
         if not authorized(request):
-            return JSONResponse(_anthropic_error("Invalid API key", "authentication_error"), 401)
+            return JSONResponse(
+                _anthropic_error("Invalid API key", "authentication_error"), 401
+            )
         body = await request.json()
         return {"input_tokens": _estimate_tokens(body)}
 
@@ -323,7 +339,9 @@ def create_app(
     @app.post("/v1/messages")
     async def messages(request: Request) -> Any:
         if not authorized(request):
-            return JSONResponse(_anthropic_error("Invalid API key", "authentication_error"), 401)
+            return JSONResponse(
+                _anthropic_error("Invalid API key", "authentication_error"), 401
+            )
         try:
             body = await request.json()
             if not isinstance(body, dict):
@@ -331,7 +349,9 @@ def create_app(
             session_id = _session_id(request, body)
             payload = anthropic_to_codex(body, session_id=session_id)
         except (ValueError, GatewayError) as exc:
-            return JSONResponse(_anthropic_error(str(exc), "invalid_request_error"), 400)
+            return JSONResponse(
+                _anthropic_error(str(exc), "invalid_request_error"), 400
+            )
 
         if body.get("stream") is True:
 
@@ -348,8 +368,7 @@ def create_app(
 
         try:
             events = [
-                event
-                async for event in backend.stream(payload, session_id=session_id)
+                event async for event in backend.stream(payload, session_id=session_id)
             ]
             return codex_events_to_anthropic(events, model=str(body["model"]))
         except UpstreamError as exc:

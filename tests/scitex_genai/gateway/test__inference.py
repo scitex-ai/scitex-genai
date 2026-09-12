@@ -19,6 +19,7 @@ from scitex_genai.gateway._errors import (
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
+    ResponseTokenReport,
     accepts_session_id,
     adapt_openai_roles,
     announce,
@@ -26,8 +27,10 @@ from scitex_genai.gateway._inference import (
     estimate_input_tokens,
     hoist_system,
     hoists_on,
+    inject_cache_report_request,
     parse_upstreams,
     prefix_report,
+    request_prefix_fingerprint,
     request_session_key,
     telemetry_enabled,
 )
@@ -81,6 +84,75 @@ def test_input_token_estimate_uses_the_documented_four_byte_approximation(
     estimated = estimate_input_tokens(body)
     # Assert
     assert estimated == expected
+
+
+def test_request_prefix_fingerprint_is_stable_bounded_and_payload_free() -> None:
+    # Arrange
+    shared = SECRET.encode() * 400
+    same_prefix = shared + b"different tail"
+    changed_prefix = b"x" + shared
+    # Act
+    fingerprints = [
+        request_prefix_fingerprint(value)
+        for value in (shared, same_prefix, changed_prefix)
+    ]
+    # Assert -- the tail beyond 16 KiB does not matter and no source text leaks.
+    assert (
+        fingerprints[0] == fingerprints[1],
+        fingerprints[0] != fingerprints[2],
+        all(SECRET not in fingerprint for fingerprint in fingerprints),
+    ) == (True, True, True)
+
+
+def test_cache_report_extension_is_opt_in_and_openai_only() -> None:
+    # Arrange
+    source = json.dumps({"stream": True, "messages": []}).encode()
+    # Act
+    openai, changed = inject_cache_report_request(
+        source, "/v1/chat/completions", enabled=True
+    )
+    anthropic, anthropic_changed = inject_cache_report_request(
+        source, "/v1/messages", enabled=True
+    )
+    disabled, disabled_changed = inject_cache_report_request(
+        source, "/v1/chat/completions", enabled=False
+    )
+    payload = json.loads(openai)
+    # Assert
+    assert (
+        changed,
+        payload["return_cached_tokens_details"],
+        payload["stream_options"]["include_usage"],
+        anthropic is source,
+        anthropic_changed,
+        disabled is source,
+        disabled_changed,
+    ) == (True, True, True, True, False, True, False)
+
+
+def test_response_token_report_reads_sglang_and_anthropic_streams_incrementally() -> (
+    None
+):
+    # Arrange -- exact field shapes observed from the live SGLang 2026-09-12.
+    report = ResponseTokenReport()
+    stream = (
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":65,'
+        b'"output_tokens":0,"cache_read_input_tokens":64}}}\n\n'
+        b'data: {"sglext":{"cached_tokens_details":{"device":32,"host":24,'
+        b'"storage":8,"storage_backend":"HiCacheFile"}}}\n\n'
+        b'data: {"usage":{"prompt_tokens":65,"completion_tokens":2,'
+        b'"prompt_tokens_details":{"cached_tokens":64}}}\n\n'
+    )
+    # Act -- split inside JSON to prove framing is not chunk-boundary dependent.
+    for chunk in (stream[:31], stream[31:117], stream[117:]):
+        report.feed(chunk)
+    report.finish()
+    # Assert
+    assert report.fields() == (
+        "reported_input_tokens=65 reported_output_tokens=2 cached_tokens=64 "
+        "cache_device_tokens=32 cache_host_tokens=24 cache_storage_tokens=8 "
+        "cache_storage_backend=HiCacheFile"
+    )
 
 
 def test_telemetry_enabled_matches_the_script_truthiness() -> None:
@@ -225,7 +297,9 @@ async def _wait_for_requests(upstream, size: int) -> None:
         if len(upstream.requests) >= size:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError(f"upstream saw {len(upstream.requests)} requests, wanted {size}")
+    raise AssertionError(
+        f"upstream saw {len(upstream.requests)} requests, wanted {size}"
+    )
 
 
 async def _wait_for_in_flight(pool: InferenceUpstreamPool, value: int) -> None:
@@ -645,7 +719,9 @@ async def test_relay_streams_the_upstream_sse_verbatim(upstream_factory) -> None
 
 
 @pytest.mark.asyncio
-async def test_continuation_qos_aborts_then_retries_first_turn(upstream_factory) -> None:
+async def test_continuation_qos_aborts_then_retries_first_turn(
+    upstream_factory,
+) -> None:
     # Arrange: gateway capacity is deliberately 2. The handoff must happen
     # before dispatch even though a second gateway slot is available.
     release = __import__("threading").Event()
@@ -949,7 +1025,9 @@ async def test_client_cancel_before_headers_aborts_engine_and_releases_capacity(
 
 
 @pytest.mark.asyncio
-async def test_invalid_body_is_never_registered_for_preemption(upstream_factory) -> None:
+async def test_invalid_body_is_never_registered_for_preemption(
+    upstream_factory,
+) -> None:
     # Arrange
     release = __import__("threading").Event()
     upstream = upstream_factory(block_until=release, abort_releases=True)
@@ -1492,6 +1570,73 @@ async def test_the_journal_says_which_request_went_where_and_how_it_ended(
         f"<- {upstream.url} status=200 outcome=complete bytes=" in relay[1],
         any(SECRET in line for line in relay),
     ) == (2, True, True, True, True, False)
+
+
+@pytest.mark.asyncio
+async def test_relay_journal_reports_ttft_prefix_and_upstream_cache_tiers(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(
+        chunks=(
+            b'data: {"sglext":{"cached_tokens_details":{"device":400,'
+            b'"host":20,"storage":5,"storage_backend":"HiCacheFile"}}}\n\n',
+            b'data: {"usage":{"prompt_tokens":500,"completion_tokens":7,'
+            b'"prompt_tokens_details":{"cached_tokens":425}}}\n\n',
+            b"data: [DONE]\n\n",
+        )
+    )
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url),
+        journal=lines.append,
+        cache_report_enabled=True,
+    )
+    body = json.dumps(
+        {
+            "model": "local",
+            "stream": True,
+            "messages": [{"role": "user", "content": SECRET}],
+        }
+    ).encode()
+
+    # Act
+    relayed = await backend.relay("POST", "/v1/chat/completions", body=body, headers={})
+    await _collect(relayed.body)
+
+    # Assert
+    sent = json.loads(upstream.requests[0]["body"])
+    assert (
+        sent["return_cached_tokens_details"],
+        sent["stream_options"]["include_usage"],
+        "prefix_fingerprint=" in lines[0],
+        "cache_report_requested=true" in lines[0],
+        "queue_s=" in lines[0],
+        "ttft_s=" in lines[1],
+        "total_s=" in lines[1],
+        "reported_input_tokens=500" in lines[1],
+        "reported_output_tokens=7" in lines[1],
+        "cached_tokens=425" in lines[1],
+        "cache_device_tokens=400" in lines[1],
+        "cache_host_tokens=20" in lines[1],
+        "cache_storage_tokens=5" in lines[1],
+        SECRET in "\n".join(lines),
+    ) == (
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    )
 
 
 @pytest.mark.asyncio
