@@ -78,6 +78,7 @@ def gateway_command(
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
+    inference_cache_report_enabled: bool | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
 ) -> list[str]:
@@ -159,6 +160,14 @@ def gateway_command(
                 )
             ),
         ]
+    if inference_cache_report_enabled is not None:
+        argv.append(
+            "--inference-cache-report"
+            if check_bool(
+                "inference_cache_report_enabled", inference_cache_report_enabled
+            )
+            else "--no-inference-cache-report"
+        )
     return argv
 
 
@@ -176,6 +185,7 @@ def render_unit(
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
+    inference_cache_report_enabled: bool | None = None,
 ) -> str:
     """The unit text, byte-for-byte what ``install_unit`` writes."""
     argv = gateway_command(
@@ -185,16 +195,13 @@ def render_unit(
         inference_timeout_s=inference_timeout_s,
         inference_capacity_per_upstream=inference_capacity_per_upstream,
         inference_max_queue_size=inference_max_queue_size,
-        inference_token_capacity_per_upstream=(
-            inference_token_capacity_per_upstream
-        ),
+        inference_token_capacity_per_upstream=(inference_token_capacity_per_upstream),
         inference_continuation_qos_enabled=inference_continuation_qos_enabled,
-        inference_continuation_qos_max_retries=(
-            inference_continuation_qos_max_retries
-        ),
+        inference_continuation_qos_max_retries=(inference_continuation_qos_max_retries),
         inference_continuation_qos_min_preempt_tokens=(
             inference_continuation_qos_min_preempt_tokens
         ),
+        inference_cache_report_enabled=inference_cache_report_enabled,
         config=config,
         interpreter=interpreter,
     )
@@ -242,6 +249,7 @@ def install_unit(
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
+    inference_cache_report_enabled: bool | None = None,
     interpreter: str | None = None,
 ) -> Path:
     """Write the unit, then reload the user manager and ``enable --now`` it.
@@ -265,15 +273,14 @@ def install_unit(
             inference_token_capacity_per_upstream=(
                 inference_token_capacity_per_upstream
             ),
-            inference_continuation_qos_enabled=(
-                inference_continuation_qos_enabled
-            ),
+            inference_continuation_qos_enabled=(inference_continuation_qos_enabled),
             inference_continuation_qos_max_retries=(
                 inference_continuation_qos_max_retries
             ),
             inference_continuation_qos_min_preempt_tokens=(
                 inference_continuation_qos_min_preempt_tokens
             ),
+            inference_cache_report_enabled=inference_cache_report_enabled,
             config=config,
             interpreter=interpreter,
         )

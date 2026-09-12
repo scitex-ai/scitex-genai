@@ -22,6 +22,8 @@ list only the upstream that is actually reachable.
      inference_continuation_qos_enabled: false
      inference_continuation_qos_max_retries: 1
      inference_continuation_qos_min_preempt_tokens: 400000
+     # Opt in only when the OpenAI upstream implements SGLang's extension.
+     inference_cache_report_enabled: true
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
@@ -166,6 +168,26 @@ With the token guard enabled, ``/health`` adds
 the request estimate and the admitted token total; payloads remain absent.
 Stream completion lines distinguish ``outcome=complete``,
 ``outcome=client_disconnected``, and ``outcome=stream_error``.
+
+Request-level cache observations
+--------------------------------
+
+Every inference journal entry records the estimated input tokens, queue wait,
+time to the first upstream body byte (``ttft_s``), upstream and total latency,
+and a domain-separated SHA-256 fingerprint of the first 16 KiB of the relayed
+request.  The fingerprint exposes no prompt text and makes early-prefix drift
+between otherwise related requests visible.
+
+SGLang's Anthropic Messages stream reports ``cache_read_input_tokens`` without
+request extensions; the completion journal records it as ``cached_tokens``.
+For SGLang OpenAI Chat/Completions, enable
+``inference_cache_report_enabled`` only after verifying that the upstream was
+started with ``--enable-cache-report``.  The gateway then requests
+``return_cached_tokens_details`` and ``stream_options.include_usage`` and logs
+the upstream-reported ``device``, ``host``, and ``storage`` token counts.  The
+option defaults to false because arbitrary OpenAI-compatible providers may
+reject the SGLang-only request field.  Prompts, generated text, credentials,
+and raw session identifiers are never journaled.
 
 The gateway releases its reservation after closing a disconnected upstream
 HTTP stream.  The inference engine must actually abort that request too.

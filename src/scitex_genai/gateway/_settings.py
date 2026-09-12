@@ -62,9 +62,11 @@ KEY_TOKEN_CAPACITY = "gateway.inference_token_capacity_per_upstream"
 KEY_CONTINUATION_QOS = "gateway.inference_continuation_qos_enabled"
 KEY_CONTINUATION_RETRIES = "gateway.inference_continuation_qos_max_retries"
 KEY_CONTINUATION_MIN_TOKENS = "gateway.inference_continuation_qos_min_preempt_tokens"
+KEY_CACHE_REPORT = "gateway.inference_cache_report_enabled"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
+
 
 @dataclass(frozen=True)
 class ExternalGatewaySettings:
@@ -120,7 +122,9 @@ class ExternalGatewaySettings:
         if any(ch.isspace() for ch in upstream):
             raise ValueError("external_provider.upstream cannot contain whitespace")
         if not self.upstream_auth_token_env.replace("_", "").isalnum():
-            raise ValueError("external_provider.upstream_auth_token_env is not an env name")
+            raise ValueError(
+                "external_provider.upstream_auth_token_env is not an env name"
+            )
         object.__setattr__(self, "upstream", upstream)
 
 
@@ -200,12 +204,11 @@ class GatewaySettings:
         DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM
     )
     inference_continuation_qos_enabled: bool = DEFAULT_CONTINUATION_QOS_ENABLED
-    inference_continuation_qos_max_retries: int = (
-        DEFAULT_CONTINUATION_QOS_MAX_RETRIES
-    )
+    inference_continuation_qos_max_retries: int = DEFAULT_CONTINUATION_QOS_MAX_RETRIES
     inference_continuation_qos_min_preempt_tokens: int = (
         DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
     )
+    inference_cache_report_enabled: bool = False
     external_provider: ExternalGatewaySettings | None = None
 
     def __post_init__(self) -> None:
@@ -273,6 +276,14 @@ class GatewaySettings:
                 minimum=0,
             ),
         )
+        object.__setattr__(
+            self,
+            "inference_cache_report_enabled",
+            check_bool(
+                "inference_cache_report_enabled",
+                self.inference_cache_report_enabled,
+            ),
+        )
 
 
 def load_settings(
@@ -288,6 +299,7 @@ def load_settings(
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
+    inference_cache_report_enabled: bool | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -311,9 +323,7 @@ def load_settings(
     raw_config = load_yaml(path) if present else {}
     raw_gateway = raw_config.get("gateway", {}) if isinstance(raw_config, dict) else {}
     external_mapping = (
-        raw_gateway.get("external_provider")
-        if isinstance(raw_gateway, dict)
-        else None
+        raw_gateway.get("external_provider") if isinstance(raw_gateway, dict) else None
     )
     return GatewaySettings(
         host=config.resolve(KEY_HOST, direct_val=host, default=DEFAULT_HOST),
@@ -351,7 +361,10 @@ def load_settings(
             direct_val=inference_continuation_qos_min_preempt_tokens,
             default=DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS,
         ),
-        external_provider=ExternalGatewaySettings.from_mapping(
-            external_mapping
+        inference_cache_report_enabled=config.resolve(
+            KEY_CACHE_REPORT,
+            direct_val=inference_cache_report_enabled,
+            default=False,
         ),
+        external_provider=ExternalGatewaySettings.from_mapping(external_mapping),
     )
