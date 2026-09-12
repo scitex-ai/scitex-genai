@@ -1670,10 +1670,6 @@ class InferenceBackend:
                 release_capacity = False
                 await drain_to_eof()
                 release_capacity = True
-            elif next_chunk is not None:
-                if not next_chunk.done():
-                    next_chunk.cancel()
-                await asyncio.gather(next_chunk, return_exceptions=True)
             raise
         except BaseException:
             outcome = "stream_error"
@@ -1687,6 +1683,18 @@ class InferenceBackend:
                 )
             raise
         finally:
+            # ``shield`` deliberately leaves the upstream read running when
+            # its caller is cancelled.  Settle that task on *every* exit,
+            # including the race where it has already completed with
+            # StopAsyncIteration before the cancellation branch observes it.
+            # Merely skipping cancellation for a done task is insufficient:
+            # its result still has to be retrieved to avoid an unhandled task
+            # exception after the response generator is collected.
+            if next_chunk is not None:
+                if not next_chunk.done():
+                    next_chunk.cancel()
+                await asyncio.gather(next_chunk, return_exceptions=True)
+                next_chunk = None
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 self._note(f"[relay] {tag} outcome={outcome} bytes={sent} {took:.1f}s")
