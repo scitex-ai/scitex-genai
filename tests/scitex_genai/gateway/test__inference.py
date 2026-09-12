@@ -1066,13 +1066,16 @@ async def test_cancelled_chunk_wait_retrieves_concurrent_end_of_stream(
         await backend.close()
 
     # Assert
-    assert isinstance(cancelled, asyncio.CancelledError)
-    assert pool.status()[0]["in_flight"] == 0
-    assert not [
+    unretrieved = [
         context
         for context in unhandled
         if context.get("message") == "Task exception was never retrieved"
     ]
+    assert (
+        isinstance(cancelled, asyncio.CancelledError),
+        pool.status()[0]["in_flight"],
+        unretrieved,
+    ) == (True, 0, [])
 
 
 @pytest.mark.asyncio
