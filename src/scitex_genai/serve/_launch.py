@@ -7,7 +7,7 @@ renders the BODY -- one supervised step per engine, one engine per GPU
 (operator ruling 2026-08-15: TP=1, one instance per card), ``wait`` at the
 end so the batch shell stays alive for SLURM.
 
-THREE THINGS THE BODY DELIBERATELY DOES NOT DO, each measured on Spartan:
+THREE THINGS THE BODY DELIBERATELY DOES NOT DO, each measured on the HPC system:
 - It sets no ``CUDA_VISIBLE_DEVICES``: each engine's conf exports its own and
   the serve command hands it to the engine; setting it here would put both
   replicas on one card.

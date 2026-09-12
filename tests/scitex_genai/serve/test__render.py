@@ -390,8 +390,22 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
     assert (
         launch.engine_argv.count("--enable-session-radix-cache"),
         launch.engine_argv.count("--enable-metrics"),
+        launch.engine_argv.count("--enable-cache-report"),
+        _arg_value(launch.engine_argv, "--schedule-policy"),
+        _arg_value(launch.engine_argv, "--chunked-prefill-size"),
+        _arg_value(launch.engine_argv, "--hicache-storage-backend"),
+        launch.writable_dirs,
         launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
-    ) == (1, 1, "1")
+    ) == (
+        1,
+        1,
+        1,
+        "lpm",
+        "8192",
+        "file",
+        (Path(launch.env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"]),),
+        "1",
+    )
 
 
 def test_scheduler_canary_manifest_conforms_to_its_schema():
