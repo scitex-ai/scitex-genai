@@ -1273,6 +1273,80 @@ async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
 
 
 @pytest.mark.asyncio
+async def test_non_addressable_cleanup_releases_instead_of_spawning_infinite_reaper(
+    upstream_factory,
+) -> None:
+    # Arrange: the Anthropic adapter does not propagate a gateway-owned rid.
+    # Reproduce the post-header disconnect path after draining the transport
+    # failed, which left one 685,947-token admission permanently reserved in
+    # production on 2026-09-12.
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, token_capacity_per_upstream=1_100_000
+    )
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    member = await pool.acquire("anthropic", input_tokens=685_947)
+
+    class ClosedResponse:
+        async def aclose(self) -> None:
+            return None
+
+    class ClosedClient:
+        async def aclose(self) -> None:
+            return None
+
+    # Act: false means the engine state was not confirmed through an explicit
+    # abort. An empty request id makes such confirmation impossible.
+    await backend._finish(
+        ClosedClient(),
+        ClosedResponse(),
+        member,
+        input_tokens=685_947,
+        session_id="anthropic",
+        release_capacity=False,
+        request_id="",
+    )
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert: no keyless reaper can spin forever and poison both slot and token
+    # accounting. Closing the non-addressable transport is the terminal cleanup
+    # event; SGLang's native Anthropic StreamingResponse owns engine abort on
+    # downstream disconnect.
+    assert (
+        pool.status()[0]["in_flight"],
+        pool.status()[0]["input_tokens_in_flight"],
+        snapshot["cleanup_reapers_active"],
+        snapshot["non_addressable_cleanup_releases"],
+    ) == (0, 0, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reaper_rejects_missing_engine_request_id(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    member = await pool.acquire("held")
+
+    # Act
+    with pytest.raises(
+        ValueError, match="cleanup reaper requires a non-empty request id"
+    ):
+        backend._schedule_cleanup_reaper(
+            member,
+            "",
+            headers={},
+            input_tokens=0,
+            session_id="held",
+        )
+
+    # Assert
+    await pool.release(member, session_id="held")
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_visible_reaper_without_double_release(
     upstream_factory,
 ) -> None:
