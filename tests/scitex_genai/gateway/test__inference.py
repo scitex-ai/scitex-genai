@@ -408,6 +408,98 @@ async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> 
 
 
 @pytest.mark.asyncio
+async def test_token_admission_backfills_with_work_that_fits_now() -> None:
+    # Arrange: request count has ample headroom, but the oldest queued request
+    # cannot fit the remaining token budget.
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=8,
+        token_capacity_per_upstream=1_000,
+    )
+    active = await pool.acquire("long-active", input_tokens=700)
+    large = asyncio.create_task(pool.acquire("long-waiting", input_tokens=400))
+    await _wait_for_queue(pool, 1)
+
+    # Act: 200 tokens fit the 300-token remainder and must not wait behind 400.
+    short = await asyncio.wait_for(
+        pool.acquire("short", input_tokens=200), timeout=0.1
+    )
+    observed = pool.status()[0]
+    await pool.release(short, input_tokens=200, session_id="short")
+    await pool.release(active, input_tokens=700, session_id="long-active")
+    admitted_large = await large
+    await pool.release(
+        admitted_large, input_tokens=400, session_id="long-waiting"
+    )
+
+    # Assert
+    assert (
+        observed["in_flight"],
+        observed["input_tokens_in_flight"],
+        observed["queued"],
+    ) == (2, 900, 1)
+
+
+@pytest.mark.asyncio
+async def test_token_backfill_is_bounded_so_large_work_cannot_starve() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=8,
+        token_capacity_per_upstream=1_000,
+        max_admission_bypasses=1,
+    )
+    active = await pool.acquire("long-active", input_tokens=700)
+    large = asyncio.create_task(pool.acquire("long-waiting", input_tokens=400))
+    await _wait_for_queue(pool, 1)
+    first_short = await pool.acquire("short-1", input_tokens=200)
+
+    # Act: the large ticket has used its one bypass. Even after short-1 exits,
+    # short-2 waits while admission drains enough capacity for the large one.
+    await pool.release(first_short, input_tokens=200, session_id="short-1")
+    second_short = asyncio.create_task(
+        pool.acquire("short-2", input_tokens=200)
+    )
+    await _wait_for_queue(pool, 2)
+    blocked = (not large.done(), not second_short.done())
+    await pool.release(active, input_tokens=700, session_id="long-active")
+    admitted_large = await asyncio.wait_for(large, timeout=0.1)
+    await pool.release(
+        admitted_large, input_tokens=400, session_id="long-waiting"
+    )
+    admitted_short = await asyncio.wait_for(second_short, timeout=0.1)
+    await pool.release(admitted_short, input_tokens=200, session_id="short-2")
+
+    # Assert
+    assert blocked == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_aged_ordinary_work_precedes_new_priority_work() -> None:
+    # Arrange: zero seconds makes the aging boundary deterministic in a unit
+    # test; production defaults to 30 seconds.
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=1, priority_aging_s=0
+    )
+    active = await pool.acquire("active")
+    ordinary = asyncio.create_task(pool.acquire("ordinary"))
+    await _wait_for_queue(pool, 1)
+    priority = asyncio.create_task(pool.acquire("priority", priority=True))
+    await _wait_for_queue(pool, 2)
+
+    # Act
+    await pool.release(active, session_id="active")
+    first = await asyncio.wait_for(ordinary, timeout=0.1)
+    priority_waited = not priority.done()
+    await pool.release(first, session_id="ordinary")
+    second = await asyncio.wait_for(priority, timeout=0.1)
+    await pool.release(second, session_id="priority")
+
+    # Assert
+    assert priority_waited is True
+
+
+@pytest.mark.asyncio
 async def test_token_capacity_rejects_a_request_that_can_never_fit() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls(
