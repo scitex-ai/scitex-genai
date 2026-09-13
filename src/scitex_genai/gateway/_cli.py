@@ -381,6 +381,10 @@ def main(
             token_capacity_per_upstream=(
                 settings.inference_token_capacity_per_upstream
             ),
+            cold_prefill_limit_per_upstream=(
+                settings.inference_cold_prefill_limit_per_upstream
+            ),
+            cold_prefill_min_tokens=settings.inference_cold_prefill_min_tokens,
         )
         backend = ExternalProviderBackend(
             pool,
@@ -416,6 +420,10 @@ def main(
             token_capacity_per_upstream=(
                 settings.inference_token_capacity_per_upstream
             ),
+            cold_prefill_limit_per_upstream=(
+                settings.inference_cold_prefill_limit_per_upstream
+            ),
+            cold_prefill_min_tokens=settings.inference_cold_prefill_min_tokens,
         )
         backend = InferenceBackend(
             pool,

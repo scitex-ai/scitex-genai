@@ -514,3 +514,22 @@ def test_the_default_path_is_under_the_scitex_dir():
 
     # Assert
     assert path == scitex_dir / "genai" / "config.yaml"
+
+
+def test_cold_prefill_guard_requires_an_explicit_limit_and_threshold(tmp_path: Path):
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  inference_cold_prefill_limit_per_upstream: 1\n"
+        "  inference_cold_prefill_min_tokens: 256000\n",
+    )
+    settings = load_settings(path)
+    assert settings.inference_cold_prefill_limit_per_upstream == 1
+    assert settings.inference_cold_prefill_min_tokens == 256000
+
+    incomplete = _write(
+        tmp_path / "incomplete.yaml",
+        "gateway:\n  inference_cold_prefill_limit_per_upstream: 1\n",
+    )
+    with pytest.raises(ValueError, match="configured together"):
+        load_settings(incomplete)

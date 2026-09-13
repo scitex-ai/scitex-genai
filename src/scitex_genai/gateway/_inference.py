@@ -648,6 +648,7 @@ class InferenceUpstream:
     token_capacity: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM
     input_tokens_in_flight: int = 0
     input_tokens_queued: int = 0
+    cold_prefills_in_flight: int = 0
     cooldown_until: float = 0.0
     #: When this upstream last went out of rotation (None = healthy).
     cooling_since: float | None = None
@@ -691,6 +692,7 @@ class _PoolTicket:
     session_id: str = ""
     queued_at: float = 0.0
     bypasses: int = 0
+    cold_prefill: bool = False
 
 
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
@@ -717,6 +719,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
         priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
+        cold_prefill_limit_per_upstream: int | None = None,
+        cold_prefill_min_tokens: int | None = None,
     ) -> None:
         if capacity_per_upstream < 1:
             raise ValueError("capacity_per_upstream must be >= 1")
@@ -728,12 +732,27 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             raise ValueError("max_admission_bypasses must be >= 0")
         if priority_aging_s < 0:
             raise ValueError("priority_aging_s must be >= 0")
+        if (
+            cold_prefill_limit_per_upstream is not None
+            and cold_prefill_limit_per_upstream < 1
+        ):
+            raise ValueError("cold_prefill_limit_per_upstream must be >= 1")
+        if (cold_prefill_limit_per_upstream is None) != (
+            cold_prefill_min_tokens is None
+        ):
+            raise ValueError(
+                "cold prefill limit and minimum tokens must be configured together"
+            )
+        if cold_prefill_min_tokens is not None and cold_prefill_min_tokens < 1:
+            raise ValueError("cold_prefill_min_tokens must be >= 1")
         for upstream in upstreams:
             upstream.capacity = capacity_per_upstream
             upstream.token_capacity = token_capacity_per_upstream
         self.max_queue_size = max_queue_size
         self.max_admission_bypasses = max_admission_bypasses
         self.priority_aging_s = priority_aging_s
+        self.cold_prefill_limit_per_upstream = cold_prefill_limit_per_upstream
+        self.cold_prefill_min_tokens = cold_prefill_min_tokens
         self._next_placement = 0
         super().__init__(
             upstreams,
@@ -762,6 +781,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
         priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
+        cold_prefill_limit_per_upstream: int | None = None,
+        cold_prefill_min_tokens: int | None = None,
     ) -> "InferenceUpstreamPool":
         """Build from the ``HOIST_UPSTREAM`` string or an already-split list."""
         if isinstance(urls, str):
@@ -773,6 +794,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             token_capacity_per_upstream=token_capacity_per_upstream,
             max_admission_bypasses=max_admission_bypasses,
             priority_aging_s=priority_aging_s,
+            cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
+            cold_prefill_min_tokens=cold_prefill_min_tokens,
         )
 
     async def route_alias(
@@ -793,6 +816,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         exclude: set[str] | None = None,
         input_tokens: int = 0,
         priority: bool = False,
+        cold_prefill: bool = False,
     ) -> InferenceUpstream:
         """Place first for cache locality, then wait for that member's capacity."""
         if input_tokens < 0:
@@ -811,9 +835,13 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     "Estimated request input exceeds this upstream's token capacity "
                     f"({input_tokens}/{selected.token_capacity})"
                 )
-            if self._fits(selected, input_tokens, session_id) and not selected.queued:
+            if (
+                self._fits(selected, input_tokens, session_id, cold_prefill)
+                and not selected.queued
+            ):
                 selected.in_flight += 1
                 selected.input_tokens_in_flight += input_tokens
+                selected.cold_prefills_in_flight += int(cold_prefill)
                 if session_id:
                     self._active_sessions.add(session_id)
                 return selected
@@ -827,6 +855,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 input_tokens=input_tokens,
                 session_id=session_id,
                 queued_at=time.monotonic(),
+                cold_prefill=cold_prefill,
             )
             waiters = self._waiters[selected.alias]
             waiters.append(ticket)
@@ -851,6 +880,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         queued = False
                         selected.in_flight += 1
                         selected.input_tokens_in_flight += input_tokens
+                        selected.cold_prefills_in_flight += int(cold_prefill)
                         if session_id:
                             self._active_sessions.add(session_id)
                         return selected
@@ -871,9 +901,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     selected.input_tokens_queued -= input_tokens
                     self._admission.notify_all()
 
-    def _next_admissible_ticket(
-        self, member: InferenceUpstream
-    ) -> _PoolTicket | None:
+    def _next_admissible_ticket(self, member: InferenceUpstream) -> _PoolTicket | None:
         """Choose work that fits now without permitting indefinite bypass.
 
         The request count is a hard safety ceiling. Below it, the token budget
@@ -901,7 +929,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         fitting = [
             ticket
             for ticket in waiters
-            if self._fits(member, ticket.input_tokens, ticket.session_id)
+            if self._fits(
+                member, ticket.input_tokens, ticket.session_id, ticket.cold_prefill
+            )
         ]
         if not fitting:
             return None
@@ -926,11 +956,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         waiters = self._waiters[member.alias]
         selected_index = waiters.index(selected)
         for bypassed in list(waiters)[:selected_index]:
-            if (
-                bypassed.session_id not in self._active_sessions
-                and not self._fits(
-                    member, bypassed.input_tokens, bypassed.session_id
-                )
+            if bypassed.session_id not in self._active_sessions and not self._fits(
+                member,
+                bypassed.input_tokens,
+                bypassed.session_id,
+                bypassed.cold_prefill,
             ):
                 bypassed.bypasses += 1
 
@@ -939,11 +969,17 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         member: InferenceUpstream,
         input_tokens: int,
         session_id: str = "",
+        cold_prefill: bool = False,
     ) -> bool:
         token_capacity = member.token_capacity
         return (
             session_id not in self._active_sessions
             and member.in_flight < member.capacity
+            and (
+                not cold_prefill
+                or self.cold_prefill_limit_per_upstream is None
+                or member.cold_prefills_in_flight < self.cold_prefill_limit_per_upstream
+            )
             and (
                 token_capacity is None
                 or member.input_tokens_in_flight + input_tokens <= token_capacity
@@ -956,12 +992,17 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         *,
         input_tokens: int = 0,
         session_id: str = "",
+        cold_prefill: bool = False,
     ) -> None:
         async with self._admission:
             member.in_flight = max(0, member.in_flight - 1)
             member.input_tokens_in_flight = max(
                 0, member.input_tokens_in_flight - input_tokens
             )
+            if cold_prefill:
+                member.cold_prefills_in_flight = max(
+                    0, member.cold_prefills_in_flight - 1
+                )
             if session_id:
                 self._active_sessions.discard(session_id)
             self._admission.notify_all()
@@ -1121,13 +1162,13 @@ class ContinuationQoS:
             "non_addressable_cleanup_releases": 0,
         }
 
-    def classify(self, explicit_session: str) -> str:
+    def kind(self, explicit_session: str) -> str:
         if not explicit_session:
-            kind = "unclassified"
-        elif explicit_session in self._successful:
-            kind = "continuation"
-        else:
-            kind = "first-turn"
+            return "unclassified"
+        return "continuation" if explicit_session in self._successful else "first-turn"
+
+    def classify(self, explicit_session: str) -> str:
+        kind = self.kind(explicit_session)
         self._counters[kind.replace("-", "_")] += 1
         return kind
 
@@ -1462,10 +1503,16 @@ class InferenceBackend:
             body, path, enabled=self.cache_report_enabled
         )
         routing_session = session or ""
+        session_kind = self.continuation_qos.kind(qos_session)
         qos_kind = (
             self.continuation_qos.classify(qos_session)
             if self.continuation_qos.enabled
             else "disabled"
+        )
+        cold_prefill = bool(
+            self.pool.cold_prefill_limit_per_upstream is not None
+            and session_kind == "first-turn"
+            and input_tokens >= (self.pool.cold_prefill_min_tokens or 1)
         )
         self.cache_admission.observe(CacheResidency.UNKNOWN)
         feedback_headers = {
@@ -1503,6 +1550,7 @@ class InferenceBackend:
                         exclude=attempted,
                         input_tokens=input_tokens,
                         priority=qos_kind == "continuation",
+                        cold_prefill=cold_prefill,
                         client_disconnected=client_disconnected,
                     )
                 except _ClientDisconnected:
@@ -1581,6 +1629,7 @@ class InferenceBackend:
                             upstream,
                             input_tokens=input_tokens,
                             session_id=routing_session,
+                            cold_prefill=cold_prefill,
                         )
                     )
                     await asyncio.shield(task)
@@ -1803,6 +1852,7 @@ class InferenceBackend:
                             headers=forwarded,
                             input_tokens=input_tokens,
                             session_id=routing_session,
+                            cold_prefill=cold_prefill,
                         )
                     if (
                         first_attempt is not None
@@ -1840,6 +1890,7 @@ class InferenceBackend:
                             headers=forwarded,
                             input_tokens=input_tokens,
                             session_id=routing_session,
+                            cold_prefill=cold_prefill,
                         )
                         raise InferenceAdmissionError(
                             "Upstream request state is unknown after transport "
@@ -1901,6 +1952,7 @@ class InferenceBackend:
                         successful_session=(
                             qos_session if 200 <= response.status_code < 300 else ""
                         ),
+                        cold_prefill=cold_prefill,
                     ),
                 )
             raise UpstreamUnreachable(self._refusal(failures))
@@ -1942,6 +1994,7 @@ class InferenceBackend:
         exclude: set[str],
         input_tokens: int,
         priority: bool,
+        cold_prefill: bool,
         client_disconnected: Callable[[], Awaitable[bool]] | None,
     ) -> InferenceUpstream:
         """Remove a queued admission ticket as soon as its caller disappears."""
@@ -1951,6 +2004,7 @@ class InferenceBackend:
                 exclude=exclude,
                 input_tokens=input_tokens,
                 priority=priority,
+                cold_prefill=cold_prefill,
             )
         )
         if client_disconnected is None:
@@ -2013,6 +2067,7 @@ class InferenceBackend:
         headers: Mapping[str, str],
         input_tokens: int,
         session_id: str,
+        cold_prefill: bool = False,
     ) -> None:
         """Retain admission and retry abort until engine cleanup is confirmed."""
         if not request_id:
@@ -2031,6 +2086,7 @@ class InferenceBackend:
                                 upstream,
                                 input_tokens=input_tokens,
                                 session_id=session_id,
+                                cold_prefill=cold_prefill,
                             )
                         )
                         await asyncio.shield(release)
@@ -2071,6 +2127,7 @@ class InferenceBackend:
         session_id: str = "",
         continuation_handoff: _ContinuationHandoff | None = None,
         successful_session: str = "",
+        cold_prefill: bool = False,
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
@@ -2178,6 +2235,7 @@ class InferenceBackend:
                     upstream,
                     input_tokens=input_tokens,
                     session_id=session_id,
+                    cold_prefill=cold_prefill,
                     release_capacity=release_capacity,
                     request_id=request_id,
                     request_headers=request_headers or {},
@@ -2193,6 +2251,7 @@ class InferenceBackend:
         *,
         input_tokens: int = 0,
         session_id: str = "",
+        cold_prefill: bool = False,
         release_capacity: bool = True,
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
@@ -2206,6 +2265,7 @@ class InferenceBackend:
                     upstream,
                     input_tokens=input_tokens,
                     session_id=session_id,
+                    cold_prefill=cold_prefill,
                 )
                 if not release_capacity:
                     # A reaper without an engine address can never prove
@@ -2227,6 +2287,7 @@ class InferenceBackend:
                     headers=request_headers or {},
                     input_tokens=input_tokens,
                     session_id=session_id,
+                    cold_prefill=cold_prefill,
                 )
 
     async def close(self) -> None:
