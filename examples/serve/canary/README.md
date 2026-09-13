@@ -100,3 +100,18 @@ multi-request 750k row. Those inputs exceed the one-GPU KV working set before
 measurement has established a safe lower row. Results must include engine
 metrics sampled before, during, and after each row; client latency alone is
 not evidence of the capacity knee.
+
+Spartan compute nodes currently cannot resolve the fleet overlay name
+`scitex-primary`. `run-tp1-context-canary-in-step.sh` is an experiment-only,
+fail-closed fixture for that topology gap. It opens an authenticated SSH local
+forward to the canonical Postgres 55432 endpoint, sets the one official
+`SCITEX_STORE_DSN` override, and closes the tunnel when the engine exits. It
+does not introduce another store or a production routing path. A failed SSH
+forward, missing `.pgpass` credential, or failed incarnation receipt prevents
+the engine from starting.
+
+Invoke the fixture inside the explicitly selected idle-GPU `srun --overlap`
+step. Required environment is the staged committed source root, the Python
+containing `scitex-genai`, the SSH destination, and its validated
+`ProxyCommand`. Preserve the step command, source commit, incarnation receipt,
+and engine log with every result.
