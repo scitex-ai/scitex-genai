@@ -85,3 +85,35 @@ Source links are pinned, not `main`:
 The JSON manifest is the machine-readable source of the intended differences.
 Its schema and dry-render tests prevent silent drift between the manifest,
 profile files, and generated SGLang argv.
+
+## One-H100 context/concurrency capacity canary
+
+`qwen38-tp1-context-concurrency.conf` is a separate capacity experiment, not a
+member of the scheduler matrix above. It keeps the live engine's Qwen3.8 FP8,
+FP8 KV, LPM, 8,192-token chunks, EAGLE, and three cache tiers, but uses TP=1 on
+one isolated H100. `qwen38-context-concurrency-matrix.json` distinguishes the
+configured one-million-token ceiling from actual 256k, 512k, and 640k prompt
+rows. The engine's measured TP=1 capacity is 694,720 device-KV tokens; 640k
+leaves finite generation headroom. Cold
+concurrency greater than one is a dedicated-canary crash probe.
+
+The matrix intentionally omits four concurrent 512k requests and every
+multi-request 640k row. Those inputs exceed the measured one-GPU KV working
+set. Results must include engine metrics sampled before, during, and after
+each row; client latency alone is
+not evidence of the capacity knee.
+
+Spartan compute nodes currently cannot resolve the fleet overlay name
+`scitex-primary`. `run-tp1-context-canary-in-step.sh` is an experiment-only,
+fail-closed fixture for that topology gap. It opens an authenticated SSH local
+forward to the canonical Postgres 55432 endpoint, sets the one official
+`SCITEX_STORE_DSN` override, and closes the tunnel when the engine exits. It
+does not introduce another store or a production routing path. A failed SSH
+forward, missing `.pgpass` credential, or failed incarnation receipt prevents
+the engine from starting.
+
+Invoke the fixture inside the explicitly selected idle-GPU `srun --overlap`
+step. Required environment is the staged committed source root, the Python
+containing `scitex-genai`, the SSH destination, and its validated
+`ProxyCommand`. Preserve the step command, source commit, incarnation receipt,
+and engine log with every result.

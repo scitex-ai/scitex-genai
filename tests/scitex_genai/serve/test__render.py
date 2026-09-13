@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import jsonschema
@@ -353,13 +354,16 @@ def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     }
 
     # Assert
-    assert (binds, launch.writable_dirs) == (
-        {
-            "/weights/model-a:/weights/model-a:ro",
-            f"{storage}:{storage}:rw",
-        },
-        (Path(storage),),
+    cache_paths = tuple(
+        launch.env[name] for name in CACHE_SUBDIRS if name != "HOME"
     )
+    assert (
+        "/weights/model-a:/weights/model-a:ro" in binds,
+        f"{storage}:{storage}:rw" in binds,
+        Path(storage) in launch.writable_dirs,
+        all(f"{path}:{path}:rw" in binds for path in cache_paths),
+        all(Path(path) in launch.writable_dirs for path in cache_paths),
+    ) == (True, True, True, True, True)
 
 
 def test_canary_inherits_slurm_cuda_visibility_into_the_container():
@@ -394,7 +398,8 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
         _arg_value(launch.engine_argv, "--schedule-policy"),
         _arg_value(launch.engine_argv, "--chunked-prefill-size"),
         _arg_value(launch.engine_argv, "--hicache-storage-backend"),
-        launch.writable_dirs,
+        Path(launch.env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"])
+        in launch.writable_dirs,
         launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
     ) == (
         1,
@@ -403,7 +408,7 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
         "lpm",
         "8192",
         "file",
-        (Path(launch.env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"]),),
+        True,
         "1",
     )
 
@@ -426,10 +431,91 @@ def test_scheduler_manifest_declares_every_and_only_canary_conf():
     declared = {profile["file"] for profile in CANARY_MANIFEST["profiles"]}
 
     # Act
-    present = {path.name for path in CANARY_DIR.glob("*.conf")}
+    present = {
+        path.name
+        for path in CANARY_DIR.glob("*.conf")
+        if path.name != "qwen38-tp1-context-concurrency.conf"
+    }
 
     # Assert
     assert present == declared
+
+
+def test_tp1_context_concurrency_canary_is_isolated_and_matches_manifest():
+    # Arrange
+    manifest = json.loads(
+        (CANARY_DIR / "qwen38-context-concurrency-matrix.json").read_text()
+    )
+    profile_path = CANARY_DIR / manifest["profile"]
+    conf = parse_engine_conf(
+        profile_path.stem, profile_path.read_text(), source=profile_path
+    )
+
+    # Act
+    actual = (
+        conf.canary_only,
+        conf.canary_purpose,
+        conf.tp,
+        conf.required_gpu_count,
+        conf.max_model_len,
+        conf.max_num_seqs,
+        conf.served_name,
+    )
+
+    # Assert
+    args = conf.extra_sglang_args
+    assert (
+        actual,
+        args[args.index("--schedule-policy") + 1],
+        args[args.index("--kv-cache-dtype") + 1],
+        args[args.index("--chunked-prefill-size") + 1],
+        "--enable-hierarchical-cache" in args,
+    ) == (
+        (
+            True,
+            "qwen38-tp1-context-concurrency",
+            manifest["hardware"]["tensor_parallel_size"],
+            manifest["hardware"]["gpu_count"],
+            manifest["fixed_engine_configuration"]["configured_max_model_len"],
+            manifest["fixed_engine_configuration"]["max_running_requests"],
+            "qwen38-27b-tp1-canary",
+        ),
+        "lpm",
+        "fp8_e4m3",
+        "8192",
+        True,
+    )
+
+
+def test_canary_step_fixture_is_valid_shell():
+    # Arrange
+    fixture = CANARY_DIR / "run-tp1-context-canary-in-step.sh"
+
+    # Act
+    proc = subprocess.run(
+        ["bash", "-n", str(fixture)], capture_output=True, text=True, check=False
+    )
+
+    # Assert
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+def test_canary_step_fixture_has_one_store_and_fails_closed():
+    # Arrange
+    fixture = CANARY_DIR / "run-tp1-context-canary-in-step.sh"
+
+    # Act
+    text = fixture.read_text()
+
+    # Assert
+    assert (
+        "ExitOnForwardFailure=yes" in text,
+        "SCITEX_STORE_DSN=" in text,
+        "scitex-primary:55432" in text,
+        "STORE_PORT=${SCITEX_GENAI_CANARY_STORE_PORT:-55432}" in text,
+        "sqlite" not in text.lower(),
+        "SCITEX_GENAI_CANARY_STORE_SSH:?" in text,
+    ) == (True, True, True, True, True, True)
 
 
 def test_scheduler_profile_ids_and_files_are_unique():
