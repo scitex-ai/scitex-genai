@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import jsonschema
@@ -353,15 +354,16 @@ def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     }
 
     # Assert
-    assert "/weights/model-a:/weights/model-a:ro" in binds
-    assert f"{storage}:{storage}:rw" in binds
-    assert Path(storage) in launch.writable_dirs
-    for name in CACHE_SUBDIRS:
-        if name == "HOME":
-            continue
-        path = launch.env[name]
-        assert f"{path}:{path}:rw" in binds
-        assert Path(path) in launch.writable_dirs
+    cache_paths = tuple(
+        launch.env[name] for name in CACHE_SUBDIRS if name != "HOME"
+    )
+    assert (
+        "/weights/model-a:/weights/model-a:ro" in binds,
+        f"{storage}:{storage}:rw" in binds,
+        Path(storage) in launch.writable_dirs,
+        all(f"{path}:{path}:rw" in binds for path in cache_paths),
+        all(Path(path) in launch.writable_dirs for path in cache_paths),
+    ) == (True, True, True, True, True)
 
 
 def test_canary_inherits_slurm_cuda_visibility_into_the_container():
@@ -461,20 +463,59 @@ def test_tp1_context_concurrency_canary_is_isolated_and_matches_manifest():
     )
 
     # Assert
-    assert actual == (
-        True,
-        "qwen38-tp1-context-concurrency",
-        manifest["hardware"]["tensor_parallel_size"],
-        manifest["hardware"]["gpu_count"],
-        manifest["fixed_engine_configuration"]["configured_max_model_len"],
-        manifest["fixed_engine_configuration"]["max_running_requests"],
-        "qwen38-27b-tp1-canary",
-    )
     args = conf.extra_sglang_args
-    assert args[args.index("--schedule-policy") + 1] == "lpm"
-    assert args[args.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
-    assert args[args.index("--chunked-prefill-size") + 1] == "8192"
-    assert "--enable-hierarchical-cache" in args
+    assert (
+        actual,
+        args[args.index("--schedule-policy") + 1],
+        args[args.index("--kv-cache-dtype") + 1],
+        args[args.index("--chunked-prefill-size") + 1],
+        "--enable-hierarchical-cache" in args,
+    ) == (
+        (
+            True,
+            "qwen38-tp1-context-concurrency",
+            manifest["hardware"]["tensor_parallel_size"],
+            manifest["hardware"]["gpu_count"],
+            manifest["fixed_engine_configuration"]["configured_max_model_len"],
+            manifest["fixed_engine_configuration"]["max_running_requests"],
+            "qwen38-27b-tp1-canary",
+        ),
+        "lpm",
+        "fp8_e4m3",
+        "8192",
+        True,
+    )
+
+
+def test_canary_step_fixture_is_valid_shell():
+    # Arrange
+    fixture = CANARY_DIR / "run-tp1-context-canary-in-step.sh"
+
+    # Act
+    proc = subprocess.run(
+        ["bash", "-n", str(fixture)], capture_output=True, text=True, check=False
+    )
+
+    # Assert
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+def test_canary_step_fixture_has_one_store_and_fails_closed():
+    # Arrange
+    fixture = CANARY_DIR / "run-tp1-context-canary-in-step.sh"
+
+    # Act
+    text = fixture.read_text()
+
+    # Assert
+    assert (
+        "ExitOnForwardFailure=yes" in text,
+        "SCITEX_STORE_DSN=" in text,
+        "scitex-primary:55432" in text,
+        "STORE_PORT=${SCITEX_GENAI_CANARY_STORE_PORT:-55432}" in text,
+        "sqlite" not in text.lower(),
+        "SCITEX_GENAI_CANARY_STORE_SSH:?" in text,
+    ) == (True, True, True, True, True, True)
 
 
 def test_scheduler_profile_ids_and_files_are_unique():

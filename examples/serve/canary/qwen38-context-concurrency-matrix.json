@@ -22,9 +22,10 @@
   "request_matrix": [
     {"actual_prompt_tokens": 256000, "concurrency": [1, 2, 4]},
     {"actual_prompt_tokens": 512000, "concurrency": [1, 2]},
-    {"actual_prompt_tokens": 750000, "concurrency": [1]}
+    {"actual_prompt_tokens": 640000, "concurrency": [1]}
   ],
   "safety": {
+    "observed_device_kv_token_capacity": 694720,
     "target_scope": "dedicated-canary",
     "cold_concurrency_greater_than_one_is_crash_probe": true,
     "stop_before_next_row_if_engine_health_fails": true
