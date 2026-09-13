@@ -8,7 +8,10 @@ set -euo pipefail
 
 PYTHON=${SCITEX_GENAI_SERVE_PYTHON:-python3}
 SOURCE_ROOT=${SCITEX_GENAI_CANARY_SOURCE_ROOT:?set the staged committed source root}
-STORE_PORT=${SCITEX_GENAI_CANARY_STORE_PORT:-35432}
+# Keep the canonical port number on loopback as well: libpq matches .pgpass on
+# host *and port*, so an arbitrary local port turns a valid scoped credential
+# into an interactive password prompt (which this fixture correctly forbids).
+STORE_PORT=${SCITEX_GENAI_CANARY_STORE_PORT:-55432}
 STORE_ROLE=${SCITEX_GENAI_CANARY_STORE_ROLE:-${USER}__scitex-genai}
 CONTROL_SOCKET=/tmp/scitex-genai-canary-store-${SLURM_JOB_ID}-${SLURM_STEP_ID}.sock
 

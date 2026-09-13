@@ -31,5 +31,6 @@ def test_canary_step_fixture_has_one_store_and_fails_closed():
     assert "ExitOnForwardFailure=yes" in text
     assert "SCITEX_STORE_DSN=" in text
     assert "scitex-primary:55432" in text
+    assert "STORE_PORT=${SCITEX_GENAI_CANARY_STORE_PORT:-55432}" in text
     assert "sqlite" not in text.lower()
     assert "SCITEX_GENAI_CANARY_STORE_SSH:?" in text
