@@ -421,16 +421,12 @@ async def test_token_admission_backfills_with_work_that_fits_now() -> None:
     await _wait_for_queue(pool, 1)
 
     # Act: 200 tokens fit the 300-token remainder and must not wait behind 400.
-    short = await asyncio.wait_for(
-        pool.acquire("short", input_tokens=200), timeout=0.1
-    )
+    short = await asyncio.wait_for(pool.acquire("short", input_tokens=200), timeout=0.1)
     observed = pool.status()[0]
     await pool.release(short, input_tokens=200, session_id="short")
     await pool.release(active, input_tokens=700, session_id="long-active")
     admitted_large = await large
-    await pool.release(
-        admitted_large, input_tokens=400, session_id="long-waiting"
-    )
+    await pool.release(admitted_large, input_tokens=400, session_id="long-waiting")
 
     # Assert
     assert (
@@ -457,16 +453,12 @@ async def test_token_backfill_is_bounded_so_large_work_cannot_starve() -> None:
     # Act: the large ticket has used its one bypass. Even after short-1 exits,
     # short-2 waits while admission drains enough capacity for the large one.
     await pool.release(first_short, input_tokens=200, session_id="short-1")
-    second_short = asyncio.create_task(
-        pool.acquire("short-2", input_tokens=200)
-    )
+    second_short = asyncio.create_task(pool.acquire("short-2", input_tokens=200))
     await _wait_for_queue(pool, 2)
     blocked = (not large.done(), not second_short.done())
     await pool.release(active, input_tokens=700, session_id="long-active")
     admitted_large = await asyncio.wait_for(large, timeout=0.1)
-    await pool.release(
-        admitted_large, input_tokens=400, session_id="long-waiting"
-    )
+    await pool.release(admitted_large, input_tokens=400, session_id="long-waiting")
     admitted_short = await asyncio.wait_for(second_short, timeout=0.1)
     await pool.release(admitted_short, input_tokens=200, session_id="short-2")
 
@@ -2250,3 +2242,37 @@ async def test_relay_sends_one_preamble_on_the_responses_route(
         "Base rules.\n\nBe terse.",
         ["user"],
     )
+
+
+@pytest.mark.asyncio
+async def test_cold_prefill_guard_serializes_only_cold_requests() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=4,
+        token_capacity_per_upstream=1_000_000,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=256_000,
+    )
+    first = await pool.acquire("cold-1", input_tokens=256_000, cold_prefill=True)
+    blocked = asyncio.create_task(
+        pool.acquire("cold-2", input_tokens=256_000, cold_prefill=True)
+    )
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    hot = await pool.acquire("hot", input_tokens=256_000, cold_prefill=False)
+    observed_hot = hot is first
+    observed_blocked = not blocked.done()
+    await pool.release(hot, input_tokens=256_000, session_id="hot")
+    await pool.release(
+        first, input_tokens=256_000, session_id="cold-1", cold_prefill=True
+    )
+    second = await asyncio.wait_for(blocked, timeout=1)
+    observed_cold_count = second.cold_prefills_in_flight
+    await pool.release(
+        second, input_tokens=256_000, session_id="cold-2", cold_prefill=True
+    )
+
+    # Assert
+    assert (observed_hot, observed_blocked, observed_cold_count) == (True, True, 1)

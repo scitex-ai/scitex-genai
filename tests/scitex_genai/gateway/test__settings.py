@@ -514,3 +514,39 @@ def test_the_default_path_is_under_the_scitex_dir():
 
     # Assert
     assert path == scitex_dir / "genai" / "config.yaml"
+
+
+def test_cold_prefill_guard_requires_an_explicit_limit_and_threshold(tmp_path: Path):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n"
+        "  inference_cold_prefill_limit_per_upstream: 1\n"
+        "  inference_cold_prefill_min_tokens: 256000\n",
+    )
+
+    # Act
+    settings = load_settings(path)
+
+    # Assert
+    assert (
+        settings.inference_cold_prefill_limit_per_upstream,
+        settings.inference_cold_prefill_min_tokens,
+    ) == (1, 256000)
+
+
+def test_cold_prefill_guard_rejects_an_incomplete_pair(tmp_path: Path):
+    # Arrange
+    incomplete = _write(
+        tmp_path / "incomplete.yaml",
+        "gateway:\n  inference_cold_prefill_limit_per_upstream: 1\n",
+    )
+
+    # Act
+    raised = _raised(lambda: load_settings(incomplete))
+
+    # Assert
+    assert (
+        str(raised)
+        == "cold prefill limit and minimum tokens must be configured together"
+    )
