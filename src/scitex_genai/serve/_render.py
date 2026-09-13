@@ -189,13 +189,20 @@ def _sglang_container_prefix(
 def _sglang_writable_dirs(
     conf: EngineConf, env: dict[str, str]
 ) -> tuple[Path, ...]:
-    """Host directories that an explicitly configured SGLang backend writes."""
-    if "--hicache-storage-backend" not in conf.extra_sglang_args:
-        return ()
-    index = conf.extra_sglang_args.index("--hicache-storage-backend") + 1
-    if conf.extra_sglang_args[index] != "file":
-        return ()
-    return (Path(env[SGLANG_HICACHE_STORAGE_ENV]),)
+    """Host directories that the clean SGLang container must write.
+
+    Apptainer happens to expose ``/tmp`` at many sites, but an explicitly
+    configured cache under project scratch is otherwise the read-only path
+    from the SIF. Passing an environment variable alone does not make its
+    target writable. Bind every cache directory we pass into the container,
+    plus the optional file-backed HiCache directory.
+    """
+    paths = [Path(env[name]) for name in CACHE_SUBDIRS if name != "HOME"]
+    if "--hicache-storage-backend" in conf.extra_sglang_args:
+        index = conf.extra_sglang_args.index("--hicache-storage-backend") + 1
+        if conf.extra_sglang_args[index] == "file":
+            paths.append(Path(env[SGLANG_HICACHE_STORAGE_ENV]))
+    return tuple(dict.fromkeys(paths))
 
 
 def sglang_preflight_argv(

@@ -353,13 +353,15 @@ def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     }
 
     # Assert
-    assert (binds, launch.writable_dirs) == (
-        {
-            "/weights/model-a:/weights/model-a:ro",
-            f"{storage}:{storage}:rw",
-        },
-        (Path(storage),),
-    )
+    assert "/weights/model-a:/weights/model-a:ro" in binds
+    assert f"{storage}:{storage}:rw" in binds
+    assert Path(storage) in launch.writable_dirs
+    for name in CACHE_SUBDIRS:
+        if name == "HOME":
+            continue
+        path = launch.env[name]
+        assert f"{path}:{path}:rw" in binds
+        assert Path(path) in launch.writable_dirs
 
 
 def test_canary_inherits_slurm_cuda_visibility_into_the_container():
@@ -394,7 +396,8 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
         _arg_value(launch.engine_argv, "--schedule-policy"),
         _arg_value(launch.engine_argv, "--chunked-prefill-size"),
         _arg_value(launch.engine_argv, "--hicache-storage-backend"),
-        launch.writable_dirs,
+        Path(launch.env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"])
+        in launch.writable_dirs,
         launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
     ) == (
         1,
@@ -403,7 +406,7 @@ def test_canonical_qwen_profile_renders_session_cache_and_metrics():
         "lpm",
         "8192",
         "file",
-        (Path(launch.env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"]),),
+        True,
         "1",
     )
 
