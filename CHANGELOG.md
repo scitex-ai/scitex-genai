@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Gateway drained restarts now cross one admission-locked, server-side empty
+  barrier before systemd cutover. Draining health is non-ready, and a bounded
+  timeout leaves admission closed with exact remaining ownership counts.
+
 ## [0.2.0] - 2026-09-05
 
 ### Added

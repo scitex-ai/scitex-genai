@@ -232,13 +232,15 @@ async def test_authenticated_drain_closes_admission_and_health_reports_it(
         health.status_code,
         health.json()["status"],
         health.json()["draining"],
+        health.json()["ready"],
         refused.status_code,
     ) == (
         401,
-        {"draining": True, "in_flight": 0, "queued": 0},
-        200,
+        {"draining": True, "ready": False, "in_flight": 0, "queued": 0},
+        503,
         "draining",
         True,
+        False,
         503,
     )
 
@@ -251,9 +253,7 @@ async def test_authenticated_resume_reopens_admission(upstream_factory) -> None:
 
     # Act
     async with _serving(backend) as test_client:
-        await test_client.post(
-            "/admin/drain", headers={"x-api-key": "relay-secret"}
-        )
+        await test_client.post("/admin/drain", headers={"x-api-key": "relay-secret"})
         resumed = await test_client.post(
             "/admin/resume", headers={"x-api-key": "relay-secret"}
         )
@@ -264,7 +264,136 @@ async def test_authenticated_resume_reopens_admission(upstream_factory) -> None:
         )
 
     # Assert
-    assert (resumed.json(), response.status_code) == ({"draining": False}, 200)
+    assert (resumed.json(), response.status_code) == (
+        {"draining": False, "ready": True, "in_flight": 0, "queued": 0},
+        200,
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_barrier_refuses_racing_request_and_drains_owned_work(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release_upstream = threading.Event()
+    upstream = upstream_factory(block_until=release_upstream)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    backend = InferenceBackend(pool)
+
+    # Act
+    async with _serving(backend) as test_client:
+        admitted_task = asyncio.create_task(
+            test_client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "owned"},
+            )
+        )
+        upstream_started = await asyncio.to_thread(upstream.request_started.wait, 2)
+        queued_task = asyncio.create_task(
+            test_client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "queued"},
+            )
+        )
+        for _ in range(1000):
+            if pool.upstreams[0].queued == 1:
+                break
+            await asyncio.sleep(0.001)
+        drain_task = asyncio.create_task(
+            test_client.post(
+                "/admin/drain?timeout_s=2",
+                headers={"x-api-key": "relay-secret"},
+            )
+        )
+        for _ in range(1000):
+            if pool.draining:
+                break
+            await asyncio.sleep(0.001)
+        racing = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={"x-api-key": "relay-secret", "x-session-id": "racing"},
+        )
+        queued = await asyncio.wait_for(queued_task, 1)
+        health = await test_client.get("/health")
+        barrier_waiting = not drain_task.done()
+        release_upstream.set()
+        admitted = await asyncio.wait_for(admitted_task, 2)
+        drained = await asyncio.wait_for(drain_task, 2)
+
+    # Assert
+    assert (
+        upstream_started,
+        racing.status_code,
+        queued.status_code,
+        sum(request["path"] == "/v1/messages" for request in upstream.requests),
+        barrier_waiting,
+        health.status_code,
+        health.json()["ready"],
+        health.json()["draining"],
+        health.json()["in_flight"],
+        health.json()["queued"],
+        admitted.status_code,
+        drained.status_code,
+        drained.json(),
+    ) == (
+        True,
+        503,
+        503,
+        1,
+        True,
+        503,
+        False,
+        True,
+        1,
+        0,
+        200,
+        200,
+        {"draining": True, "ready": False, "in_flight": 0, "queued": 0},
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_fails_closed_with_deterministic_health(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory(chunks=(b"{}",))
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    owned = await pool.acquire("owned")
+    backend = InferenceBackend(pool)
+
+    # Act
+    async with _serving(backend) as test_client:
+        timed_out = await test_client.post(
+            "/admin/drain?timeout_s=0.01",
+            headers={"x-api-key": "relay-secret"},
+        )
+        health = await test_client.get("/health")
+        refused = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={"x-api-key": "relay-secret", "x-session-id": "after-timeout"},
+        )
+        await pool.release(owned, session_id="owned")
+
+    # Assert
+    assert (
+        timed_out.status_code,
+        timed_out.json()["error"]["type"],
+        timed_out.json()["draining"],
+        timed_out.json()["ready"],
+        timed_out.json()["in_flight"],
+        health.status_code,
+        health.json()["status"],
+        health.json()["ready"],
+        refused.status_code,
+        sum(request["path"] == "/v1/messages" for request in upstream.requests),
+    ) == (409, "drain_timeout", True, False, 1, 503, "draining", False, 503, 0)
 
 
 @pytest.mark.asyncio
@@ -476,9 +605,7 @@ async def test_relay_health_failed_probe_preserves_cooldown() -> None:
     pool = InferenceUpstreamPool.from_urls("http://127.0.0.1:18773")
     await pool.cool_down(pool.upstreams[0], 30)
     cooldown_until = pool.upstreams[0].cooldown_until
-    backend = InferenceBackend(
-        pool, health_probe=failed, health_failure_threshold=1
-    )
+    backend = InferenceBackend(pool, health_probe=failed, health_failure_threshold=1)
     # Act
     async with _serving(backend) as test_client:
         response = await test_client.get("/health")
@@ -498,9 +625,7 @@ async def test_relay_health_timeout_probe_preserves_cooldown() -> None:
     pool = InferenceUpstreamPool.from_urls("http://127.0.0.1:18773")
     await pool.cool_down(pool.upstreams[0], 30)
     cooldown_until = pool.upstreams[0].cooldown_until
-    backend = InferenceBackend(
-        pool, health_probe=timed_out, health_failure_threshold=1
-    )
+    backend = InferenceBackend(pool, health_probe=timed_out, health_failure_threshold=1)
     # Act
     async with _serving(backend) as test_client:
         response = await test_client.get("/health")
