@@ -1,0 +1,194 @@
+import json
+
+import pytest
+
+from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
+from scitex_genai.gateway._prediction import AdmissionPredictionTelemetry
+
+
+def _body(messages: list[dict[str, str]], *, tools: str = "stable") -> bytes:
+    return json.dumps(
+        {"model": "qwen", "tools": [{"name": tools}], "messages": messages}
+    ).encode()
+
+
+def _observe(
+    telemetry: AdmissionPredictionTelemetry,
+    *,
+    messages: list[dict[str, str]],
+    estimated: int,
+    reported: int,
+    cached: int,
+    generation: str = "engine-a",
+):
+    body = _body(messages)
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation=generation,
+        body=body,
+        estimated_input_tokens=estimated,
+    )
+    telemetry.observe(
+        prediction,
+        session_id="session",
+        upstream="upstream",
+        reported_input_tokens=reported,
+        cached_tokens=cached,
+        cache_tier="device" if cached else "none",
+    )
+    return prediction
+
+
+def test_observed_app_compaction_is_a_lineage_break_not_a_hot_prediction() -> None:
+    telemetry = AdmissionPredictionTelemetry()
+    common = {"role": "system", "content": "x" * 20_000}
+    old = [common, {"role": "user", "content": "old history"}]
+    _observe(
+        telemetry, messages=old, estimated=671_627, reported=687_453, cached=687_040
+    )
+
+    compacted = [common, {"role": "user", "content": "compacted summary"}]
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(compacted),
+        estimated_input_tokens=665_653,
+    )
+
+    assert prediction.evidence == "no-compatible-history"
+    assert prediction.predecessor_digest is None
+    assert prediction.predicted_uncached_tokens == 665_653
+
+
+def test_observed_hub_append_only_turn_predicts_only_growth() -> None:
+    telemetry = AdmissionPredictionTelemetry()
+    prior = [{"role": "system", "content": "rules"}]
+    _observe(
+        telemetry, messages=prior, estimated=404_000, reported=450_000, cached=449_000
+    )
+    current = prior + [{"role": "user", "content": "continue"}]
+
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(current),
+        estimated_input_tokens=405_000,
+    )
+
+    assert prediction.evidence == "historical-lineage-extension"
+    assert prediction.predecessor_digest is not None
+    assert prediction.predicted_uncached_tokens == 1_000
+
+
+def test_observed_ui_historical_hot_can_still_miss_and_feedback_records_error() -> None:
+    telemetry = AdmissionPredictionTelemetry()
+    prior = [{"role": "system", "content": "rules"}]
+    _observe(
+        telemetry, messages=prior, estimated=500_735, reported=546_784, cached=545_856
+    )
+    current = prior + [{"role": "user", "content": "next"}]
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(current),
+        estimated_input_tokens=501_171,
+    )
+    telemetry.observe(
+        prediction,
+        session_id="session",
+        upstream="upstream",
+        reported_input_tokens=547_199,
+        cached_tokens=13_184,
+        cache_tier="device",
+    )
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["authoritative_for_admission"] is False
+    assert snapshot["recent"][-1]["actual_uncached_tokens"] == 534_015
+    assert snapshot["cumulative"]["prediction_error_tokens_abs_sum"] >= 533_000
+
+
+def test_generation_change_and_missing_report_never_reuse_history() -> None:
+    telemetry = AdmissionPredictionTelemetry()
+    prior = [{"role": "system", "content": "rules"}]
+    _observe(telemetry, messages=prior, estimated=100, reported=110, cached=100)
+    current = prior + [{"role": "user", "content": "next"}]
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-b",
+        body=_body(current),
+        estimated_input_tokens=120,
+    )
+    telemetry.observe(
+        prediction,
+        session_id="session",
+        upstream="upstream",
+        reported_input_tokens=130,
+        cached_tokens=None,
+        cache_tier="unknown",
+    )
+
+    snapshot = telemetry.snapshot()
+    assert prediction.evidence == "no-compatible-history"
+    assert prediction.predicted_uncached_tokens == 120
+    assert snapshot["cumulative"]["missing_cache_reports_total"] == 1
+    assert snapshot["observations"] == 1
+
+
+def test_observations_and_recent_rows_are_bounded() -> None:
+    telemetry = AdmissionPredictionTelemetry(max_sessions=2, max_recent=2)
+    for index in range(3):
+        body = _body([{"role": "user", "content": str(index)}])
+        prediction = telemetry.predict(
+            session_id=f"session-{index}",
+            upstream="upstream",
+            engine_generation="engine",
+            body=body,
+            estimated_input_tokens=10,
+        )
+        telemetry.observe(
+            prediction,
+            session_id=f"session-{index}",
+            upstream="upstream",
+            reported_input_tokens=10,
+            cached_tokens=0,
+            cache_tier="none",
+        )
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["observations"] == 2
+    assert len(snapshot["recent"]) == 2
+    assert "session-" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_operator_snapshot_distinguishes_gateway_admitted_from_backend_queue() -> (
+    None
+):
+    pool = InferenceUpstreamPool.from_urls("http://engine:1")
+    backend = InferenceBackend(pool)
+    member = await pool.acquire("session", input_tokens=500_000)
+    backend.observe_backend_scheduler(
+        upstream=member.alias,
+        engine_generation="process-123",
+        running=0,
+        queued=2,
+        token_usage=0.22,
+    )
+
+    snapshot = await backend.observability_snapshot()
+    comparison = snapshot["admission_prediction"]["gateway_backend_comparison"]
+    await pool.release(member, input_tokens=500_000, session_id="session")
+
+    assert comparison["gateway_admitted"] == 1
+    assert comparison["gateway_queued"] == 0
+    assert comparison["backend"]["running"] == 0
+    assert comparison["backend"]["queued"] == 2
+    assert comparison["backend"]["token_usage"] == 0.22
+    assert comparison["block_reason"] == "backend-scheduler-queue"
+    assert comparison["backend"]["engine_generation"] != "process-123"

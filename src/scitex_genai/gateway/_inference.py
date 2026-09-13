@@ -79,6 +79,7 @@ from ._health import (
     timed_out_reachability,
 )
 from ._pool import StickyPool
+from ._prediction import AdmissionPrediction, AdmissionPredictionTelemetry
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
 #: working unchanged. Comma-separated base URLs, seconds, and a truthy flag.
@@ -320,6 +321,32 @@ class ResponseTokenReport:
         return " ".join(
             f"{name}={value}" for name, value in values if value is not None
         )
+
+    def observed_cached_tokens(self) -> int | None:
+        """Return reported cached tokens without inventing a missing report."""
+        if self.cached_tokens is not None:
+            return self.cached_tokens
+        tiers = (
+            self.device_cached_tokens,
+            self.host_cached_tokens,
+            self.storage_cached_tokens,
+        )
+        return (
+            sum(value or 0 for value in tiers)
+            if any(v is not None for v in tiers)
+            else None
+        )
+
+    def observed_cache_tier(self) -> str:
+        """Name the slowest tier that supplied at least one reported token."""
+        for name, value in (
+            ("storage", self.storage_cached_tokens),
+            ("host", self.host_cached_tokens),
+            ("device", self.device_cached_tokens),
+        ):
+            if value:
+                return name
+        return "none" if self.observed_cached_tokens() == 0 else "unknown"
 
 
 @dataclass
@@ -757,6 +784,7 @@ class _PoolTicket:
     cold_prefill: bool = False
     admission_class: str = "unclassified"
     cache_classification: str = CacheResidency.UNKNOWN.value
+    block_reason: str = "none"
 
     def status(self, *, state: str, now: float, upstream: str) -> dict[str, Any]:
         """Return bounded, payload-free request metadata for operators."""
@@ -780,6 +808,7 @@ class _PoolTicket:
             "cache_classification": self.cache_classification,
             "cold_prefill": self.cold_prefill,
             "bypasses": self.bypasses,
+            "block_reason": self.block_reason,
         }
 
 
@@ -895,6 +924,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._queued_total = 0
         self._queue_time_s_sum = 0.0
         self._queue_time_samples = 0
+        self._blocked_total: dict[str, int] = {}
         self._active_sessions: set[str] = set()
         self._closing = False
 
@@ -1003,6 +1033,10 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     f"Inference queue is full ({total_queued}/{self.max_queue_size})"
                 )
             ticket.queued_at = time.monotonic()
+            ticket.block_reason = self._block_reason(selected, ticket)
+            self._blocked_total[ticket.block_reason] = (
+                self._blocked_total.get(ticket.block_reason, 0) + 1
+            )
             waiters = self._waiters[selected.alias]
             waiters.append(ticket)
             self._queued_total += 1
@@ -1139,6 +1173,26 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             )
         )
 
+    def _block_reason(self, member: InferenceUpstream, ticket: _PoolTicket) -> str:
+        """Explain the first deterministic gateway condition blocking a ticket."""
+        if ticket.session_id in self._active_sessions:
+            return "session-serialization"
+        if member.in_flight >= member.capacity:
+            return "request-capacity"
+        if (
+            ticket.cold_prefill
+            and self.cold_prefill_limit_per_upstream is not None
+            and member.cold_prefills_in_flight >= self.cold_prefill_limit_per_upstream
+        ):
+            return "cold-prefill-limit"
+        if (
+            member.token_capacity is not None
+            and member.input_tokens_in_flight + ticket.input_tokens
+            > member.token_capacity
+        ):
+            return "token-capacity"
+        return "queue-order"
+
     async def release(
         self,
         member: InferenceUpstream,
@@ -1240,8 +1294,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         """Return one lock-consistent, bounded view of admission ownership."""
         async with self._admission:
             now = time.monotonic()
-            running = [
-                ticket.status(state="running", now=now, upstream=upstream.alias)
+            admitted = [
+                ticket.status(state="admitted", now=now, upstream=upstream.alias)
                 for upstream in self.upstreams
                 for ticket in self._running_tickets[upstream.alias]
             ]
@@ -1250,11 +1304,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 for upstream in self.upstreams
                 for ticket in self._waiters[upstream.alias]
             ]
-            tickets = running + queued
+            tickets = admitted + queued
             return {
-                "running": len(running),
+                "admitted": len(admitted),
                 "queued": len(queued),
-                "input_tokens_running": sum(
+                "input_tokens_admitted": sum(
                     upstream.input_tokens_in_flight for upstream in self.upstreams
                 ),
                 "input_tokens_queued": sum(
@@ -1270,6 +1324,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     "queued_total": self._queued_total,
                     "queue_time_s_sum": self._queue_time_s_sum,
                     "queue_time_samples": self._queue_time_samples,
+                    "blocked_total": dict(sorted(self._blocked_total.items())),
                 },
             }
 
@@ -1574,17 +1629,79 @@ class InferenceBackend:
         )
         self.cache_report_enabled = cache_report_enabled
         self.relay_metrics = RelayMetrics()
+        self.admission_predictions = AdmissionPredictionTelemetry()
+        self._engine_generations = {
+            upstream.alias: "unavailable" for upstream in self.pool.upstreams
+        }
+        self._backend_scheduler: dict[str, Any] = {
+            "state": "unobserved",
+            "running": None,
+            "queued": None,
+            "token_usage": None,
+            "reason": "no-authoritative-engine-generation-or-metrics-contract",
+        }
         self._cleanup_reapers: set[asyncio.Task[None]] = set()
+
+    def observe_backend_scheduler(
+        self,
+        *,
+        upstream: str,
+        engine_generation: str,
+        running: int,
+        queued: int,
+        token_usage: float,
+    ) -> None:
+        """Accept one external engine observation without changing admission."""
+        if upstream not in self._engine_generations:
+            raise ValueError("backend observation names an unknown upstream")
+        if not engine_generation:
+            raise ValueError("engine_generation must be non-empty")
+        if running < 0 or queued < 0 or not 0 <= token_usage <= 1:
+            raise ValueError("backend scheduler metrics are outside valid bounds")
+        generation = hashlib.sha256(
+            b"scitex-genai-engine-generation-v1\0" + engine_generation.encode()
+        ).hexdigest()[:16]
+        self._engine_generations[upstream] = generation
+        self._backend_scheduler = {
+            "state": "observed",
+            "upstream": public_upstream_url(upstream),
+            "engine_generation": generation,
+            "running": running,
+            "queued": queued,
+            "token_usage": token_usage,
+            "reason": "engine-metrics-observed",
+        }
 
     async def observability_snapshot(self) -> dict[str, Any]:
         """Return the stable operator-facing status document."""
         admission = await self.pool.observability_snapshot()
         admission["cumulative"].update(self.relay_metrics.snapshot())
+        queued_tickets = [
+            ticket for ticket in admission["tickets"] if ticket["state"] == "queued"
+        ]
+        block_reason = (
+            queued_tickets[0]["block_reason"]
+            if queued_tickets
+            else (
+                "backend-scheduler-queue"
+                if (self._backend_scheduler.get("queued") or 0) > 0
+                else "none"
+            )
+        )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "provider": self.provider,
             "draining": self.pool.draining,
             "admission": admission,
+            "admission_prediction": {
+                **self.admission_predictions.snapshot(),
+                "gateway_backend_comparison": {
+                    "gateway_admitted": admission["admitted"],
+                    "gateway_queued": admission["queued"],
+                    "backend": dict(self._backend_scheduler),
+                    "block_reason": block_reason,
+                },
+            },
         }
 
     async def probe_upstreams(self) -> list[UpstreamReachability]:
@@ -1761,6 +1878,7 @@ class InferenceBackend:
             inject_session_id=accepts_session_id(path),
         )
         input_tokens = estimate_input_tokens(body)
+        prediction_body = body
         prefix_fingerprint = request_prefix_fingerprint(body)
         body, cache_report_requested = inject_cache_report_request(
             body, path, enabled=self.cache_report_enabled
@@ -1860,6 +1978,13 @@ class InferenceBackend:
                     failures.append(str(exc))
                     break
                 attempted.add(upstream.alias)
+                prediction = self.admission_predictions.predict(
+                    session_id=routing_session,
+                    upstream=upstream.alias,
+                    engine_generation=self._engine_generations[upstream.alias],
+                    body=prediction_body,
+                    estimated_input_tokens=input_tokens,
+                )
                 started = time.monotonic()
                 self._note(
                     f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
@@ -2218,6 +2343,7 @@ class InferenceBackend:
                             qos_session if 200 <= response.status_code < 300 else ""
                         ),
                         cold_prefill=cold_prefill,
+                        admission_prediction=prediction,
                     ),
                 )
             raise UpstreamUnreachable(self._refusal(failures))
@@ -2399,6 +2525,7 @@ class InferenceBackend:
         cold_prefill: bool = False,
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
+        admission_prediction: AdmissionPrediction | None = None,
     ) -> AsyncIterator[bytes]:
         sent = 0
         outcome = "complete"
@@ -2481,6 +2608,15 @@ class InferenceBackend:
                 next_chunk = None
             token_report.finish()
             self.relay_metrics.observe(token_report, ttft_s=ttft_s)
+            if admission_prediction is not None:
+                self.admission_predictions.observe(
+                    admission_prediction,
+                    session_id=session_id,
+                    upstream=upstream.alias,
+                    reported_input_tokens=token_report.input_tokens,
+                    cached_tokens=token_report.observed_cached_tokens(),
+                    cache_tier=token_report.observed_cache_tier(),
+                )
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 total = (
