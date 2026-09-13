@@ -160,12 +160,14 @@ class AdmissionController:
         )
         return {
             "mode": "enabled" if self.enabled else "observe-only",
-            "running": self._running,
+            "admitted": self._running,
             "queued": len(self._waiters),
             "oldest_wait_s": oldest_wait_s,
             "hot_overtakes": self._hot_overtakes,
             "observed": {key.value: value for key, value in self._observed.items()},
-            "admitted": {key.value: value for key, value in self._admitted.items()},
+            "admitted_total_by_residency": {
+                key.value: value for key, value in self._admitted.items()
+            },
         }
 
 

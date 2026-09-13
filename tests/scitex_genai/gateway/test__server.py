@@ -312,7 +312,7 @@ async def test_admin_status_is_authenticated_and_reports_observed_metrics(
         status.status_code,
         payload["schema_version"],
         payload["provider"],
-        payload["admission"]["running"],
+        payload["admission"]["admitted"],
         payload["admission"]["queued"],
         cumulative["admissions_total"],
         cumulative["observed_streams_total"],
@@ -323,7 +323,7 @@ async def test_admin_status_is_authenticated_and_reports_observed_metrics(
         cumulative["cache_host_tokens_total"],
         cumulative["cache_storage_tokens_total"],
         "private-session" not in json.dumps(payload),
-    ) == (401, 200, 200, 1, "inference-upstream", 0, 0, 1, 1, 1, 3, 8, 5, 2, 1, True)
+    ) == (401, 200, 200, 2, "inference-upstream", 0, 0, 1, 1, 1, 3, 8, 5, 2, 1, True)
 
 
 @pytest.mark.asyncio
