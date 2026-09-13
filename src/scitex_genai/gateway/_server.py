@@ -3,6 +3,7 @@
 import asyncio
 import hmac
 import json
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,9 +14,10 @@ from ._anthropic import (
     codex_events_to_anthropic,
 )
 from ._codex import CodexBackend
+from ._drain import DEFAULT_DRAIN_TIMEOUT_S
 from ._errors import GatewayError, UpstreamError
 from ._health import public_upstream_url
-from ._inference import InferenceBackend, estimate_input_tokens
+from ._inference import InferenceBackend, InferenceDrainTimeout, estimate_input_tokens
 from ._secrets import resolve_gateway_key
 
 
@@ -165,10 +167,12 @@ def create_app(
         if relaying:
             members = backend.pool.status()
             if not backend.active_health_probe:
+                drain = await backend.pool.drain_state()
                 for member in members:
                     member["url"] = public_upstream_url(member["url"])
                 status = {
-                    "status": "ok",
+                    "status": "draining" if drain.draining else "ok",
+                    "ready": drain.ready,
                     "provider": backend.provider,
                     "health_strategy": backend.health_strategy,
                     "upstreams": [
@@ -177,9 +181,9 @@ def create_app(
                     ],
                     "members": members,
                     "active_members": sum(member["active"] for member in members),
-                    "in_flight": sum(member["in_flight"] for member in members),
-                    "queued": sum(member["queued"] for member in members),
-                    "draining": backend.pool.draining,
+                    "in_flight": drain.in_flight,
+                    "queued": drain.queued,
+                    "draining": drain.draining,
                     "cache_admission": backend.cache_admission.snapshot(),
                     "continuation_qos": backend.continuation_qos.snapshot(),
                     "cache_report": {
@@ -198,7 +202,7 @@ def create_app(
                     status["input_tokens_queued"] = sum(
                         member["input_tokens_queued"] for member in members
                     )
-                return status
+                return status if drain.ready else JSONResponse(status, status_code=503)
             reachability = await backend.probe_upstreams()
             members = backend.pool.status()
             for member, observed in zip(members, reachability, strict=True):
@@ -216,11 +220,14 @@ def create_app(
             admission_eligible_members = sum(
                 member["admission_eligible"] for member in members
             )
-            draining = backend.pool.draining
+            drain = await backend.pool.drain_state()
             status = {
                 "status": (
-                    "draining" if draining else ("ok" if active_members else "degraded")
+                    "draining"
+                    if drain.draining
+                    else ("ok" if active_members else "degraded")
                 ),
+                "ready": drain.ready and bool(active_members),
                 "provider": backend.provider,
                 "health_strategy": backend.health_strategy,
                 "upstreams": [
@@ -233,9 +240,9 @@ def create_app(
                 "reachable_members": reachable_members,
                 "ready_members": ready_members,
                 "active_members": active_members,
-                "in_flight": sum(member["in_flight"] for member in members),
-                "queued": sum(member["queued"] for member in members),
-                "draining": draining,
+                "in_flight": drain.in_flight,
+                "queued": drain.queued,
+                "draining": drain.draining,
                 "cache_admission": backend.cache_admission.snapshot(),
                 "continuation_qos": backend.continuation_qos.snapshot(),
                 "cache_report": {
@@ -246,7 +253,7 @@ def create_app(
                     )
                 },
             }
-            if not active_members and not draining:
+            if not active_members and not drain.draining:
                 status["reason"] = (
                     "no_inference_upstream_reachable"
                     if not reachable_members
@@ -259,11 +266,7 @@ def create_app(
                 status["input_tokens_queued"] = sum(
                     member["input_tokens_queued"] for member in members
                 )
-            return (
-                status
-                if active_members or draining
-                else JSONResponse(status, status_code=503)
-            )
+            return status if status["ready"] else JSONResponse(status, status_code=503)
         return {
             "status": "ok",
             "provider": "openai-codex",
@@ -282,19 +285,34 @@ def create_app(
     if relaying:
 
         @app.post("/admin/drain")
-        async def begin_drain(request: Request) -> Any:
+        async def begin_drain(
+            request: Request, timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
+        ) -> Any:
             if not authorized(request):
                 return JSONResponse(
                     _openai_error("Invalid API key", "authentication_error", 401),
                     401,
                 )
-            await backend.pool.close()
-            members = backend.pool.status()
-            return {
-                "draining": True,
-                "in_flight": sum(member["in_flight"] for member in members),
-                "queued": sum(member["queued"] for member in members),
-            }
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                return JSONResponse(
+                    _openai_error(
+                        "drain timeout_s must be finite and > 0",
+                        "invalid_request_error",
+                        400,
+                    ),
+                    400,
+                )
+            try:
+                state = await backend.pool.begin_drain(timeout_s)
+            except InferenceDrainTimeout as exc:
+                return JSONResponse(
+                    {
+                        **_openai_error(str(exc), "drain_timeout", 409),
+                        **exc.state.as_dict(),
+                    },
+                    409,
+                )
+            return state.as_dict()
 
         @app.post("/admin/resume")
         async def cancel_drain(request: Request) -> Any:
@@ -304,7 +322,7 @@ def create_app(
                     401,
                 )
             await backend.pool.resume()
-            return {"draining": False}
+            return (await backend.pool.drain_state()).as_dict()
 
         async def relay(request: Request) -> Any:
             path = request.url.path

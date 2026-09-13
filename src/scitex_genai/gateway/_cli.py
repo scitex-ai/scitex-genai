@@ -226,7 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval-s",
         type=float,
         default=DEFAULT_POLL_INTERVAL_S,
-        help=f"health polling interval in seconds (default: {DEFAULT_POLL_INTERVAL_S:g})",
+        help=(
+            "deprecated compatibility option; the server-side barrier no longer "
+            "polls health"
+        ),
     )
     return parser
 

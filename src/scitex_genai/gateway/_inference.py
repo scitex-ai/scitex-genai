@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -695,6 +696,42 @@ class _PoolTicket:
     cold_prefill: bool = False
 
 
+@dataclass(frozen=True)
+class InferenceDrainState:
+    """An admission-locked snapshot used to authorize a process cutover."""
+
+    draining: bool
+    in_flight: int
+    queued: int
+
+    @property
+    def ready(self) -> bool:
+        return not self.draining
+
+    @property
+    def empty(self) -> bool:
+        return self.in_flight == 0 and self.queued == 0
+
+    def as_dict(self) -> dict[str, bool | int]:
+        return {
+            "draining": self.draining,
+            "ready": self.ready,
+            "in_flight": self.in_flight,
+            "queued": self.queued,
+        }
+
+
+class InferenceDrainTimeout(TimeoutError):
+    """Admission is closed, but owned work did not finish before the deadline."""
+
+    def __init__(self, state: InferenceDrainState) -> None:
+        self.state = state
+        super().__init__(
+            "drain deadline expired with "
+            f"in_flight={state.in_flight} queued={state.queued}; admission remains closed"
+        )
+
+
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
     """Sticky per-conversation pool with bounded per-upstream admission.
 
@@ -1057,6 +1094,47 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         async with self._admission:
             self._closing = True
             self._admission.notify_all()
+
+    def _drain_state_locked(self) -> InferenceDrainState:
+        return InferenceDrainState(
+            draining=self._closing,
+            in_flight=sum(upstream.in_flight for upstream in self.upstreams),
+            queued=sum(upstream.queued for upstream in self.upstreams),
+        )
+
+    async def drain_state(self) -> InferenceDrainState:
+        """Read readiness and ownership counters under the admission lock."""
+        async with self._admission:
+            return self._drain_state_locked()
+
+    async def begin_drain(self, timeout_s: float) -> InferenceDrainState:
+        """Atomically close admission and wait for all owned work to settle.
+
+        The same condition lock guards both ``_closing`` and every transition
+        into or out of the in-flight/queued counters. Therefore a successful
+        return is a durable cutover barrier: no request can acquire ownership
+        between this zero observation and the caller's process restart.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and > 0")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        async with self._admission:
+            self._closing = True
+            self._admission.notify_all()
+            while True:
+                state = self._drain_state_locked()
+                if state.empty:
+                    return state
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise InferenceDrainTimeout(state)
+                try:
+                    await asyncio.wait_for(self._admission.wait(), remaining)
+                except TimeoutError:
+                    state = self._drain_state_locked()
+                    if not state.empty:
+                        raise InferenceDrainTimeout(state) from None
 
     async def resume(self) -> None:
         """Reopen admission after an operator-aborted drain."""
