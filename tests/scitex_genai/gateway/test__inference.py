@@ -2276,3 +2276,57 @@ async def test_cold_prefill_guard_serializes_only_cold_requests() -> None:
 
     # Assert
     assert (observed_hot, observed_blocked, observed_cold_count) == (True, True, 1)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_explicit_session_release_cannot_debit_another_owner() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=2, token_capacity_per_upstream=1000
+    )
+    upstream = await pool.acquire("first", input_tokens=100)
+    await pool.acquire("second", input_tokens=200)
+
+    # Act
+    await pool.release(upstream, input_tokens=100, session_id="first")
+    await pool.release(upstream, input_tokens=100, session_id="first")
+    state = pool.status()[0]
+
+    # Assert
+    assert (state["in_flight"], state["input_tokens_in_flight"]) == (1, 200)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_release_precedes_blocked_transport_close() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", token_capacity_per_upstream=1000
+    )
+    upstream = await pool.acquire("session", input_tokens=100)
+    backend = InferenceBackend(pool)
+    close_started = asyncio.Event()
+    never_closes = asyncio.Event()
+
+    class BlockingClose:
+        async def aclose(self) -> None:
+            close_started.set()
+            await never_closes.wait()
+
+    finish = asyncio.create_task(
+        backend._finish(
+            BlockingClose(),
+            BlockingClose(),
+            upstream,
+            input_tokens=100,
+            session_id="session",
+        )
+    )
+
+    # Act
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    state = pool.status()[0]
+    finish.cancel()
+    await asyncio.gather(finish, return_exceptions=True)
+
+    # Assert
+    assert (state["in_flight"], state["input_tokens_in_flight"]) == (0, 0)

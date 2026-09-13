@@ -611,7 +611,9 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
     # Arrange
     upstream = upstream_factory()
     pool = InferenceUpstreamPool.from_urls(
-        upstream.url, capacity_per_upstream=1, max_queue_size=1
+        upstream.url,
+        capacity_per_upstream=1,
+        max_queue_size=1,
     )
     backend = InferenceBackend(pool)
     admitted = await pool.acquire("first")
@@ -951,7 +953,10 @@ async def test_asgi_disconnect_removes_request_waiting_for_admission(
     # Arrange
     upstream = upstream_factory()
     pool = InferenceUpstreamPool.from_urls(
-        upstream.url, capacity_per_upstream=1, max_queue_size=1
+        upstream.url,
+        capacity_per_upstream=1,
+        max_queue_size=1,
+        token_capacity_per_upstream=1000,
     )
     occupying = await pool.acquire("occupying")
     app = create_app(InferenceBackend(pool), api_key="relay-secret")
@@ -999,9 +1004,11 @@ async def test_asgi_disconnect_removes_request_waiting_for_admission(
     assert (
         state["in_flight"],
         state["queued"],
+        state["input_tokens_in_flight"],
+        state["input_tokens_queued"],
         sent[0]["status"],
         len(upstream.requests),
-    ) == (1, 0, 499, 0)
+    ) == (1, 0, 0, 0, 499, 0)
 
 
 @pytest.mark.asyncio
