@@ -27,10 +27,18 @@ async def test_admission_is_observe_only_by_default() -> None:
     await first.release()
 
     # Assert
-    assert (snapshot["mode"], snapshot["running"], snapshot["queued"]) == (
+    assert (
+        snapshot["mode"],
+        snapshot["admitted"],
+        snapshot["admitted_total_by_residency"],
+        snapshot["queued"],
+        "running" in snapshot,
+    ) == (
         "observe-only",
         0,
+        {"hot": 0, "cold": 0, "unknown": 0},
         0,
+        False,
     )
 
 
@@ -133,7 +141,9 @@ async def test_explicit_session_has_hashed_feedback(upstream_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_streaming_response_propagates_admission_feedback(upstream_factory) -> None:
+async def test_streaming_response_propagates_admission_feedback(
+    upstream_factory,
+) -> None:
     # Arrange
     upstream = upstream_factory(chunks=(b'{"id":"response-1"}',))
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
@@ -160,7 +170,9 @@ async def test_streaming_response_propagates_admission_feedback(upstream_factory
 
 
 @pytest.mark.asyncio
-async def test_health_exposes_incremented_observe_only_snapshot(upstream_factory) -> None:
+async def test_health_exposes_incremented_observe_only_snapshot(
+    upstream_factory,
+) -> None:
     # Arrange
     upstream = upstream_factory()
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
@@ -183,6 +195,13 @@ async def test_health_exposes_incremented_observe_only_snapshot(upstream_factory
     assert (
         snapshot["mode"],
         snapshot["observed"],
-        snapshot["running"],
+        snapshot["admitted"],
+        snapshot["admitted_total_by_residency"],
         snapshot["queued"],
-    ) == ("observe-only", {"hot": 0, "cold": 0, "unknown": 1}, 0, 0)
+    ) == (
+        "observe-only",
+        {"hot": 0, "cold": 0, "unknown": 1},
+        0,
+        {"hot": 0, "cold": 0, "unknown": 0},
+        0,
+    )
