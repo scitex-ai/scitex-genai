@@ -55,3 +55,26 @@ evictable under pressure. A future lifecycle integration should call SGLang's
 
 No configuration change restarts a live engine. These settings take effect on
 the next normal or controlled server activation.
+
+## Gateway operator status
+
+The inference gateway exposes `GET /admin/status` using the same API-key
+authentication as the relay and drain endpoints. The stable JSON document has
+`schema_version: 1` and reports current running/queued request and estimated
+input-token totals, oldest queue age, and cumulative queue-time, time-to-first-
+token, output-token, and cache-tier observations.
+
+`admission.tickets` is an ephemeral snapshot, capped at 256 entries. Each entry
+contains only the public upstream address, an opaque 12-character session label,
+estimated input tokens, queue age, priority/admission class, cache classification,
+cold-prefill flag, and bypass count. Raw session IDs, request bodies, prompt text,
+headers, and storage-backend names are never included. `tickets_omitted` reports
+any entries beyond the cap. The cumulative counters reset when the gateway
+process restarts and token/cache totals advance only when the upstream response
+actually reports them.
+
+Example:
+
+```console
+curl -H 'Authorization: Bearer <gateway-key>' http://127.0.0.1:18772/admin/status
+```

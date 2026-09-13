@@ -284,6 +284,16 @@ def create_app(
 
     if relaying:
 
+        @app.get("/admin/status")
+        async def operator_status(request: Request) -> Any:
+            """Authenticated, payload-free gateway admission/relay metrics."""
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            return await backend.observability_snapshot()
+
         @app.post("/admin/drain")
         async def begin_drain(
             request: Request, timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S

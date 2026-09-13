@@ -271,6 +271,62 @@ async def test_authenticated_resume_reopens_admission(upstream_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_admin_status_is_authenticated_and_reports_observed_metrics(
+    upstream_factory,
+) -> None:
+    # Arrange
+    reply = json.dumps(
+        {
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 8},
+            },
+            "sglext": {"cached_tokens_details": {"device": 5, "host": 2, "storage": 1}},
+        }
+    ).encode()
+    upstream = upstream_factory(chunks=(reply,))
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+
+    # Act
+    async with _serving(backend) as test_client:
+        denied = await test_client.get("/admin/status")
+        served = await test_client.post(
+            "/v1/messages",
+            json=_relay_body(),
+            headers={
+                "x-api-key": "relay-secret",
+                "x-scitex-session-id": "agent/private-session",
+            },
+        )
+        status = await test_client.get(
+            "/admin/status", headers={"x-api-key": "relay-secret"}
+        )
+
+    # Assert
+    payload = status.json()
+    cumulative = payload["admission"]["cumulative"]
+    assert (
+        denied.status_code,
+        served.status_code,
+        status.status_code,
+        payload["schema_version"],
+        payload["provider"],
+        payload["admission"]["running"],
+        payload["admission"]["queued"],
+        cumulative["admissions_total"],
+        cumulative["observed_streams_total"],
+        cumulative["ttft_samples"],
+        cumulative["reported_output_tokens_total"],
+        cumulative["cached_tokens_total"],
+        cumulative["cache_device_tokens_total"],
+        cumulative["cache_host_tokens_total"],
+        cumulative["cache_storage_tokens_total"],
+        "private-session" not in json.dumps(payload),
+    ) == (401, 200, 200, 1, "inference-upstream", 0, 0, 1, 1, 1, 3, 8, 5, 2, 1, True)
+
+
+@pytest.mark.asyncio
 async def test_drain_barrier_refuses_racing_request_and_drains_owned_work(
     upstream_factory,
 ) -> None:
