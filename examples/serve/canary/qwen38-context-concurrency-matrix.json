@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
   "production_change": false,
-  "measurement_status": "unmeasured",
+  "measurement_status": "measured_2026-09-14",
+  "result_record": "../../../docs/design/qwen38-multi-agent-performance-2026-09-12.md",
   "profile": "qwen38-tp1-context-concurrency.conf",
   "hardware": {
     "gpu_count": 1,
