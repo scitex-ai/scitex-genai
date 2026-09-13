@@ -94,13 +94,19 @@ Restart through the package command, not ``systemctl restart`` directly::
 
    scitex-genai-gateway restart-unit --drain-timeout-s 1800
 
-The command first closes authenticated inference admission, then polls the
-live ``/health`` counters until both ``in_flight`` and ``queued`` are zero.
-Only that proved-empty state permits the systemd restart. An unreachable or
-malformed health response, or an expired deadline, refuses the restart and
-reopens admission with an actionable error. This prevents a deployment
-restart from cutting through a long agent turn and forcing a cold prefix
-replay.
+The command enters a server-side admission barrier. Under the same lock that
+owns admission counters, the gateway first marks itself draining and wakes
+queued callers with a 503, then waits until both ``in_flight`` and ``queued``
+are zero. A successful response leaves admission closed, so no request can
+enter between the empty observation and the systemd restart. ``/health``
+reports ``status: draining`` and ``ready: false`` with HTTP 503 throughout.
+
+The wait is bounded by ``--drain-timeout-s``. An unreachable gateway,
+malformed response, or expired deadline refuses the restart and leaves
+admission closed (fail-closed) with exact remaining ownership counts. Use the
+authenticated ``POST /admin/resume`` only after the failed release has been
+deliberately abandoned. This prevents a deployment restart from cutting
+through a long agent turn and forcing a cold prefix replay.
 
 This guard is grounded in the 2026-09-12 deployment observation: a direct
 gateway restart overlapped an active approximately 672,000-token Hub turn,

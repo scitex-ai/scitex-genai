@@ -24,9 +24,15 @@ For a deployed inference gateway, drain before restarting:
 scitex-genai-gateway restart-unit --drain-timeout-s 1800
 ```
 
-This closes new admission, waits for live `/health` evidence that both
-`in_flight` and `queued` are zero, and only then restarts the systemd user
-unit. A failed or timed-out drain refuses the restart and reopens admission.
+`restart-unit` crosses the live gateway's atomic admission barrier before it
+invokes systemd. During the bounded wait `/health` returns HTTP 503 with
+`status: draining` and `ready: false`. A timeout refuses the restart and leaves
+admission closed; explicitly `POST /admin/resume` only after abandoning the
+release.
+
+The barrier returns success only after both `in_flight` and `queued` ownership
+are zero; the command then restarts the systemd user unit while admission is
+still closed.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

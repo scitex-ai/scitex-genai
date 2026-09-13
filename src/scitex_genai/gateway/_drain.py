@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
-import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ class DrainState:
     in_flight: int
     queued: int
     draining: bool
+    ready: bool
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "DrainState":
@@ -33,9 +35,10 @@ class DrainState:
             in_flight = payload["in_flight"]
             queued = payload["queued"]
             draining = payload["draining"]
+            ready = payload["ready"]
         except KeyError as exc:
             raise DrainError(
-                "gateway health lacks drain counters; deploy matching scitex-genai "
+                "gateway response lacks drain-barrier fields; deploy matching scitex-genai "
                 "source before requesting a drained restart"
             ) from exc
         if (
@@ -46,28 +49,43 @@ class DrainState:
             or isinstance(queued, bool)
             or queued < 0
             or not isinstance(draining, bool)
+            or not isinstance(ready, bool)
         ):
-            raise DrainError("gateway health returned invalid drain counters")
-        return cls(in_flight=in_flight, queued=queued, draining=draining)
+            raise DrainError("gateway returned invalid drain-barrier fields")
+        return cls(
+            in_flight=in_flight,
+            queued=queued,
+            draining=draining,
+            ready=ready,
+        )
 
     @property
     def empty(self) -> bool:
         return self.in_flight == 0 and self.queued == 0
 
 
-HttpCall = Callable[[str, str, str], Mapping[str, Any]]
+HttpCall = Callable[[str, str, str, float], Mapping[str, Any]]
 SystemctlCall = Callable[[Sequence[str]], None]
 
 
-def _http_json(method: str, url: str, api_key: str) -> Mapping[str, Any]:
+def _http_json(
+    method: str, url: str, api_key: str, timeout_s: float
+) -> Mapping[str, Any]:
     request = urllib.request.Request(
         url,
         method=method,
         headers={"authorization": f"Bearer {api_key}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5.0) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
             payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            failure = json.loads(exc.read())
+            message = failure["error"]["message"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            message = str(exc.reason)
+        raise DrainError(f"gateway refused drain: HTTP {exc.code}: {message}") from exc
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise DrainError(
             f"gateway control request failed: {method} {url}: {exc}"
@@ -89,48 +107,29 @@ def restart_when_drained(
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     http_call: HttpCall = _http_json,
     systemctl_call: SystemctlCall = _systemctl,
-    monotonic: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = print,
 ) -> None:
-    """Close admission, prove zero work, then restart the user unit."""
-    if timeout_s <= 0:
-        raise ValueError("timeout_s must be > 0")
-    if poll_interval_s <= 0:
-        raise ValueError("poll_interval_s must be > 0")
+    """Cross the server's atomic empty barrier, then restart the user unit."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("timeout_s must be finite and > 0")
+    if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be finite and > 0")
     base_url = health_url.removesuffix("/health").rstrip("/")
-    drain_url = f"{base_url}/admin/drain"
-    resume_url = f"{base_url}/admin/resume"
-    http_call("POST", drain_url, api_key)
-    deadline = monotonic() + timeout_s
-    last: DrainState | None = None
+    query = urllib.parse.urlencode({"timeout_s": f"{timeout_s:g}"})
+    drain_url = f"{base_url}/admin/drain?{query}"
+    state = DrainState.from_payload(
+        http_call("POST", drain_url, api_key, timeout_s + 5.0)
+    )
+    if not state.draining or state.ready or not state.empty:
+        raise DrainError(
+            "gateway did not confirm a closed, empty admission barrier; "
+            "restart refused and admission was not reopened"
+        )
+    report("scitex-genai-gateway: admission closed; in_flight=0 queued=0")
     try:
-        while True:
-            last = DrainState.from_payload(http_call("GET", health_url, api_key))
-            if not last.draining:
-                raise DrainError(
-                    "gateway did not enter draining state; restart refused"
-                )
-            report(
-                "scitex-genai-gateway: draining "
-                f"in_flight={last.in_flight} queued={last.queued}"
-            )
-            if last.empty:
-                systemctl_call(["systemctl", "--user", "restart", UNIT_NAME])
-                report(f"scitex-genai-gateway: drained; restarted {UNIT_NAME}")
-                return
-            if monotonic() >= deadline:
-                raise DrainError(
-                    "drain deadline expired with "
-                    f"in_flight={last.in_flight} queued={last.queued}; restart refused"
-                )
-            sleep(poll_interval_s)
-    except BaseException:
-        try:
-            http_call("POST", resume_url, api_key)
-        except DrainError as resume_error:
-            raise DrainError(
-                "drained restart failed and admission could not be reopened; "
-                f"check {health_url} immediately: {resume_error}"
-            ) from None
-        raise
+        systemctl_call(["systemctl", "--user", "restart", UNIT_NAME])
+    except Exception as exc:
+        raise DrainError(
+            f"restart failed while admission remains closed: {exc}"
+        ) from exc
+    report(f"scitex-genai-gateway: drained; restarted {UNIT_NAME}")
