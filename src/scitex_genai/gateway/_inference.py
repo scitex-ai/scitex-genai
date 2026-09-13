@@ -75,6 +75,7 @@ from ._health import (
     DEFAULT_HEALTH_PROBE_TIMEOUT_S,
     UpstreamReachability,
     probe_upstream,
+    public_upstream_url,
     timed_out_reachability,
 )
 from ._pool import StickyPool
@@ -95,6 +96,7 @@ DEFAULT_CONTINUATION_QOS_MAX_RETRIES = 1
 DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS = 0
 DEFAULT_MAX_ADMISSION_BYPASSES = 4
 DEFAULT_PRIORITY_AGING_S = 30.0
+MAX_STATUS_TICKETS = 256
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
 #: are few (one per agent) and eviction only costs a prefix-cache miss, never
@@ -318,6 +320,65 @@ class ResponseTokenReport:
         return " ".join(
             f"{name}={value}" for name, value in values if value is not None
         )
+
+
+@dataclass
+class RelayMetrics:
+    """Fixed-cardinality cumulative facts already observed by the relay."""
+
+    observed_streams_total: int = 0
+    ttft_s_sum: float = 0.0
+    ttft_samples: int = 0
+    reported_output_tokens_total: int = 0
+    output_token_samples: int = 0
+    cached_tokens_total: int = 0
+    cache_creation_tokens_total: int = 0
+    cache_device_tokens_total: int = 0
+    cache_host_tokens_total: int = 0
+    cache_storage_tokens_total: int = 0
+    cache_token_reports: int = 0
+
+    def observe(self, report: ResponseTokenReport, *, ttft_s: float | None) -> None:
+        self.observed_streams_total += 1
+        if ttft_s is not None:
+            self.ttft_s_sum += max(0.0, ttft_s)
+            self.ttft_samples += 1
+        if report.output_tokens is not None:
+            self.reported_output_tokens_total += max(0, report.output_tokens)
+            self.output_token_samples += 1
+        cache_values = (
+            report.cached_tokens,
+            report.cache_creation_tokens,
+            report.device_cached_tokens,
+            report.host_cached_tokens,
+            report.storage_cached_tokens,
+        )
+        if any(value is not None for value in cache_values):
+            self.cache_token_reports += 1
+        for field_name, value in (
+            ("cached_tokens_total", report.cached_tokens),
+            ("cache_creation_tokens_total", report.cache_creation_tokens),
+            ("cache_device_tokens_total", report.device_cached_tokens),
+            ("cache_host_tokens_total", report.host_cached_tokens),
+            ("cache_storage_tokens_total", report.storage_cached_tokens),
+        ):
+            if value is not None:
+                setattr(self, field_name, getattr(self, field_name) + max(0, value))
+
+    def snapshot(self) -> dict[str, int | float]:
+        return {
+            "observed_streams_total": self.observed_streams_total,
+            "ttft_s_sum": self.ttft_s_sum,
+            "ttft_samples": self.ttft_samples,
+            "reported_output_tokens_total": self.reported_output_tokens_total,
+            "output_token_samples": self.output_token_samples,
+            "cached_tokens_total": self.cached_tokens_total,
+            "cache_creation_tokens_total": self.cache_creation_tokens_total,
+            "cache_device_tokens_total": self.cache_device_tokens_total,
+            "cache_host_tokens_total": self.cache_host_tokens_total,
+            "cache_storage_tokens_total": self.cache_storage_tokens_total,
+            "cache_token_reports": self.cache_token_reports,
+        }
 
 
 def _integer(value: Any, previous: int | None) -> int | None:
@@ -694,6 +755,32 @@ class _PoolTicket:
     queued_at: float = 0.0
     bypasses: int = 0
     cold_prefill: bool = False
+    admission_class: str = "unclassified"
+    cache_classification: str = CacheResidency.UNKNOWN.value
+
+    def status(self, *, state: str, now: float, upstream: str) -> dict[str, Any]:
+        """Return bounded, payload-free request metadata for operators."""
+        label = (
+            hashlib.sha256(
+                b"scitex-genai-status-session-v1\0" + self.session_id.encode()
+            ).hexdigest()[:12]
+            if self.session_id
+            else "anonymous"
+        )
+        return {
+            "session_label": label,
+            "upstream": public_upstream_url(upstream),
+            "state": state,
+            "input_tokens": self.input_tokens,
+            "queue_age_s": (
+                max(0.0, now - self.queued_at) if state == "queued" else 0.0
+            ),
+            "priority": self.priority,
+            "admission_class": self.admission_class,
+            "cache_classification": self.cache_classification,
+            "cold_prefill": self.cold_prefill,
+            "bypasses": self.bypasses,
+        }
 
 
 @dataclass(frozen=True)
@@ -801,6 +888,13 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._waiters: dict[str, deque[_PoolTicket]] = {
             upstream.alias: deque() for upstream in self.upstreams
         }
+        self._running_tickets: dict[str, deque[_PoolTicket]] = {
+            upstream.alias: deque() for upstream in self.upstreams
+        }
+        self._admissions_total = 0
+        self._queued_total = 0
+        self._queue_time_s_sum = 0.0
+        self._queue_time_samples = 0
         self._active_sessions: set[str] = set()
         self._closing = False
 
@@ -854,6 +948,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         input_tokens: int = 0,
         priority: bool = False,
         cold_prefill: bool = False,
+        admission_class: str = "unclassified",
+        cache_classification: str = CacheResidency.UNKNOWN.value,
     ) -> InferenceUpstream:
         """Place first for cache locality, then wait for that member's capacity."""
         if input_tokens < 0:
@@ -872,6 +968,23 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     "Estimated request input exceeds this upstream's token capacity "
                     f"({input_tokens}/{selected.token_capacity})"
                 )
+            ticket = _PoolTicket(
+                priority=priority,
+                input_tokens=input_tokens,
+                session_id=session_id,
+                cold_prefill=cold_prefill,
+                admission_class=(
+                    admission_class
+                    if admission_class
+                    in {"continuation", "first-turn", "unclassified", "disabled"}
+                    else "unclassified"
+                ),
+                cache_classification=(
+                    cache_classification
+                    if cache_classification in {item.value for item in CacheResidency}
+                    else CacheResidency.UNKNOWN.value
+                ),
+            )
             if (
                 self._fits(selected, input_tokens, session_id, cold_prefill)
                 and not selected.queued
@@ -879,6 +992,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 selected.in_flight += 1
                 selected.input_tokens_in_flight += input_tokens
                 selected.cold_prefills_in_flight += int(cold_prefill)
+                self._running_tickets[selected.alias].append(ticket)
+                self._admissions_total += 1
                 if session_id:
                     self._active_sessions.add(session_id)
                 return selected
@@ -887,15 +1002,10 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 raise InferenceAdmissionError(
                     f"Inference queue is full ({total_queued}/{self.max_queue_size})"
                 )
-            ticket = _PoolTicket(
-                priority=priority,
-                input_tokens=input_tokens,
-                session_id=session_id,
-                queued_at=time.monotonic(),
-                cold_prefill=cold_prefill,
-            )
+            ticket.queued_at = time.monotonic()
             waiters = self._waiters[selected.alias]
             waiters.append(ticket)
+            self._queued_total += 1
             selected.queued += 1
             selected.input_tokens_queued += input_tokens
             queued = True
@@ -918,6 +1028,12 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         selected.in_flight += 1
                         selected.input_tokens_in_flight += input_tokens
                         selected.cold_prefills_in_flight += int(cold_prefill)
+                        self._running_tickets[selected.alias].append(ticket)
+                        self._admissions_total += 1
+                        self._queue_time_s_sum += max(
+                            0.0, time.monotonic() - ticket.queued_at
+                        )
+                        self._queue_time_samples += 1
                         if session_id:
                             self._active_sessions.add(session_id)
                         return selected
@@ -1047,6 +1163,19 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 member.cold_prefills_in_flight = max(
                     0, member.cold_prefills_in_flight - 1
                 )
+            running = self._running_tickets[member.alias]
+            matched = next(
+                (
+                    ticket
+                    for ticket in running
+                    if ticket.session_id == session_id
+                    and ticket.input_tokens == input_tokens
+                    and ticket.cold_prefill == cold_prefill
+                ),
+                running[0] if running else None,
+            )
+            if matched is not None:
+                running.remove(matched)
             if session_id:
                 self._active_sessions.discard(session_id)
             self._admission.notify_all()
@@ -1106,6 +1235,43 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         """Read readiness and ownership counters under the admission lock."""
         async with self._admission:
             return self._drain_state_locked()
+
+    async def observability_snapshot(self) -> dict[str, Any]:
+        """Return one lock-consistent, bounded view of admission ownership."""
+        async with self._admission:
+            now = time.monotonic()
+            running = [
+                ticket.status(state="running", now=now, upstream=upstream.alias)
+                for upstream in self.upstreams
+                for ticket in self._running_tickets[upstream.alias]
+            ]
+            queued = [
+                ticket.status(state="queued", now=now, upstream=upstream.alias)
+                for upstream in self.upstreams
+                for ticket in self._waiters[upstream.alias]
+            ]
+            tickets = running + queued
+            return {
+                "running": len(running),
+                "queued": len(queued),
+                "input_tokens_running": sum(
+                    upstream.input_tokens_in_flight for upstream in self.upstreams
+                ),
+                "input_tokens_queued": sum(
+                    upstream.input_tokens_queued for upstream in self.upstreams
+                ),
+                "oldest_queue_age_s": max(
+                    (ticket["queue_age_s"] for ticket in queued), default=0.0
+                ),
+                "tickets": tickets[:MAX_STATUS_TICKETS],
+                "tickets_omitted": max(0, len(tickets) - MAX_STATUS_TICKETS),
+                "cumulative": {
+                    "admissions_total": self._admissions_total,
+                    "queued_total": self._queued_total,
+                    "queue_time_s_sum": self._queue_time_s_sum,
+                    "queue_time_samples": self._queue_time_samples,
+                },
+            }
 
     async def begin_drain(self, timeout_s: float) -> InferenceDrainState:
         """Atomically close admission and wait for all owned work to settle.
@@ -1407,7 +1573,19 @@ class InferenceBackend:
             min_preempt_tokens=continuation_qos_min_preempt_tokens,
         )
         self.cache_report_enabled = cache_report_enabled
+        self.relay_metrics = RelayMetrics()
         self._cleanup_reapers: set[asyncio.Task[None]] = set()
+
+    async def observability_snapshot(self) -> dict[str, Any]:
+        """Return the stable operator-facing status document."""
+        admission = await self.pool.observability_snapshot()
+        admission["cumulative"].update(self.relay_metrics.snapshot())
+        return {
+            "schema_version": 1,
+            "provider": self.provider,
+            "draining": self.pool.draining,
+            "admission": admission,
+        }
 
     async def probe_upstreams(self) -> list[UpstreamReachability]:
         """Return one coalesced, briefly cached local-control-plane observation."""
@@ -1636,6 +1814,8 @@ class InferenceBackend:
                         input_tokens=input_tokens,
                         priority=qos_kind == "continuation",
                         cold_prefill=cold_prefill,
+                        admission_class=qos_kind,
+                        cache_classification=CacheResidency.UNKNOWN.value,
                         client_disconnected=client_disconnected,
                     )
                 except _ClientDisconnected:
@@ -2080,6 +2260,8 @@ class InferenceBackend:
         input_tokens: int,
         priority: bool,
         cold_prefill: bool,
+        admission_class: str,
+        cache_classification: str,
         client_disconnected: Callable[[], Awaitable[bool]] | None,
     ) -> InferenceUpstream:
         """Remove a queued admission ticket as soon as its caller disappears."""
@@ -2090,6 +2272,8 @@ class InferenceBackend:
                 input_tokens=input_tokens,
                 priority=priority,
                 cold_prefill=cold_prefill,
+                admission_class=admission_class,
+                cache_classification=cache_classification,
             )
         )
         if client_disconnected is None:
@@ -2295,6 +2479,8 @@ class InferenceBackend:
                     next_chunk.cancel()
                 await asyncio.gather(next_chunk, return_exceptions=True)
                 next_chunk = None
+            token_report.finish()
+            self.relay_metrics.observe(token_report, ttft_s=ttft_s)
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 total = (
@@ -2302,7 +2488,6 @@ class InferenceBackend:
                     if request_started is not None
                     else took
                 )
-                token_report.finish()
                 reported = token_report.fields()
                 suffix = f" {reported}" if reported else ""
                 self._note(
