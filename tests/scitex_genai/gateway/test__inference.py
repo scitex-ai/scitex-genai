@@ -344,6 +344,77 @@ async def test_capacity_is_enforced_and_waiters_are_admitted_after_release() -> 
 
 
 @pytest.mark.asyncio
+async def test_observability_snapshot_is_bounded_and_never_exposes_session_ids() -> (
+    None
+):
+    # Arrange
+    raw_active = "agent-alpha/private-session"
+    raw_queued = "agent-beta/private-session"
+    pool = InferenceUpstreamPool.from_urls(
+        "http://user:secret@only:1", capacity_per_upstream=1, max_queue_size=1
+    )
+    active = await pool.acquire(
+        raw_active,
+        input_tokens=700,
+        admission_class="first-turn",
+        cache_classification="unknown",
+    )
+    waiting = asyncio.create_task(
+        pool.acquire(
+            raw_queued,
+            input_tokens=400,
+            priority=True,
+            admission_class="continuation",
+            cache_classification="hot",
+        )
+    )
+    await _wait_for_queue(pool, 1)
+
+    # Act
+    snapshot = await pool.observability_snapshot()
+    serialized = json.dumps(snapshot)
+    await pool.release(active, input_tokens=700, session_id=raw_active)
+    admitted = await waiting
+    finished = await pool.observability_snapshot()
+    await pool.release(admitted, input_tokens=400, session_id=raw_queued)
+
+    # Assert
+    tickets = snapshot["tickets"]
+    assert (
+        snapshot["running"],
+        snapshot["queued"],
+        snapshot["input_tokens_running"],
+        snapshot["input_tokens_queued"],
+        snapshot["oldest_queue_age_s"] >= 0,
+        tickets[1]["priority"],
+        tickets[1]["admission_class"],
+        tickets[1]["cache_classification"],
+        "secret" not in serialized,
+        raw_active not in serialized,
+        raw_queued not in serialized,
+        finished["cumulative"]["queued_total"],
+        finished["cumulative"]["queue_time_samples"],
+    ) == (1, 1, 700, 400, True, True, "continuation", "hot", True, True, True, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_observability_ticket_details_have_a_hard_cap() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=257, max_queue_size=0
+    )
+    admitted = [await pool.acquire(f"session-{index}") for index in range(257)]
+
+    # Act
+    snapshot = await pool.observability_snapshot()
+    for index, member in enumerate(admitted):
+        await pool.release(member, session_id=f"session-{index}")
+
+    # Assert
+    assert (len(snapshot["tickets"]), snapshot["tickets_omitted"]) == (256, 1)
+
+
+@pytest.mark.asyncio
 async def test_priority_waiters_are_fifo_ahead_of_ordinary_work() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls(
