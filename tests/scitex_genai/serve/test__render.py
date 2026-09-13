@@ -426,10 +426,52 @@ def test_scheduler_manifest_declares_every_and_only_canary_conf():
     declared = {profile["file"] for profile in CANARY_MANIFEST["profiles"]}
 
     # Act
-    present = {path.name for path in CANARY_DIR.glob("*.conf")}
+    present = {
+        path.name
+        for path in CANARY_DIR.glob("*.conf")
+        if path.name != "qwen38-tp1-context-concurrency.conf"
+    }
 
     # Assert
     assert present == declared
+
+
+def test_tp1_context_concurrency_canary_is_isolated_and_matches_manifest():
+    # Arrange
+    manifest = json.loads(
+        (CANARY_DIR / "qwen38-context-concurrency-matrix.json").read_text()
+    )
+    profile_path = CANARY_DIR / manifest["profile"]
+    conf = parse_engine_conf(
+        profile_path.stem, profile_path.read_text(), source=profile_path
+    )
+
+    # Act
+    actual = (
+        conf.canary_only,
+        conf.canary_purpose,
+        conf.tp,
+        conf.required_gpu_count,
+        conf.max_model_len,
+        conf.max_num_seqs,
+        conf.served_name,
+    )
+
+    # Assert
+    assert actual == (
+        True,
+        "qwen38-tp1-context-concurrency",
+        manifest["hardware"]["tensor_parallel_size"],
+        manifest["hardware"]["gpu_count"],
+        manifest["fixed_engine_configuration"]["configured_max_model_len"],
+        manifest["fixed_engine_configuration"]["max_running_requests"],
+        "qwen38-27b-tp1-canary",
+    )
+    args = conf.extra_sglang_args
+    assert args[args.index("--schedule-policy") + 1] == "lpm"
+    assert args[args.index("--kv-cache-dtype") + 1] == "fp8_e4m3"
+    assert args[args.index("--chunked-prefill-size") + 1] == "8192"
+    assert "--enable-hierarchical-cache" in args
 
 
 def test_scheduler_profile_ids_and_files_are_unique():

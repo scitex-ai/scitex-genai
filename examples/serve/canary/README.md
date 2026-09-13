@@ -85,3 +85,18 @@ Source links are pinned, not `main`:
 The JSON manifest is the machine-readable source of the intended differences.
 Its schema and dry-render tests prevent silent drift between the manifest,
 profile files, and generated SGLang argv.
+
+## One-H100 context/concurrency capacity canary
+
+`qwen38-tp1-context-concurrency.conf` is a separate capacity experiment, not a
+member of the scheduler matrix above. It keeps the live engine's Qwen3.8 FP8,
+FP8 KV, LPM, 8,192-token chunks, EAGLE, and three cache tiers, but uses TP=1 on
+one isolated H100. `qwen38-context-concurrency-matrix.json` distinguishes the
+configured one-million-token ceiling from actual 256k, 512k, and 750k prompt
+rows. Cold concurrency greater than one is a dedicated-canary crash probe.
+
+The matrix intentionally omits four concurrent 512k requests and every
+multi-request 750k row. Those inputs exceed the one-GPU KV working set before
+measurement has established a safe lower row. Results must include engine
+metrics sampled before, during, and after each row; client latency alone is
+not evidence of the capacity knee.
