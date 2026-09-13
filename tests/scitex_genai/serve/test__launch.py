@@ -267,5 +267,31 @@ def test_booking_shapes_the_job_config():
         "gpu-h100",
         "7-00:00:00",
         "h100-pair",
-        ["--gpus=2"],
+        ["--nodes=1", "--gpus-per-node=2"],
     )
+
+
+def test_booking_keeps_typed_gpu_pair_on_one_node():
+    # Arrange
+    calls: list[tuple] = []
+
+    def book(config, **kw):
+        calls.append((config, kw))
+        return "lease"
+
+    # Act
+    book_serve_lease(
+        ["engine-a"],
+        _settings(),
+        name="h100-pair",
+        project="serve",
+        host="spartan",
+        gpus="H100:2",
+        book=book,
+    )
+
+    # Assert
+    assert calls[0][0].extra_sbatch_args == [
+        "--nodes=1",
+        "--gpus-per-node=H100:2",
+    ]

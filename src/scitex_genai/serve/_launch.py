@@ -140,7 +140,11 @@ def book_serve_lease(
         partition=partition,
         time=time,
         job_name=name,
-        extra_sbatch_args=[f"--gpus={gpus}"],
+        # A model-serving lease is node-local. ``--gpus=H100:2`` alone may be
+        # satisfied by one GPU on each of two nodes; the resulting TP=2 engine
+        # cannot start, and even a TP=1 hold body gets an ambiguous multi-node
+        # step. Keep the requested cards on one node deterministically.
+        extra_sbatch_args=["--nodes=1", f"--gpus-per-node={gpus}"],
     )
     if book is None:
         from scitex_hpc._reservation import Reservation
