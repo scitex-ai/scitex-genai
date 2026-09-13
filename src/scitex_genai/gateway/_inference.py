@@ -92,6 +92,8 @@ DEFAULT_HEALTH_FAILURE_THRESHOLD = 2
 DEFAULT_CONTINUATION_QOS_ENABLED = False
 DEFAULT_CONTINUATION_QOS_MAX_RETRIES = 1
 DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS = 0
+DEFAULT_MAX_ADMISSION_BYPASSES = 4
+DEFAULT_PRIORITY_AGING_S = 30.0
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
 #: are few (one per agent) and eviction only costs a prefix-cache miss, never
@@ -682,9 +684,13 @@ class InferenceUpstream:
         return status
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PoolTicket:
     priority: bool = False
+    input_tokens: int = 0
+    session_id: str = ""
+    queued_at: float = 0.0
+    bypasses: int = 0
 
 
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
@@ -709,6 +715,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
+        max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
+        priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
     ) -> None:
         if capacity_per_upstream < 1:
             raise ValueError("capacity_per_upstream must be >= 1")
@@ -716,10 +724,16 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             raise ValueError("max_queue_size must be >= 0")
         if token_capacity_per_upstream is not None and token_capacity_per_upstream < 1:
             raise ValueError("token_capacity_per_upstream must be >= 1")
+        if max_admission_bypasses < 0:
+            raise ValueError("max_admission_bypasses must be >= 0")
+        if priority_aging_s < 0:
+            raise ValueError("priority_aging_s must be >= 0")
         for upstream in upstreams:
             upstream.capacity = capacity_per_upstream
             upstream.token_capacity = token_capacity_per_upstream
         self.max_queue_size = max_queue_size
+        self.max_admission_bypasses = max_admission_bypasses
+        self.priority_aging_s = priority_aging_s
         self._next_placement = 0
         super().__init__(
             upstreams,
@@ -746,6 +760,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
+        max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
+        priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
     ) -> "InferenceUpstreamPool":
         """Build from the ``HOIST_UPSTREAM`` string or an already-split list."""
         if isinstance(urls, str):
@@ -755,6 +771,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             capacity_per_upstream=capacity_per_upstream,
             max_queue_size=max_queue_size,
             token_capacity_per_upstream=token_capacity_per_upstream,
+            max_admission_bypasses=max_admission_bypasses,
+            priority_aging_s=priority_aging_s,
         )
 
     async def route_alias(
@@ -804,24 +822,14 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 raise InferenceAdmissionError(
                     f"Inference queue is full ({total_queued}/{self.max_queue_size})"
                 )
-            ticket = _PoolTicket(priority=priority)
+            ticket = _PoolTicket(
+                priority=priority,
+                input_tokens=input_tokens,
+                session_id=session_id,
+                queued_at=time.monotonic(),
+            )
             waiters = self._waiters[selected.alias]
-            # A proven continuation may take the next slot. This is deliberately
-            # not a general priority API: callers opt in explicitly, and the
-            # gateway only does so for a stable session with a prior 2xx reply.
-            if priority:
-                # FIFO within the continuation class, ahead of ordinary work.
-                index = next(
-                    (
-                        position
-                        for position, queued_ticket in enumerate(waiters)
-                        if not queued_ticket.priority
-                    ),
-                    len(waiters),
-                )
-                waiters.insert(index, ticket)
-            else:
-                waiters.append(ticket)
+            waiters.append(ticket)
             selected.queued += 1
             selected.input_tokens_queued += input_tokens
             queued = True
@@ -833,11 +841,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         )
                     now = time.time()
                     if (
-                        waiters[0] is ticket
-                        and self._fits(selected, input_tokens, session_id)
+                        self._next_admissible_ticket(selected) is ticket
                         and selected.cooldown_until <= now
                     ):
-                        waiters.popleft()
+                        self._record_bypasses(selected, ticket)
+                        waiters.remove(ticket)
                         selected.queued -= 1
                         selected.input_tokens_queued -= input_tokens
                         queued = False
@@ -862,6 +870,69 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     selected.queued -= 1
                     selected.input_tokens_queued -= input_tokens
                     self._admission.notify_all()
+
+    def _next_admissible_ticket(
+        self, member: InferenceUpstream
+    ) -> _PoolTicket | None:
+        """Choose work that fits now without permitting indefinite bypass.
+
+        The request count is a hard safety ceiling. Below it, the token budget
+        is the dynamic limit: smaller requests may backfill unused capacity
+        while a large request waits. A token-blocked ticket may be bypassed a
+        bounded number of times; after that, admission drains until it fits.
+        Ordinary work also ages into the priority class, preventing an endless
+        stream of continuations from monopolizing the upstream.
+        """
+        waiters = self._waiters[member.alias]
+        if not waiters or member.in_flight >= member.capacity:
+            return None
+
+        now = time.monotonic()
+        oldest = waiters[0]
+        token_blocked = (
+            oldest.session_id not in self._active_sessions
+            and member.token_capacity is not None
+            and member.input_tokens_in_flight + oldest.input_tokens
+            > member.token_capacity
+        )
+        if token_blocked and oldest.bypasses >= self.max_admission_bypasses:
+            return None
+
+        fitting = [
+            ticket
+            for ticket in waiters
+            if self._fits(member, ticket.input_tokens, ticket.session_id)
+        ]
+        if not fitting:
+            return None
+        aged = next(
+            (
+                ticket
+                for ticket in fitting
+                if not ticket.priority
+                and now - ticket.queued_at >= self.priority_aging_s
+            ),
+            None,
+        )
+        selected = aged or next(
+            (ticket for ticket in fitting if ticket.priority), fitting[0]
+        )
+        return selected
+
+    def _record_bypasses(
+        self, member: InferenceUpstream, selected: _PoolTicket
+    ) -> None:
+        """Charge one bypass only when the later ticket is actually admitted."""
+        waiters = self._waiters[member.alias]
+        selected_index = waiters.index(selected)
+        for bypassed in list(waiters)[:selected_index]:
+            if (
+                bypassed.session_id not in self._active_sessions
+                and not self._fits(
+                    member, bypassed.input_tokens, bypassed.session_id
+                )
+            ):
+                bypassed.bypasses += 1
 
     def _fits(
         self,
