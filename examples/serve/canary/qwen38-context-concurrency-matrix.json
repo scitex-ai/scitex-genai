@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "production_change": false,
+  "measurement_status": "unmeasured",
+  "profile": "qwen38-tp1-context-concurrency.conf",
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "tensor_parallel_size": 1
+  },
+  "fixed_engine_configuration": {
+    "model": "Qwen3.8-27B-FP8",
+    "configured_max_model_len": 1000000,
+    "kv_cache_dtype": "fp8_e4m3",
+    "schedule_policy": "lpm",
+    "chunked_prefill_size": 8192,
+    "max_prefill_tokens": 32768,
+    "max_running_requests": 4,
+    "speculation": "EAGLE-3-1-4",
+    "hierarchical_cache": "HBM + 32 GiB host + 32 GiB file"
+  },
+  "request_matrix": [
+    {"actual_prompt_tokens": 256000, "concurrency": [1, 2, 4]},
+    {"actual_prompt_tokens": 512000, "concurrency": [1, 2]},
+    {"actual_prompt_tokens": 750000, "concurrency": [1]}
+  ],
+  "safety": {
+    "target_scope": "dedicated-canary",
+    "cold_concurrency_greater_than_one_is_crash_probe": true,
+    "stop_before_next_row_if_engine_health_fails": true
+  }
+}
