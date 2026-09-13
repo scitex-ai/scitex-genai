@@ -895,7 +895,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     except TimeoutError:
                         pass
             finally:
-                if queued:
+                if queued and ticket in waiters:
                     waiters.remove(ticket)
                     selected.queued -= 1
                     selected.input_tokens_queued -= input_tokens
@@ -995,6 +995,13 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cold_prefill: bool = False,
     ) -> None:
         async with self._admission:
+            # Explicit sessions are serialized, so the active-session entry is
+            # the admission ownership receipt. A duplicated or late cleanup
+            # must not decrement another request that has since been admitted.
+            if session_id and session_id not in self._active_sessions:
+                return
+            if member.in_flight <= 0:
+                return
             member.in_flight = max(0, member.in_flight - 1)
             member.input_tokens_in_flight = max(
                 0, member.input_tokens_in_flight - input_tokens
@@ -2256,39 +2263,33 @@ class InferenceBackend:
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
     ) -> None:
-        try:
-            await response.aclose()
-            await client.aclose()
-        finally:
-            if release_capacity or not request_id:
-                await self.pool.release(
-                    upstream,
-                    input_tokens=input_tokens,
-                    session_id=session_id,
-                    cold_prefill=cold_prefill,
+        # Ownership is settled before socket cleanup. A peer stuck in
+        # FIN-WAIT/CLOSE-WAIT must never keep a confirmed-aborted or fully
+        # consumed request charged against admission indefinitely.
+        if release_capacity or not request_id:
+            await self.pool.release(
+                upstream,
+                input_tokens=input_tokens,
+                session_id=session_id,
+                cold_prefill=cold_prefill,
+            )
+            if not release_capacity:
+                self.continuation_qos.non_addressable_cleanup_released()
+                self._note(
+                    "[relay] released admission for non-addressable upstream "
+                    "request before transport cleanup; no cleanup reaper created"
                 )
-                if not release_capacity:
-                    # A reaper without an engine address can never prove
-                    # cleanup and therefore can never terminate. This is the
-                    # native Anthropic route today: SGLang owns cancellation
-                    # when its StreamingResponse transport closes, but does
-                    # not propagate the gateway's ``rid``. Treat the closed
-                    # transport as the terminal boundary and expose the event
-                    # in health instead of permanently poisoning admission.
-                    self.continuation_qos.non_addressable_cleanup_released()
-                    self._note(
-                        "[relay] released admission after non-addressable "
-                        "upstream transport closed; no cleanup reaper created"
-                    )
-            else:
-                self._schedule_cleanup_reaper(
-                    upstream,
-                    request_id,
-                    headers=request_headers or {},
-                    input_tokens=input_tokens,
-                    session_id=session_id,
-                    cold_prefill=cold_prefill,
-                )
+        else:
+            self._schedule_cleanup_reaper(
+                upstream,
+                request_id,
+                headers=request_headers or {},
+                input_tokens=input_tokens,
+                session_id=session_id,
+                cold_prefill=cold_prefill,
+            )
+        await response.aclose()
+        await client.aclose()
 
     async def close(self) -> None:
         """Stop admission and wake requests waiting for capacity."""
