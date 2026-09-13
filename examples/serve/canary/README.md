@@ -92,13 +92,15 @@ profile files, and generated SGLang argv.
 member of the scheduler matrix above. It keeps the live engine's Qwen3.8 FP8,
 FP8 KV, LPM, 8,192-token chunks, EAGLE, and three cache tiers, but uses TP=1 on
 one isolated H100. `qwen38-context-concurrency-matrix.json` distinguishes the
-configured one-million-token ceiling from actual 256k, 512k, and 750k prompt
-rows. Cold concurrency greater than one is a dedicated-canary crash probe.
+configured one-million-token ceiling from actual 256k, 512k, and 640k prompt
+rows. The engine's measured TP=1 capacity is 694,720 device-KV tokens; 640k
+leaves finite generation headroom. Cold
+concurrency greater than one is a dedicated-canary crash probe.
 
 The matrix intentionally omits four concurrent 512k requests and every
-multi-request 750k row. Those inputs exceed the one-GPU KV working set before
-measurement has established a safe lower row. Results must include engine
-metrics sampled before, during, and after each row; client latency alone is
+multi-request 640k row. Those inputs exceed the measured one-GPU KV working
+set. Results must include engine metrics sampled before, during, and after
+each row; client latency alone is
 not evidence of the capacity knee.
 
 Spartan compute nodes currently cannot resolve the fleet overlay name

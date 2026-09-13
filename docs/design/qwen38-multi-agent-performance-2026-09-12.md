@@ -237,3 +237,120 @@ A dedicated full-tier canary lease, job `30459210`, requests two H100 GPUs,
 256 GB host RAM, and one day. It was pending for priority when submitted. The
 128-GB job can run scheduler and conservative L2-only experiments; the full
 L2/L3 1M-context matrix must wait for the 256-GB canary.
+
+## Controlled TP=1 capacity run, 2026-09-14
+
+The previously split job `30409720` exposed one otherwise idle H100 on
+`spartan-gpgpu013`. A dedicated overlap step launched the pinned TP=1 canary
+there. It did not send synthetic load to the production engine. The committed
+fixture, profile, and matrix are in
+[PR 82](https://github.com/scitex-ai/scitex-genai/pull/82); the raw result root
+is
+`/data/scratch/projects/punim0264/ywatanabe/canary-results/tp1-context-20260914T030500Z/`.
+
+The canary kept the production model, FP8 weights, FP8 E4M3 KV, LPM,
+8,192-token prefill chunks, 32,768 maximum prefill tokens, EAGLE 3/1/4, and
+three cache tiers. Only tensor parallelism changed from two to one. Startup
+reported:
+
+- configured `context_len`: 1,000,000 tokens;
+- actual device-KV capacity: 694,720 tokens;
+- host HiCache capacity: 604,480 ordinary-KV tokens;
+- model weights: 28.72 GiB;
+- device KV: 21.20 GiB;
+- HBM in use during measured rows: approximately 70,058--70,060 MiB.
+
+Therefore the one-million-token setting is an API ceiling, not a promise that
+one TP=1 H100 can hold such a request. The unsafe 750k row was replaced with a
+640k single-request edge row after startup disclosed the actual capacity.
+
+### Cold rows
+
+Every request used an exact input-token list and generated 32 tokens. Prefixes
+were distinct. The 128 cached tokens in the first row came from the endpoint
+validation request and are negligible but retained in the record rather than
+silently relabelled as cold.
+
+| Prompt | Concurrent | Cached/request | TTFT (s) | Queue (s) | Max waiting | Max active KV | Mean GPU | Prompt tok/s | Decode tok/s/request | Output tok/s including prefill |
+| ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| 256k | 1 | 128 | 83.406 | 0.886 | 0 | 254,080 | unavailable | 3,058.7 | 110.55 | 0.382 |
+| 256k | 2 | 0, 0 | 83.150, 163.631 | 0.665, 80.507 | 1 | 507,904 | unavailable | 3,123.0 | 0.40, 101.56 | 0.390 |
+| 256k | 4 | 0 each | 82.229--325.046 | 0.002--241.931 | 3 | 512,128 | 99.63% | 3,146.7 | 0.40--95.66 | 0.393 |
+| 512k | 1 | 0 | 293.221 | 1.199 | 0 | 512,064 | 99.21% | 1,743.4 | 69.74 | 0.109 |
+| 512k | 2 | 0, 0 | 291.863, 583.891 | 0.002, 292.223 | 1 | 512,064 | 99.73% | 1,752.7 | 88.24, 88.64 | 0.110 |
+| 640k | 1 | 0 | 446.833 | 1.472 | 0 | 640,064 | 99.48% | 1,431.1 | 84.69 | 0.072 |
+
+The four-request 256k row reached only 448 free device-KV tokens and 604,160
+of 604,480 host-cache tokens. SGLang exposed one running request and three
+waiting requests. The 512k pair was also strictly serialized. No request
+failed and health remained HTTP 200 after every row, but concurrency increased
+latency rather than useful prefill throughput. Long-position prefill also
+became materially slower: aggregate prompt throughput fell from approximately
+3,100 tokens/s at 256k to 1,431 tokens/s at 640k.
+
+Decode was not uniformly protected while another cold prefill ran. In the
+256k two-request row, one request's TPOT was 10.2 ms while the other's was
+2.606 s. In the four-request row two requests had approximately 10.8 ms TPOT
+and two had approximately 2.6 s TPOT. The long prefill therefore delayed both
+admission and already-started output in this fixed EAGLE/non-mixed-chunk
+configuration.
+
+### Cache survival rows
+
+An immediate replay of the 640k request hit 638,976 tokens in device cache and
+reduced TTFT from 446.833 seconds to 1.717 seconds. This proves that exact
+resident-prefix reuse is effective.
+
+After other prefixes created pressure:
+
+- the old 256k prefix reported zero cached tokens and TTFT 81.691 seconds;
+- the 640k prefix retained 434,176 device tokens, but reported zero host and
+  zero storage hits; recomputing the missing 205,824 long-position tokens took
+  TTFT to 240.946 seconds;
+- lifetime canary counters ended at 1,073,280 device-hit tokens, zero host-hit
+  tokens, and zero storage-hit tokens, despite 3.55 million storage backup
+  tokens and a 28 GiB file cache;
+- the engine logged `Failed to fetch ... .mamba from HiCacheFile storage` and
+  then `HiCache hybrid prefetch discarded ... completed=6464 requested=6464`
+  for the pressured 640k replay.
+
+Thus L2/L3 capacity cannot yet be counted as usable admission capacity for
+this hybrid model. The file backend accepted writes, but the measured replay
+did not restore a usable full hybrid prefix when its Mamba artifact was
+missing.
+
+### Correlated production incident
+
+The gateway journal provides a real-agent counterpart. For FigRecipe
+conversation `8e9ef1e0`, the 2026-09-13 16:54:54 UTC turn had 758,767 input
+tokens and 757,504 device-cached tokens. At 17:00:48 UTC, the next observed
+turn had 760,118 input tokens but only 103,296 cached: 8,192 device, 95,104
+host, and zero storage. Its TTFT was 315.896 seconds and total gateway time was
+341.400 seconds. Hub and UI requests then entered with queue times 330.711 and
+319.867 seconds. This is observed eviction between adjacent turns, not a
+general cache-hit-rate inference.
+
+### Measured admission conclusion
+
+For this TP=1 profile, the responsive envelope is one cold long-context
+prefill at a time. Four agents may remain resumable, but four simultaneous
+cold 256k turns are not an interactive workload: their TTFTs are serialized
+out to 325 seconds. A single resident 640k continuation is fast, but one 256k
+pressure request was enough to make the next 640k turn recompute 205,824
+long-position tokens.
+
+The smallest evidence-backed rules are:
+
+1. Admit at most one cold prefill per TP=1 engine.
+2. Do not admit from configured `max_model_len`; use actual prompt tokens,
+   measured resident-prefix tokens, and the 694,720-token device capacity.
+3. Keep device-resident interactive continuations sticky.
+4. Treat host and storage cache as experimental until a validator proves that
+   both KV and Mamba artifacts restore and the response reports tier hits.
+5. Do not route 750k--1M agents to TP=1. TP=2 remains required for that actual
+   context range; a two-replica TP=1 topology is only a candidate for shorter
+   agents and needs a separate controlled comparison.
+
+These results do not establish a general four-agent limit. They establish a
+one-cold-prefill limit for one H100 under the exact pinned configuration and
+show why admission must distinguish cache-hot continuations from cold turns.
