@@ -2246,6 +2246,7 @@ async def test_relay_sends_one_preamble_on_the_responses_route(
 
 @pytest.mark.asyncio
 async def test_cold_prefill_guard_serializes_only_cold_requests() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=4,
@@ -2259,15 +2260,19 @@ async def test_cold_prefill_guard_serializes_only_cold_requests() -> None:
     )
     await _wait_for_queue(pool, 1)
 
+    # Act
     hot = await pool.acquire("hot", input_tokens=256_000, cold_prefill=False)
-    assert hot is first
-    assert not blocked.done()
+    observed_hot = hot is first
+    observed_blocked = not blocked.done()
     await pool.release(hot, input_tokens=256_000, session_id="hot")
     await pool.release(
         first, input_tokens=256_000, session_id="cold-1", cold_prefill=True
     )
     second = await asyncio.wait_for(blocked, timeout=1)
-    assert second.cold_prefills_in_flight == 1
+    observed_cold_count = second.cold_prefills_in_flight
     await pool.release(
         second, input_tokens=256_000, session_id="cold-2", cold_prefill=True
     )
+
+    # Assert
+    assert (observed_hot, observed_blocked, observed_cold_count) == (True, True, 1)
