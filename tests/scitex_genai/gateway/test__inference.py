@@ -381,20 +381,38 @@ async def test_observability_snapshot_is_bounded_and_never_exposes_session_ids()
     # Assert
     tickets = snapshot["tickets"]
     assert (
-        snapshot["running"],
+        snapshot["admitted"],
         snapshot["queued"],
-        snapshot["input_tokens_running"],
+        snapshot["input_tokens_admitted"],
         snapshot["input_tokens_queued"],
         snapshot["oldest_queue_age_s"] >= 0,
         tickets[1]["priority"],
         tickets[1]["admission_class"],
         tickets[1]["cache_classification"],
+        tickets[0]["state"],
+        tickets[1]["block_reason"],
         "secret" not in serialized,
         raw_active not in serialized,
         raw_queued not in serialized,
         finished["cumulative"]["queued_total"],
         finished["cumulative"]["queue_time_samples"],
-    ) == (1, 1, 700, 400, True, True, "continuation", "hot", True, True, True, 1, 1)
+    ) == (
+        1,
+        1,
+        700,
+        400,
+        True,
+        True,
+        "continuation",
+        "hot",
+        "admitted",
+        "request-capacity",
+        True,
+        True,
+        True,
+        1,
+        1,
+    )
 
 
 @pytest.mark.asyncio
@@ -460,6 +478,7 @@ async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> 
     second = await pool.acquire("short", input_tokens=200)
     waiting = asyncio.create_task(pool.acquire("long-b", input_tokens=400))
     await _wait_for_queue(pool, 1)
+    admission = await pool.observability_snapshot()
 
     # Act
     saturated = pool.status()[0]
@@ -474,8 +493,10 @@ async def test_token_capacity_queues_a_large_request_while_short_work_fits() -> 
         saturated["input_tokens_in_flight"],
         saturated["input_tokens_queued"],
         still_waiting,
+        admission["tickets"][-1]["block_reason"],
+        admission["cumulative"]["blocked_total"],
         pool.status()[0]["input_tokens_in_flight"],
-    ) == (900, 400, True, 0)
+    ) == (900, 400, True, "token-capacity", {"token-capacity": 1}, 0)
 
 
 @pytest.mark.asyncio
