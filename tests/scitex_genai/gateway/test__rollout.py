@@ -310,7 +310,8 @@ def test_bootstrap_rejects_nonzero_legacy_held_before_stopping_it(tmp_path: Path
         return {"status": "ok", "in_flight": 0, "queued": 0, "held": 1}
 
     # Act
-    with pytest.raises(RolloutError, match="not empty"):
+    error = None
+    try:
         rollout(
             generation="new",
             build="build",
@@ -324,9 +325,14 @@ def test_bootstrap_rejects_nonzero_legacy_held_before_stopping_it(tmp_path: Path
             systemctl=lambda argv: calls.append(list(argv)),
             health_call=health,
         )
+    except RolloutError as exc:
+        error = exc
 
     # Assert
-    assert ["systemctl", "--user", "disable", "--now", UNIT_NAME] not in calls
+    assert (
+        "not empty" in str(error),
+        ["systemctl", "--user", "disable", "--now", UNIT_NAME] not in calls,
+    ) == (True, True)
 
 
 def test_empty_legacy_schema_without_held_bootstraps_durable_frontend(
