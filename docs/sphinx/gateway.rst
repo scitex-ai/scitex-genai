@@ -6,6 +6,9 @@ local inference servers. Deployment settings belong in
 ``~/.scitex/genai/config.yaml``; a one-member pool is supported and should
 list only the upstream that is actually reachable.
 
+The request-phase and SAC identity contract is documented in
+``docs/design/gateway-request-lifecycle-observability.md`` in the source tree.
+
 .. code-block:: yaml
 
    gateway:
