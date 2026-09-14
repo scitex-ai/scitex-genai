@@ -127,25 +127,150 @@ async def test_heterogeneous_capacity_filters_and_repins_grown_sessions() -> Non
 
 
 @pytest.mark.asyncio
-async def test_new_sessions_use_normalized_token_pressure() -> None:
+async def test_best_fit_uses_normalized_token_pressure_within_capacity_tier() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_specs(
         (
-            SimpleNamespace(label="small", url="http://small:1", token_capacity=500),
+            SimpleNamespace(
+                label="small-a", url="http://small-a:1", token_capacity=500
+            ),
             SimpleNamespace(label="large", url="http://large:2", token_capacity=2_000),
+            SimpleNamespace(
+                label="small-b", url="http://small-b:3", token_capacity=500
+            ),
         )
     )
-    small = await pool.acquire("one", input_tokens=400)
-    large = await pool.acquire("two", input_tokens=100)
+    first = await pool.acquire("one", input_tokens=400)
 
     # Act
-    selected = await pool.acquire("three", input_tokens=100)
+    selected = await pool.acquire("two", input_tokens=100)
 
     # Assert
-    assert (small.alias, large.alias, selected.alias) == ("small", "large", "large")
-    await pool.release(small, input_tokens=400, session_id="one")
-    await pool.release(large, input_tokens=100, session_id="two")
-    await pool.release(selected, input_tokens=100, session_id="three")
+    assert (first.alias, selected.alias) == ("small-a", "small-b")
+    await pool.release(first, input_tokens=400, session_id="one")
+    await pool.release(selected, input_tokens=100, session_id="two")
+
+
+@pytest.mark.asyncio
+async def test_best_fit_first_placement_across_three_heterogeneous_tiers() -> None:
+    # Arrange -- tier order is deliberately not ascending.
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(label="tp2", url="http://tp2:1", token_capacity=1_600_000),
+            SimpleNamespace(
+                label="tp1-500k", url="http://tp1-b:2", token_capacity=500_000
+            ),
+            SimpleNamespace(
+                label="tp1-250k", url="http://tp1-a:3", token_capacity=250_000
+            ),
+        )
+    )
+
+    # Act
+    aliases = [
+        await pool.route_alias("small", input_tokens=152_000),
+        await pool.route_alias("medium", input_tokens=297_000),
+        await pool.route_alias("large", input_tokens=500_001),
+    ]
+
+    # Assert
+    assert aliases == ["tp1-250k", "tp1-500k", "tp2"]
+
+
+@pytest.mark.asyncio
+async def test_equal_best_fit_tier_balances_without_reserving_yaml_order() -> None:
+    # Arrange -- a larger tier between the equal members must not disturb them.
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(
+                label="tp1-b", url="http://tp1-b:1", token_capacity=250_000
+            ),
+            SimpleNamespace(label="tp2", url="http://tp2:2", token_capacity=1_600_000),
+            SimpleNamespace(
+                label="tp1-a", url="http://tp1-a:3", token_capacity=250_000
+            ),
+        )
+    )
+
+    # Act
+    aliases = [
+        await pool.route_alias(f"session-{index}", input_tokens=152_000)
+        for index in range(4)
+    ]
+
+    # Assert
+    assert aliases == ["tp1-b", "tp1-a", "tp1-b", "tp1-a"]
+
+
+@pytest.mark.asyncio
+async def test_compatible_sticky_home_precedes_smaller_best_fit_tier() -> None:
+    # Arrange -- the session legitimately reached tp2 while it was large.
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(label="tp1", url="http://tp1:1", token_capacity=250_000),
+            SimpleNamespace(label="tp2", url="http://tp2:2", token_capacity=1_600_000),
+        )
+    )
+    initial = await pool.route_alias("cached", input_tokens=700_000)
+
+    # Act -- a shorter continuation still has authoritative cache affinity.
+    continuation = await pool.route_alias("cached", input_tokens=152_000)
+
+    # Assert
+    assert (initial, continuation) == ("tp2", "tp2")
+
+
+@pytest.mark.asyncio
+async def test_incompatible_or_unknown_cache_home_uses_best_fit() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(label="tp2", url="http://tp2:2", token_capacity=1_600_000),
+            SimpleNamespace(
+                label="tp1-500k", url="http://tp1-b:3", token_capacity=500_000
+            ),
+            SimpleNamespace(label="tp1", url="http://tp1:1", token_capacity=250_000),
+        )
+    )
+    first = await pool.route_alias("growing", input_tokens=152_000)
+    pool._sessions["unknown-home"] = "retired-upstream"
+
+    # Act
+    grown_mid = await pool.route_alias("growing", input_tokens=297_000)
+    grown_large = await pool.route_alias("growing", input_tokens=500_001)
+    unknown = await pool.route_alias("unknown-home", input_tokens=152_000)
+
+    # Assert -- growth invalidates incompatible affinity; an unknown alias is
+    # not authoritative merely because it appears in the bounded route table.
+    assert (first, grown_mid, grown_large, unknown) == (
+        "tp1",
+        "tp1-500k",
+        "tp2",
+        "tp1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_smallest_tier_falls_back_to_next_capable_tier() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(
+                label="tp1-250k", url="http://tp1-a:1", token_capacity=250_000
+            ),
+            SimpleNamespace(
+                label="tp1-500k", url="http://tp1-b:2", token_capacity=500_000
+            ),
+            SimpleNamespace(label="tp2", url="http://tp2:3", token_capacity=1_600_000),
+        )
+    )
+    await pool.cool_down(pool.upstreams[0], 60)
+
+    # Act
+    selected = await pool.route_alias("new", input_tokens=152_000)
+
+    # Assert
+    assert selected == "tp1-500k"
 
 
 @pytest.mark.asyncio
