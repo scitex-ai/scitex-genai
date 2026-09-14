@@ -6,6 +6,7 @@ import logging
 import signal
 import threading
 from contextlib import asynccontextmanager, suppress
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -514,7 +515,17 @@ async def test_relay_app_still_requires_the_api_key(upstream_factory) -> None:
 async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
     # Arrange
     upstream = upstream_factory()
-    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_specs(
+            (
+                SimpleNamespace(
+                    label="qwen-tp2",
+                    url=upstream.url,
+                    token_capacity=1_600_000,
+                ),
+            )
+        )
+    )
     # Act
     async with _serving(backend) as test_client:
         response = await test_client.get("/health")
@@ -530,6 +541,8 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
         payload["reachable_members"],
         payload["active_members"],
         member["url"],
+        member["label"],
+        member["token_capacity"],
         member["configured"],
         member["admission_eligible"],
         member["reachable"],
@@ -544,6 +557,8 @@ async def test_relay_app_health_names_the_upstreams(upstream_factory) -> None:
         1,
         1,
         upstream.url,
+        "qwen-tp2",
+        1_600_000,
         True,
         True,
         True,

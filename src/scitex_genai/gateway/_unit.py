@@ -51,7 +51,6 @@ from ._settings import (
     check_host,
     check_port,
     check_timeout_s,
-    upstream_string,
 )
 
 UNIT_NAME = "scitex-genai-gateway.service"
@@ -70,11 +69,9 @@ def gateway_command(
     *,
     host: str | None = None,
     port: int | None = None,
-    upstream: str | None = None,
     inference_timeout_s: float | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
-    inference_token_capacity_per_upstream: int | None = None,
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
@@ -94,8 +91,6 @@ def gateway_command(
         argv += ["--host", check_host(host)]
     if port is not None:
         argv += ["--port", str(check_port(port))]
-    if upstream is not None and upstream_string(upstream):
-        argv += ["--inference-upstream", upstream_string(upstream)]
     if inference_timeout_s is not None:
         argv += ["--inference-timeout-s", str(check_timeout_s(inference_timeout_s))]
     if inference_capacity_per_upstream is not None:
@@ -115,17 +110,6 @@ def gateway_command(
             str(
                 check_count(
                     "inference_max_queue_size", inference_max_queue_size, minimum=0
-                )
-            ),
-        ]
-    if inference_token_capacity_per_upstream is not None:
-        argv += [
-            "--inference-token-capacity-per-upstream",
-            str(
-                check_count(
-                    "inference_token_capacity_per_upstream",
-                    inference_token_capacity_per_upstream,
-                    minimum=1,
                 )
             ),
         ]
@@ -175,13 +159,11 @@ def render_unit(
     *,
     host: str | None = None,
     port: int | None = None,
-    upstream: str | None = None,
     inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
-    inference_token_capacity_per_upstream: int | None = None,
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
@@ -191,11 +173,9 @@ def render_unit(
     argv = gateway_command(
         host=host,
         port=port,
-        upstream=upstream,
         inference_timeout_s=inference_timeout_s,
         inference_capacity_per_upstream=inference_capacity_per_upstream,
         inference_max_queue_size=inference_max_queue_size,
-        inference_token_capacity_per_upstream=(inference_token_capacity_per_upstream),
         inference_continuation_qos_enabled=inference_continuation_qos_enabled,
         inference_continuation_qos_max_retries=(inference_continuation_qos_max_retries),
         inference_continuation_qos_min_preempt_tokens=(
@@ -237,7 +217,6 @@ def install_unit(
     *,
     host: str | None = None,
     port: int | None = None,
-    upstream: str | None = None,
     inference_timeout_s: float | None = None,
     config: Path | str | None = None,
     unit_dir: Path | None = None,
@@ -245,7 +224,6 @@ def install_unit(
     runner: Runner | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
-    inference_token_capacity_per_upstream: int | None = None,
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
@@ -266,13 +244,9 @@ def install_unit(
         render_unit(
             host=host,
             port=port,
-            upstream=upstream,
             inference_timeout_s=inference_timeout_s,
             inference_capacity_per_upstream=inference_capacity_per_upstream,
             inference_max_queue_size=inference_max_queue_size,
-            inference_token_capacity_per_upstream=(
-                inference_token_capacity_per_upstream
-            ),
             inference_continuation_qos_enabled=(inference_continuation_qos_enabled),
             inference_continuation_qos_max_retries=(
                 inference_continuation_qos_max_retries

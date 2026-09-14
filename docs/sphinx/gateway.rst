@@ -12,12 +12,15 @@ list only the upstream that is actually reachable.
      host: 0.0.0.0
      port: 18772
      inference_upstreams:
-       - http://127.0.0.1:18773
+       - label: qwen-tp2
+         url: http://127.0.0.1:18773
+         token_capacity: 1600000
+       - label: qwen-tp1
+         url: http://127.0.0.1:18774
+         token_capacity: 500000
      inference_timeout_s: 1800
      inference_capacity_per_upstream: 8
      inference_max_queue_size: 128
-     # Optional weighted guard; choose from measured engine KV capacity.
-     inference_token_capacity_per_upstream: 1600000
      # Opt in only for a verified SGLang OpenAI endpoint with /abort_request.
      inference_continuation_qos_enabled: false
      inference_continuation_qos_max_retries: 1
@@ -56,15 +59,53 @@ Direct values take precedence over the configuration file, then
 Capacity planning
 -----------------
 
+Each local upstream is a mapping with exactly ``label``, ``url``, and
+``token_capacity``. Labels and URLs must be unique, and token capacity must be
+a positive integer measured for that engine topology. Bare URL lists and comma
+strings are rejected: a uniform global token limit cannot safely describe a
+mixed TP=1/TP=2 pool.
+
+Migrate deterministically before installing the new gateway. Replace:
+
+.. code-block:: yaml
+
+   inference_upstreams:
+     - http://127.0.0.1:18773
+     - http://127.0.0.1:18774
+   inference_token_capacity_per_upstream: 1600000
+
+with explicit members:
+
+.. code-block:: yaml
+
+   inference_upstreams:
+     - label: qwen-tp2
+       url: http://127.0.0.1:18773
+       token_capacity: 1600000
+     - label: qwen-tp1
+       url: http://127.0.0.1:18774
+       token_capacity: 500000
+
+The measured TP=1 engine reports ``max_total_num_tokens=563215``, already lower
+than its one-million-token configured context ceiling; the example uses a
+500,000-token gateway budget to retain headroom. Context validity is not
+resident KV capacity. New sessions are placed
+only on members that can ever fit their current estimated input. If a pinned
+session grows beyond its member's hard capacity, it is deliberately repinned
+to a capable member and pays one cold-cache turn; if no member fits, admission
+fails before dispatch. Health reports each member's label, URL, and capacity.
+
 The gateway admits at most ``inference_capacity_per_upstream`` concurrent
 requests to each member (default 8). Additional requests wait in a bounded
 pool-wide queue of ``inference_max_queue_size`` entries (default 128); once
 that queue is full the gateway returns 503. Set the per-member value no higher
 than the inference engine's own running-request limit.
 
-Admission happens after sticky placement. A conversation therefore waits for
-its existing home member instead of moving to an idle replica and losing its
-prefix cache. ``/health`` retains the ``upstreams`` URL list and adds a
+Capacity eligibility happens before a new session's sticky placement; feasible
+members are compared by admitted-plus-queued tokens divided by their own
+``token_capacity``. A warm conversation still waits for its existing home
+instead of moving to an idle replica and losing its prefix cache, unless its
+grown request can never fit there. ``/health`` retains the ``upstreams`` URL list and adds a
 ``members`` list with each member's ``active``, ``in_flight``, ``queued``, and
 ``capacity`` state, plus pool-wide totals. Cancelled waiters release their
 queue entries, and shutdown wakes all waiters while admitted streams drain.
@@ -164,7 +205,7 @@ recoveries; shutdown cancels and awaits those tasks without pretending the
 engine state was reclaimed.
 
 Request count is not enough when agents have very different context lengths.
-When ``inference_token_capacity_per_upstream`` is set, the gateway also limits
+For each member, ``token_capacity`` limits
 the sum of estimated input tokens in flight on each upstream.  It estimates
 one token per four UTF-8 request-body bytes, without loading a model tokenizer
 into the gateway.  This is a planning approximation, so set the budget below
@@ -172,10 +213,12 @@ the engine's measured usable token capacity with enough margin for output and
 estimation error.  A request larger than the configured budget is refused;
 otherwise it waits in the same bounded queue as count-limited work.
 
-Weighted admission happens *after* sticky placement.  A warm conversation
-therefore waits for room on its cache-owning upstream rather than moving to an
-idle replica and paying a cold prefill.  The total-token guard continues to
-account the full estimated input because active sequence KV is not free.
+Capacity eligibility happens before first sticky placement, and feasible new
+sessions prefer the lowest normalized token pressure. A warm conversation
+waits for room on its cache-owning upstream rather than moving merely because
+another member is idle. It is repinned only when its request has grown beyond
+that home's hard capacity. The total-token guard continues to account the full
+estimated input because active sequence KV is not free.
 
 When the cold-prefill limit and threshold are configured, that separate guard
 uses predicted **uncached prefill tokens**.  Compatible lineage starts from the
@@ -241,3 +284,31 @@ and `#36876 <https://github.com/sgl-project/sglang/issues/36876>`_ describe
 versions where tokenizer state is deleted but the scheduler keeps a zombie
 request running.  Gateway admission cannot observe or safely reclaim that
 engine-side state; deploy an SGLang build containing the upstream abort fix.
+
+Heterogeneous rollout
+---------------------
+
+Do not add a TP=1 URL to a running gateway under the old uniform-capacity
+configuration. First write the structured TP=2 member only, validate the file
+without binding a port:
+
+.. code-block:: console
+
+   $ python -c 'from scitex_genai.gateway._settings import load_settings; print(load_settings())'
+
+Then drain the gateway with
+``scitex-genai-gateway restart-unit``, and confirm ``/health`` reports the TP=2
+label, URL, and 1,600,000-token capacity. This migration changes the gateway
+process only; it does not restart SGLang.
+
+Start and probe the TP=1 canary separately. After its readiness and token-limit
+measurements pass, append it with a conservative initial ``token_capacity`` of
+500,000, drain/restart the gateway again, and confirm both member records before
+sending canary traffic. Exercise requests immediately below and above 500,000:
+the former may select TP=1 and the latter must select TP=2. A request above
+1,600,000 must fail before dispatch.
+
+Rollback is deterministic: drain, restore the last known-good structured file
+containing only the TP=2 member, restart the gateway, and verify that health has
+one configured member. Never roll back to the retired bare-URL/global-capacity
+schema. Preserve the prior file beside the deployment as the rollback artifact.

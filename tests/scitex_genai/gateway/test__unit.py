@@ -92,7 +92,7 @@ def test_with_no_flags_the_unit_execs_only_this_interpreter_and_the_module():
 
 def test_given_settings_are_baked_into_execstart():
     # Arrange
-    text = render_unit(host="0.0.0.0", port=18772, upstream=UPSTREAM)
+    text = render_unit(host="0.0.0.0", port=18772)
 
     # Act
     argv = _exec_argv(text)
@@ -103,8 +103,6 @@ def test_given_settings_are_baked_into_execstart():
         "0.0.0.0",
         "--port",
         "18772",
-        "--inference-upstream",
-        "http://127.0.0.1:18773,http://127.0.0.1:18774",
     ]
 
 
@@ -124,7 +122,6 @@ def test_explicit_admission_bounds_are_baked_into_execstart():
     text = render_unit(
         inference_capacity_per_upstream=3,
         inference_max_queue_size=9,
-        inference_token_capacity_per_upstream=1_600_000,
     )
 
     # Act
@@ -136,8 +133,6 @@ def test_explicit_admission_bounds_are_baked_into_execstart():
         "3",
         "--inference-max-queue-size",
         "9",
-        "--inference-token-capacity-per-upstream",
-        "1600000",
     ]
 
 
@@ -186,7 +181,6 @@ def test_cache_report_capability_is_baked_into_execstart_only_when_explicit():
     [
         {"inference_capacity_per_upstream": 0},
         {"inference_max_queue_size": -1},
-        {"inference_token_capacity_per_upstream": 0},
     ],
 )
 def test_invalid_admission_bounds_are_refused(given):
@@ -315,12 +309,10 @@ def test_install_returns_the_unit_path(tmp_path: Path):
 
 def test_install_writes_the_rendered_text(tmp_path: Path):
     # Arrange
-    expected = render_unit(host="0.0.0.0", port=18772, upstream=UPSTREAM)
+    expected = render_unit(host="0.0.0.0", port=18772)
 
     # Act
-    path = install_unit(
-        host="0.0.0.0", port=18772, upstream=UPSTREAM, unit_dir=tmp_path, enable=False
-    )
+    path = install_unit(host="0.0.0.0", port=18772, unit_dir=tmp_path, enable=False)
 
     # Assert
     assert path.read_text() == expected
