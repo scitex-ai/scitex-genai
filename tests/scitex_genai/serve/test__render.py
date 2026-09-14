@@ -911,3 +911,108 @@ def test_health_url_is_vllm_on_loopback():
 
     # Assert
     assert url == "http://127.0.0.1:8768/health"
+
+
+PRODUCTION_TP1_PROFILES = {
+    "qwen-tp1-512k": (512_000, 28769, 24004, 18774),
+    "qwen-tp1-256k": (256_000, 28770, 24005, 18775),
+}
+
+
+def _production_tp1_launch(key: str):
+    root = Path(__file__).parents[3]
+    path = root / "examples" / "serve" / f"{key}.conf"
+    conf = parse_engine_conf(key, path.read_text(), source=path)
+    return conf, render(SETTINGS, conf, BASE_ENV)
+
+
+@pytest.mark.parametrize("key", PRODUCTION_TP1_PROFILES)
+def test_production_tp1_profile_renders_the_measured_engine_contract(key: str):
+    # Arrange
+    expected_context, engine_port, litellm_port, tunnel_port = PRODUCTION_TP1_PROFILES[
+        key
+    ]
+
+    # Act
+    conf, launch = _production_tp1_launch(key)
+
+    # Assert
+    assert (
+        conf.max_model_len,
+        conf.tp,
+        conf.gpu_mem_util,
+        conf.max_num_seqs,
+        conf.engine_port,
+        conf.litellm_port,
+        conf.tunnel_port,
+        _arg_value(launch.engine_argv, "--kv-cache-dtype"),
+        _arg_value(launch.engine_argv, "--schedule-policy"),
+        '"rope_type":"yarn"'
+        in _arg_value(launch.engine_argv, "--json-model-override-args"),
+        '"factor":4.0' in _arg_value(launch.engine_argv, "--json-model-override-args"),
+        _arg_value(launch.engine_argv, "--speculative-algorithm"),
+        _arg_value(launch.engine_argv, "--speculative-num-steps"),
+        _arg_value(launch.engine_argv, "--speculative-eagle-topk"),
+        _arg_value(launch.engine_argv, "--speculative-num-draft-tokens"),
+    ) == (
+        expected_context,
+        1,
+        0.85,
+        4,
+        engine_port,
+        litellm_port,
+        tunnel_port,
+        "fp8_e4m3",
+        "lpm",
+        True,
+        True,
+        "EAGLE",
+        "3",
+        "1",
+        "4",
+    )
+
+
+@pytest.mark.parametrize("key", PRODUCTION_TP1_PROFILES)
+def test_production_tp1_profile_uses_supervisor_cache_contract(key: str):
+    # Arrange
+    expected_build = "0.0.0.dev1+g4ccff141d.d20260907"
+
+    # Act
+    conf, launch = _production_tp1_launch(key)
+
+    # Assert
+    assert (
+        conf.canary_only,
+        launch.engine_argv.count("--enable-session-radix-cache"),
+        launch.engine_argv.count("--enable-cache-report"),
+        launch.engine_argv.count("--enable-metrics"),
+        launch.env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"],
+        launch.env["SCITEX_GENAI_EXPECTED_SGLANG_VERSION"],
+        launch.health_url,
+        launch.tunnel_argv[-2],
+    ) == (
+        False,
+        1,
+        1,
+        1,
+        "1",
+        expected_build,
+        f"http://127.0.0.1:{conf.engine_port}/health",
+        f"{conf.tunnel_port}:127.0.0.1:{conf.engine_port}",
+    )
+
+
+def test_production_tp1_profiles_do_not_collide_on_any_port():
+    # Arrange
+    profiles = [_production_tp1_launch(key)[0] for key in PRODUCTION_TP1_PROFILES]
+
+    # Act
+    ports = [
+        port
+        for conf in profiles
+        for port in (conf.engine_port, conf.litellm_port, conf.tunnel_port)
+    ]
+
+    # Assert
+    assert len(ports) == len(set(ports))
