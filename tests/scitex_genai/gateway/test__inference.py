@@ -20,6 +20,7 @@ from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
     ResponseTokenReport,
+    _replay_safe_for_preemption,
     accepts_session_id,
     adapt_openai_roles,
     announce,
@@ -962,6 +963,294 @@ async def test_continuation_qos_aborts_then_retries_first_turn(
         1,
         1,
     )
+
+
+@pytest.mark.parametrize(
+    ("admission_class", "cold_prefill", "cache_tier", "expected"),
+    (
+        ("continuation", True, "device", True),
+        ("continuation", False, "host", True),
+        ("continuation", False, "storage", True),
+        ("continuation", False, "device", False),
+    ),
+)
+def test_only_slow_continuations_are_replay_safe_preemption_victims(
+    admission_class: str, cold_prefill: bool, cache_tier: str, expected: bool
+) -> None:
+    # Arrange
+
+    # Act
+    actual = _replay_safe_for_preemption(
+        admission_class=admission_class,
+        cold_prefill=cold_prefill,
+        prior_cache_tier=cache_tier,
+    )
+
+    # Assert
+    assert actual is expected
+
+
+@pytest.mark.asyncio
+async def test_cold_work_stays_preemptible_after_headers_until_first_body_byte(
+    upstream_factory,
+) -> None:
+    # Arrange: SGLang may acknowledge HTTP before its prefill produces a token.
+    body_gate = __import__("threading").Event()
+    body_gate.set()
+    upstream = upstream_factory(block_before_first_chunk=body_gate, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=2)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = b'{"model":"m","input":"hello","stream":true}'
+    known = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "hot"}
+    )
+    await _collect(known.body)
+    body_gate.clear()
+    upstream.response_headers_sent.clear()
+    cold_task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "cold"},
+        )
+    )
+    headers_sent = await asyncio.to_thread(upstream.response_headers_sent.wait, 2)
+
+    # Act
+    hot = await asyncio.wait_for(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "hot"},
+        ),
+        timeout=2,
+    )
+    await _collect(hot.body)
+    cold = await asyncio.wait_for(cold_task, timeout=2)
+    await _collect(cold.body)
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert
+    assert (
+        headers_sent,
+        snapshot["first_turns_preempted"],
+        snapshot["first_turn_retries"],
+        pool.status()[0]["in_flight"],
+    ) == (True, 1, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_predicted_cold_continuation_yields_to_predicted_hot_continuation(
+    upstream_factory,
+) -> None:
+    # Arrange: both sessions are continuations. Their prior actual cache reports
+    # distinguish 150 uncached tokens from a fully cached hot request.
+    body_gate = __import__("threading").Event()
+    body_gate.set()
+    upstream = upstream_factory(block_before_first_chunk=body_gate, abort_releases=True)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url,
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=100,
+    )
+    backend = InferenceBackend(
+        pool, continuation_qos_enabled=True, cache_report_enabled=True
+    )
+    body = b'{"model":"m","messages":[{"role":"user","content":"hello"}]}'
+    upstream.chunks = (
+        b'{"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":200}}}',
+    )
+    hot_seed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=body,
+        headers={"x-scitex-session-id": "hot"},
+    )
+    await _collect(hot_seed.body)
+    upstream.chunks = (
+        b'{"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":50}}}',
+    )
+    cold_seed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=body,
+        headers={"x-scitex-session-id": "cold"},
+    )
+    await _collect(cold_seed.body)
+    body_gate.clear()
+    upstream.response_headers_sent.clear()
+    cold_task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/chat/completions",
+            body=body,
+            headers={"x-scitex-session-id": "cold"},
+        )
+    )
+    await asyncio.to_thread(upstream.response_headers_sent.wait, 2)
+
+    # Act
+    hot = await asyncio.wait_for(
+        backend.relay(
+            "POST",
+            "/v1/chat/completions",
+            body=body,
+            headers={"x-scitex-session-id": "hot"},
+        ),
+        timeout=2,
+    )
+    await _collect(hot.body)
+    cold = await asyncio.wait_for(cold_task, timeout=2)
+    await _collect(cold.body)
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert
+    assert (
+        hot.feedback_headers["x-scitex-cache-residency"],
+        cold.feedback_headers["x-scitex-cache-residency"],
+        snapshot["cold_continuations_preempted"],
+        snapshot["cold_continuation_retries"],
+        pool.status()[0]["in_flight"],
+    ) == ("hot", "cold", 1, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_predicted_cold_waits_while_hot_response_is_already_streaming(
+    upstream_factory,
+) -> None:
+    # Arrange: seed authoritative hot/cold predictions, then let the hot
+    # continuation's first byte cross the replay boundary while its decode runs.
+    decode_gate = __import__("threading").Event()
+    decode_gate.set()
+    upstream = upstream_factory(block_after_first_chunk=decode_gate)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url,
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=100,
+    )
+    backend = InferenceBackend(
+        pool, continuation_qos_enabled=True, cache_report_enabled=True
+    )
+    body = b'{"model":"m","messages":[{"role":"user","content":"hello"}]}'
+    upstream.chunks = (
+        b'{"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":200}}}',
+    )
+    hot_seed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=body,
+        headers={"x-scitex-session-id": "hot"},
+    )
+    await _collect(hot_seed.body)
+    upstream.chunks = (
+        b'{"usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":50}}}',
+    )
+    cold_seed = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=body,
+        headers={"x-scitex-session-id": "cold"},
+    )
+    await _collect(cold_seed.body)
+    upstream.chunks = (b"first-token", b"remaining-decode")
+    decode_gate.clear()
+    hot = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=body,
+        headers={"x-scitex-session-id": "hot"},
+    )
+    hot_body = hot.body.__aiter__()
+    first_token = await anext(hot_body)
+
+    # Act
+    cold_task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/chat/completions",
+            body=body,
+            headers={"x-scitex-session-id": "cold"},
+        )
+    )
+    await _wait_for_queue(pool, 1)
+    queued = await pool.observability_snapshot()
+    forwarded_while_hot = len(
+        [
+            request
+            for request in upstream.requests
+            if request["path"] != "/abort_request"
+        ]
+    )
+    decode_gate.set()
+    remaining = b"".join([chunk async for chunk in hot_body])
+    cold = await asyncio.wait_for(cold_task, timeout=2)
+    await _collect(cold.body)
+
+    # Assert
+    ticket = next(item for item in queued["tickets"] if item["state"] == "queued")
+    assert (
+        first_token,
+        remaining,
+        forwarded_while_hot,
+        ticket["priority"],
+        ticket["block_reason"],
+        pool.status()[0]["in_flight"],
+    ) == (b"first-token", b"remaining-decode", 3, False, "hot-work-in-flight", 0)
+
+
+@pytest.mark.asyncio
+async def test_post_header_preemption_refuses_handoff_when_abort_is_unconfirmed(
+    upstream_factory,
+) -> None:
+    # Arrange
+    body_gate = __import__("threading").Event()
+    body_gate.set()
+    upstream = upstream_factory(block_before_first_chunk=body_gate, abort_status=500)
+    pool = InferenceUpstreamPool.from_urls(upstream.url, capacity_per_upstream=2)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    body = b'{"model":"m","input":"hello","stream":true}'
+    seed = await backend.relay(
+        "POST", "/v1/responses", body=body, headers={"x-scitex-session-id": "hot"}
+    )
+    await _collect(seed.body)
+    body_gate.clear()
+    upstream.response_headers_sent.clear()
+    cold_task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "cold"},
+        )
+    )
+    await asyncio.to_thread(upstream.response_headers_sent.wait, 2)
+
+    # Act
+    hot_task = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/responses",
+            body=body,
+            headers={"x-scitex-session-id": "hot"},
+        )
+    )
+    refused = await asyncio.wait_for(_raised_async(hot_task), timeout=2)
+    body_gate.set()
+    cold = await asyncio.wait_for(cold_task, timeout=2)
+    await _collect(cold.body)
+    snapshot = backend.continuation_qos.snapshot()
+
+    # Assert
+    assert (
+        isinstance(refused, InferenceAdmissionError),
+        snapshot["abort_failures"],
+        snapshot["first_turns_preempted"],
+        pool.status()[0]["in_flight"],
+    ) == (True, 1, 0, 0)
 
 
 @pytest.mark.asyncio
@@ -2372,6 +2661,33 @@ async def test_cold_prefill_guard_serializes_only_cold_requests() -> None:
 
     # Assert
     assert (observed_hot, observed_blocked, observed_cold_count) == (True, True, 1)
+
+
+@pytest.mark.asyncio
+async def test_cold_isolation_uses_bounded_bypasses_to_avoid_starvation() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1", capacity_per_upstream=3, max_admission_bypasses=1
+    )
+    active = await pool.acquire("hot-active")
+    cold = asyncio.create_task(pool.acquire("cold", cold_prefill=True))
+    await _wait_for_queue(pool, 1)
+    bypass = await pool.acquire("hot-bypass")
+
+    # Act: after one bypass, admission drains instead of letting fresh hot work
+    # keep the older cold ticket blocked forever.
+    await pool.release(bypass, session_id="hot-bypass")
+    later_hot = asyncio.create_task(pool.acquire("hot-later"))
+    await _wait_for_queue(pool, 2)
+    both_waiting = not cold.done() and not later_hot.done()
+    await pool.release(active, session_id="hot-active")
+    admitted_cold = await asyncio.wait_for(cold, timeout=0.1)
+    await pool.release(admitted_cold, session_id="cold", cold_prefill=True)
+    admitted_hot = await asyncio.wait_for(later_hot, timeout=0.1)
+    await pool.release(admitted_hot, session_id="hot-later")
+
+    # Assert
+    assert (both_waiting, pool.status()[0]["in_flight"]) == (True, 0)
 
 
 @pytest.mark.asyncio
