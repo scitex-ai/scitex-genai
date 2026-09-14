@@ -159,6 +159,28 @@ gateway restart overlapped an active approximately 672,000-token Hub turn,
 and its retry arrived without the prior prefix cache benefit. The drain
 command turns that timing-dependent failure into a checked precondition.
 
+Zero-loss member cutover
+------------------------
+
+To replace one member without stopping work on the rest of the pool, call the
+authenticated ``POST /admin/members/{alias}/quiesce?timeout_s=1800``. The
+admission lock establishes one atomic cutoff. Work already admitted or queued
+for that member may finish; later sticky requests and requests that only that
+member can fit remain held on it. New unpinned work that another member can fit
+routes around it. A successful barrier ignores held post-cutoff work and waits
+only for the member's pre-cutoff ``in_flight`` and ``queued`` counts to reach
+zero. A 409 timeout leaves both the member fence and all work intact.
+
+After starting the replacement engine, call the authenticated
+``POST /admin/members/{alias}/resume``. Resume fails with 409 until a fresh
+health probe succeeds and metrics report an authoritative engine generation
+different from the pre-cutoff generation. Only then are held tickets promoted
+to the normal member queue. ``/health`` exposes member ``quiesced`` and
+``held`` state while ``/admin/status`` also reports held request/token totals
+and cumulative member-quiesce counters. A disconnected caller removes its held
+ticket immediately. The pool-wide drain endpoints retain their existing
+shutdown semantics and wake held tickets along with ordinary queued tickets.
+
 Continuation handoff (opt in)
 -----------------------------
 
