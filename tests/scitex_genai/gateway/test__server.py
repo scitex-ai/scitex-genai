@@ -18,6 +18,7 @@ pytest.importorskip("fastapi")
 
 from scitex_genai.gateway._errors import InferenceAdmissionError
 from scitex_genai.gateway._health import UpstreamReachability
+from scitex_genai.gateway._identity import GatewayIdentity
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
 from scitex_genai.gateway._server import _build_uvicorn_server, create_app
 
@@ -1034,6 +1035,102 @@ async def test_sigterm_closes_queue_before_uvicorn_drains_admitted_request(
         admitted_response.status_code,
         serve_task.done(),
     ) == (True, 503, "inference_admission", True, 200, True)
+
+
+@pytest.mark.asyncio
+async def test_rollout_sigterm_drains_admitted_and_queued_without_503(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release_first = threading.Event()
+    upstream = upstream_factory(block_until=release_first)
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url, capacity_per_upstream=1, max_queue_size=1
+    )
+    app = create_app(InferenceBackend(pool), api_key="relay-secret")
+    server = _build_uvicorn_server(
+        app,
+        close_admission_on_shutdown=False,
+        host="127.0.0.1",
+        port=0,
+        log_level="warning",
+        timeout_graceful_shutdown=5,
+    )
+    serve_task = asyncio.create_task(server.serve())
+    for _ in range(1000):
+        if server.started:
+            break
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    # Act
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+        admitted_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "admitted"},
+            )
+        )
+        await asyncio.to_thread(upstream.request_started.wait, 2)
+        queued_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json=_relay_body(),
+                headers={"x-api-key": "relay-secret", "x-session-id": "queued"},
+            )
+        )
+        for _ in range(1000):
+            if pool.upstreams[0].queued == 1:
+                break
+            await asyncio.sleep(0.001)
+        server.handle_exit(signal.SIGTERM, None)
+        server._captured_signals.clear()
+        still_queued = not queued_task.done()
+        release_first.set()
+        admitted = await asyncio.wait_for(admitted_task, 2)
+        queued = await asyncio.wait_for(queued_task, 2)
+        await asyncio.wait_for(serve_task, 2)
+
+    # Assert
+    assert (
+        still_queued,
+        admitted.status_code,
+        queued.status_code,
+        len(upstream.requests),
+        serve_task.done(),
+    ) == (True, 200, 200, 2, True)
+
+
+@pytest.mark.asyncio
+async def test_health_and_operator_status_expose_exact_gateway_incarnation(
+    upstream_factory,
+) -> None:
+    # Arrange
+    identity = GatewayIdentity("commit-abc", "process-123", "generation-blue")
+    app = create_app(
+        InferenceBackend(InferenceUpstreamPool.from_urls(upstream_factory().url)),
+        api_key="relay-secret",
+        identity=identity,
+    )
+
+    # Act
+    async with _serving(app.state.scitex_backend):
+        # _serving constructs its own app, so exercise this exact app in-process.
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as exact:
+            health = await exact.get("/health")
+            status = await exact.get(
+                "/admin/status", headers={"x-api-key": "relay-secret"}
+            )
+
+    # Assert
+    assert (health.json()["gateway"], status.json()["gateway"]) == (
+        identity.as_dict(),
+        identity.as_dict(),
+    )
 
 
 @pytest.mark.asyncio

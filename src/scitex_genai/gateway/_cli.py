@@ -31,12 +31,20 @@ from ._drain import (
 )
 from ._errors import CredentialError
 from ._external import ExternalProviderBackend, ExternalProviderPolicy
+from ._identity import gateway_identity
 from ._inference import (
     PREFIX_TELEMETRY_ENV,
     InferenceBackend,
     InferenceUpstreamPool,
     announce,
     telemetry_enabled,
+)
+from ._rollout import (
+    DEFAULT_HEALTH_TIMEOUT_S,
+    RolloutError,
+    default_current_socket_path,
+    rollback,
+    rollout,
 )
 from ._secrets import (
     GATEWAY_KEY_ENV,
@@ -45,11 +53,25 @@ from ._secrets import (
     write_key,
 )
 from ._server import create_app, run_uvicorn
-from ._settings import default_admission_history_path, load_settings
-from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
+from ._session_state import GatewaySessionState
+from ._settings import (
+    default_admission_history_path,
+    default_config_path,
+    default_gateway_session_state_path,
+    load_settings,
+)
+from ._unit import (
+    DEFAULT_UNIT_DIR,
+    UNIT_NAME,
+    install_rollout_frontend,
+    install_unit,
+)
 
 INSTALL_UNIT = "install-unit"
 RESTART_UNIT = "restart-unit"
+INSTALL_ROLLOUT = "install-rollout-units"
+ROLLOUT = "rollout-generation"
+ROLLBACK = "rollback-generation"
 
 
 def _add_settings_args(
@@ -158,6 +180,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--log-level", default="info")
+    parser.add_argument("--uds", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--gateway-build", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--gateway-incarnation", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--frontend-generation", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--graceful-rollout-shutdown",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     commands = parser.add_subparsers(dest="command")
     unit = commands.add_parser(
         INSTALL_UNIT,
@@ -210,6 +241,38 @@ def build_parser() -> argparse.ArgumentParser:
             "deprecated compatibility option; the server-side barrier no longer "
             "polls health"
         ),
+    )
+    install_rollout = commands.add_parser(
+        INSTALL_ROLLOUT,
+        help="write the stable socket-proxy frontend units without starting them",
+    )
+    install_rollout.add_argument("--config", type=Path, default=None)
+    install_rollout.add_argument("--unit-dir", type=Path, default=None)
+    rollout_parser = commands.add_parser(
+        ROLLOUT, help="verify and atomically promote one gateway generation"
+    )
+    rollout_parser.add_argument("--generation", required=True)
+    rollout_parser.add_argument("--build", required=True)
+    rollout_parser.add_argument("--config", type=Path, default=None)
+    rollout_parser.add_argument("--unit-dir", type=Path, default=None)
+    rollout_parser.add_argument("--runtime-dir", type=Path, default=None)
+    rollout_parser.add_argument("--state-path", type=Path, default=None)
+    rollout_parser.add_argument(
+        "--health-timeout-s", type=float, default=DEFAULT_HEALTH_TIMEOUT_S
+    )
+    rollout_parser.add_argument(
+        "--bootstrap-coordinated",
+        action="store_true",
+        help="acknowledge that all clients are paused for the one-time migration",
+    )
+    rollback_parser = commands.add_parser(
+        ROLLBACK, help="atomically re-promote the retained previous generation"
+    )
+    rollback_parser.add_argument("--config", type=Path, default=None)
+    rollback_parser.add_argument("--runtime-dir", type=Path, default=None)
+    rollback_parser.add_argument("--state-path", type=Path, default=None)
+    rollback_parser.add_argument(
+        "--health-timeout-s", type=float, default=DEFAULT_HEALTH_TIMEOUT_S
     )
     return parser
 
@@ -321,6 +384,54 @@ def main(
         except (DrainError, ValueError) as exc:
             raise SystemExit(f"refusing to restart: {exc}") from exc
         return
+    if args.command == INSTALL_ROLLOUT:
+        settings = load_settings(args.config)
+        paths = install_rollout_frontend(
+            host=settings.host,
+            port=settings.port,
+            current_socket=default_current_socket_path(),
+            unit_dir=args.unit_dir,
+        )
+        print(
+            "scitex-genai-gateway: rollout frontend written but not started: "
+            + ", ".join(str(path) for path in paths),
+            flush=True,
+        )
+        return
+    if args.command in {ROLLOUT, ROLLBACK}:
+        settings = load_settings(args.config)
+        health_url = f"http://127.0.0.1:{settings.port}/health"
+        try:
+            if args.command == ROLLOUT:
+                expected_members = {
+                    upstream.label: {
+                        "capacity": settings.inference_capacity_per_upstream,
+                        "token_capacity": upstream.token_capacity,
+                    }
+                    for upstream in settings.inference_upstreams
+                }
+                rollout(
+                    generation=args.generation,
+                    build=args.build,
+                    config=args.config or default_config_path(),
+                    public_health_url=health_url,
+                    runtime_dir=args.runtime_dir,
+                    unit_dir=args.unit_dir,
+                    state_path=args.state_path,
+                    health_timeout_s=args.health_timeout_s,
+                    bootstrap_coordinated=args.bootstrap_coordinated,
+                    expected_members=(expected_members or None),
+                )
+            else:
+                rollback(
+                    public_health_url=health_url,
+                    runtime_dir=args.runtime_dir,
+                    state_path=args.state_path,
+                    health_timeout_s=args.health_timeout_s,
+                )
+        except (RolloutError, ValueError) as exc:
+            raise SystemExit(f"rollout refused: {exc}") from exc
+        return
     try:
         __import__("uvicorn")
     except ImportError as exc:
@@ -394,6 +505,7 @@ def main(
                 settings.inference_cold_prefill_limit_per_upstream
             ),
             cold_prefill_min_tokens=settings.inference_cold_prefill_min_tokens,
+            session_state=GatewaySessionState(default_gateway_session_state_path()),
         )
         backend = InferenceBackend(
             pool,
@@ -416,11 +528,22 @@ def main(
         backend = CodexBackend(codex_pool, CodexTransport(base_url=args.codex_base_url))
     key = resolve_gateway_key(create=True)
     print(f"scitex-genai-gateway: key {key.origin}", flush=True)
-    app = create_app(backend, api_key=key.value)
-    app.state.scitex_backend = backend
-    (server_runner or run_uvicorn)(
-        app, host=settings.host, port=settings.port, log_level=args.log_level
+    identity = gateway_identity(
+        build=args.gateway_build,
+        incarnation=args.gateway_incarnation,
+        frontend_generation=args.frontend_generation,
     )
+    app = create_app(backend, api_key=key.value, identity=identity)
+    app.state.scitex_backend = backend
+    listen = (
+        {"uds": str(args.uds)}
+        if args.uds is not None
+        else {"host": settings.host, "port": settings.port}
+    )
+    server_kwargs: dict[str, object] = {**listen, "log_level": args.log_level}
+    if args.graceful_rollout_shutdown:
+        server_kwargs["close_admission_on_shutdown"] = False
+    (server_runner or run_uvicorn)(app, **server_kwargs)
 
 
 if __name__ == "__main__":

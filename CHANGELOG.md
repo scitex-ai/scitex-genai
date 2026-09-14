@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gateway generations can now roll behind a stable systemd socket proxy: a
+  candidate is verified on its private Unix socket and through the public
+  frontend before the old process gracefully drains admitted and queued work.
+  Health exposes build, installed-code fingerprint, process incarnation and
+  frontend generation; retained units support atomic rollback, and bounded
+  hashed sticky/QoS metadata is shared across generations.
+
 ### Changed
 
 - Local gateway upstreams now use one structured

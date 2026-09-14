@@ -13,7 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from scitex_genai.gateway._cli import INSTALL_UNIT, RESTART_UNIT, build_parser, main
+from scitex_genai.gateway._cli import (
+    INSTALL_ROLLOUT,
+    INSTALL_UNIT,
+    RESTART_UNIT,
+    ROLLBACK,
+    ROLLOUT,
+    build_parser,
+    main,
+)
 from scitex_genai.gateway._secrets import (
     GATEWAY_KEY_ENV,
     default_secrets_path,
@@ -86,6 +94,68 @@ def test_restart_unit_has_bounded_drain_controls():
         90.0,
         0.5,
     )
+
+
+def test_rollout_commands_expose_only_the_coordinated_bootstrap_switch():
+    # Arrange
+    parser = build_parser()
+
+    # Act
+    install = parser.parse_args([INSTALL_ROLLOUT, "--unit-dir", "/units"])
+    promote = parser.parse_args(
+        [
+            ROLLOUT,
+            "--generation",
+            "abc123",
+            "--build",
+            "abc123-full",
+            "--bootstrap-coordinated",
+        ]
+    )
+    rollback = parser.parse_args([ROLLBACK, "--health-timeout-s", "12"])
+
+    # Assert
+    assert (
+        install.command,
+        install.unit_dir,
+        promote.command,
+        promote.bootstrap_coordinated,
+        rollback.command,
+        rollback.health_timeout_s,
+    ) == (
+        INSTALL_ROLLOUT,
+        Path("/units"),
+        ROLLOUT,
+        True,
+        ROLLBACK,
+        12.0,
+    )
+
+
+def test_private_generation_serve_flags_parse_exact_identity_and_socket():
+    # Arrange
+    parser = build_parser()
+
+    # Act
+    args = parser.parse_args(
+        [
+            "--uds",
+            "/run/gateway/blue.sock",
+            "--gateway-build",
+            "full-commit",
+            "--frontend-generation",
+            "blue",
+            "--graceful-rollout-shutdown",
+        ]
+    )
+
+    # Assert
+    assert (
+        args.uds,
+        args.gateway_build,
+        args.frontend_generation,
+        args.graceful_rollout_shutdown,
+    ) == (Path("/run/gateway/blue.sock"), "full-commit", "blue", True)
 
 
 def test_restart_unit_uses_configured_port_and_resolved_key(

@@ -17,6 +17,7 @@ from ._codex import CodexBackend
 from ._drain import DEFAULT_DRAIN_TIMEOUT_S
 from ._errors import GatewayError, UpstreamError
 from ._health import public_upstream_url
+from ._identity import GatewayIdentity, gateway_identity
 from ._inference import (
     InferenceBackend,
     InferenceDrainTimeout,
@@ -28,7 +29,9 @@ from ._opencode import OpenCodeBackend
 from ._secrets import resolve_gateway_key
 
 
-def _build_uvicorn_server(app: Any, **kwargs: Any) -> Any:
+def _build_uvicorn_server(
+    app: Any, *, close_admission_on_shutdown: bool = True, **kwargs: Any
+) -> Any:
     """Build uvicorn with inference admission closed before request draining.
 
     Uvicorn normally waits for active request tasks before running the app's
@@ -46,7 +49,7 @@ def _build_uvicorn_server(app: Any, **kwargs: Any) -> Any:
 
     class AdmissionAwareServer(uvicorn.Server):
         async def shutdown(self, sockets=None) -> None:
-            if isinstance(backend, InferenceBackend):
+            if close_admission_on_shutdown and isinstance(backend, InferenceBackend):
                 await backend.close()
             await super().shutdown(sockets)
 
@@ -138,6 +141,7 @@ def create_app(
     backend: CodexBackend | InferenceBackend | OpenCodeBackend,
     *,
     api_key: str | None = None,
+    identity: GatewayIdentity | None = None,
 ) -> Any:
     """Create the FastAPI app without importing server dependencies at import time.
 
@@ -161,6 +165,7 @@ def create_app(
         raise RuntimeError("Gateway server requires scitex-genai[gateway]") from exc
 
     expected_key = api_key or resolve_gateway_key().value
+    process_identity = identity or gateway_identity()
 
     relaying = isinstance(backend, InferenceBackend)
     opencode = isinstance(backend, OpenCodeBackend)
@@ -242,6 +247,7 @@ def create_app(
                         )
                     },
                     "external": backend.health_status(),
+                    "gateway": process_identity.as_dict(),
                 }
                 if any("token_capacity" in member for member in members):
                     status["input_tokens_in_flight"] = sum(
@@ -302,6 +308,7 @@ def create_app(
                         else "disabled"
                     )
                 },
+                "gateway": process_identity.as_dict(),
             }
             if not active_members and not drain.draining:
                 status["reason"] = (
@@ -321,6 +328,7 @@ def create_app(
             "status": "ok",
             "provider": "openai-codex",
             "accounts": len(backend.pool.accounts),
+            "gateway": process_identity.as_dict(),
         }
 
     @app.post("/v1/messages/count_tokens")
@@ -411,7 +419,9 @@ def create_app(
                     _openai_error("Invalid API key", "authentication_error", 401),
                     401,
                 )
-            return await backend.observability_snapshot()
+            status = await backend.observability_snapshot()
+            status["gateway"] = process_identity.as_dict()
+            return status
 
         @app.post("/admin/drain")
         async def begin_drain(
