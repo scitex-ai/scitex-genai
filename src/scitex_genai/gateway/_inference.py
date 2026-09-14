@@ -95,6 +95,7 @@ from ._sglang_metrics import SGLangSchedulerObservation, probe_sglang_metrics
 TIMEOUT_ENV = "HOIST_TIMEOUT_S"
 PREFIX_TELEMETRY_ENV = "HOIST_PREFIX_TELEMETRY"
 DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_METADATA_TIMEOUT_S = 10.0
 DEFAULT_CAPACITY_PER_UPSTREAM = 8
 DEFAULT_MAX_QUEUE_SIZE = 128
 DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM: int | None = None
@@ -487,6 +488,14 @@ def accepts_session_id(path: str) -> bool:
     """
     route = path.split("?", 1)[0].rstrip("/")
     return route in {"/v1/chat/completions", "/v1/responses"}
+
+
+def is_read_only_control_route(method: str, path: str) -> bool:
+    """Identify model discovery without exempting future compute-bearing GETs."""
+    route = path.split("?", 1)[0].rstrip("/")
+    return method.upper() in {"GET", "HEAD"} and (
+        route == "/v1/models" or route.startswith("/v1/models/")
+    )
 
 
 def inject_request_id(body: bytes | None, request_id: str) -> tuple[bytes | None, bool]:
@@ -1571,6 +1580,12 @@ async def _empty_body() -> AsyncIterator[bytes]:
         yield b""
 
 
+async def _buffered_body(content: bytes) -> AsyncIterator[bytes]:
+    """Yield a bounded control-plane response after its transport is closed."""
+    if content:
+        yield content
+
+
 @dataclass
 class _ReplaySafeAttempt:
     """Replay-safe cold work that has not emitted its first body byte."""
@@ -1770,6 +1785,7 @@ class InferenceBackend:
         pool: InferenceUpstreamPool,
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        metadata_timeout_s: float = DEFAULT_METADATA_TIMEOUT_S,
         telemetry_sink: Callable[[str], None] | None = None,
         wait_for_home_s: float = WAIT_FOR_HOME_S,
         journal: Callable[[str], None] | None = None,
@@ -1790,6 +1806,9 @@ class InferenceBackend:
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
+        if metadata_timeout_s <= 0:
+            raise ValueError("metadata_timeout_s must be > 0")
+        self.metadata_timeout_s = metadata_timeout_s
         self.wait_for_home_s = wait_for_home_s
         # The request journal ([relay] lines) is separate from the opt-in
         # prefix telemetry: it carries no payload and it is the only record
@@ -2170,6 +2189,21 @@ class InferenceBackend:
             raise RuntimeError(
                 "Inference relay requires scitex-genai[gateway]"
             ) from exc
+
+        # Generation admission exists to protect accelerator KV capacity and
+        # preserve conversation locality. Read-only discovery/control calls do
+        # neither. Charging (for example) GET /v1/models as a zero-token,
+        # non-cold ticket can block every cold prefill pinned to that member if
+        # its transport hangs. Keep all read-only routes outside generation
+        # admission and give the complete exchange a short absolute deadline.
+        if is_read_only_control_route(method, path):
+            return await self._relay_read_only_control(
+                method,
+                path,
+                body=body,
+                headers=headers,
+                upstream_path=upstream_path,
+            )
 
         explicit_session = request_session_key(headers)
         qos_session = continuation_qos_session_key(headers)
@@ -2571,41 +2605,24 @@ class InferenceBackend:
                         f"after {time.monotonic() - started:.1f}s"
                     )
                     abort_ok = False
-                    safe_to_release = not self.continuation_qos.enabled
+                    # A request without a gateway-owned engine id is not
+                    # addressable after its transport is cancelled. Never
+                    # shield its send task indefinitely: closing that
+                    # transport is the terminal cleanup event. Addressable
+                    # generation work instead transfers its slot to the abort
+                    # reaper when the immediate abort cannot be confirmed.
+                    safe_to_release = not rid_confirmed
                     if rid_confirmed:
                         abort_ok = await asyncio.shield(
                             self._abort_request(
                                 upstream, dispatch_request_id, headers=forwarded
                             )
                         )
-                    if abort_ok and send_task is not None and not send_task.done():
-                        send_task.cancel()
+                    if abort_ok:
                         safe_to_release = True
-                    elif abort_ok:
-                        safe_to_release = True
-                    elif send_task is not None:
-                        # Without a confirmed engine abort, retain the gateway
-                        # slot until the upstream really finishes.
-                        try:
-                            cancelled_response = (
-                                send_task.result()
-                                if send_task.done()
-                                else await asyncio.shield(send_task)
-                            )
-                            cancelled_stream = (
-                                stream or cancelled_response.aiter_bytes()
-                            )
-                            if first_chunk_task is not None:
-                                try:
-                                    await asyncio.shield(first_chunk_task)
-                                except StopAsyncIteration:
-                                    pass
-                            async for _ in cancelled_stream:
-                                pass
-                            await cancelled_response.aclose()
-                            safe_to_release = True
-                        except BaseException:  # task/transport state is unknown
-                            safe_to_release = False
+                    for task in (send_task, first_chunk_task):
+                        if task is not None and not task.done():
+                            task.cancel()
                     if preempt_task is not None and not preempt_task.done():
                         preempt_task.cancel()
                     if disconnect_task is not None and not disconnect_task.done():
@@ -2769,6 +2786,89 @@ class InferenceBackend:
         finally:
             if not handed_to_stream:
                 self.continuation_qos.finish_continuation(continuation_handoff)
+
+    async def _relay_read_only_control(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None,
+        headers: Mapping[str, str],
+        upstream_path: str | None,
+    ) -> RelayedResponse:
+        """Relay metadata without sticky placement or generation admission."""
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError(
+                "Inference relay requires scitex-genai[gateway]"
+            ) from exc
+
+        forwarded = {
+            name: value
+            for name, value in headers.items()
+            if name.lower() not in _HOP_BY_HOP
+        }
+        failures: list[str] = []
+        now = time.time()
+        deadline = asyncio.get_running_loop().time() + self.metadata_timeout_s
+        # Preserve configured order. Metadata must not mutate or consult the
+        # generation scheduler's usage/sticky state; fall through only when a
+        # member is cooling or fails its own bounded exchange.
+        candidates = [
+            upstream
+            for upstream in self.pool.upstreams
+            if upstream.cooldown_until <= now
+        ]
+        if not candidates:
+            raise UpstreamUnreachable(self.pool.cooling_message)
+
+        for upstream in candidates:
+            started = time.monotonic()
+            try:
+                async with asyncio.timeout_at(deadline):
+                    async with httpx.AsyncClient(
+                        timeout=self.metadata_timeout_s
+                    ) as client:
+                        response = await client.request(
+                            method,
+                            upstream.base_url + (upstream_path or path),
+                            content=body,
+                            headers=forwarded,
+                        )
+                        content = await response.aread()
+            except (TimeoutError, httpx.TransportError) as exc:
+                failures.append(f"{upstream.alias} ({type(exc).__name__})")
+                self._note(
+                    f"[relay-control] -> {upstream.alias} {method} {path} "
+                    f"failed={type(exc).__name__} after "
+                    f"{time.monotonic() - started:.3f}s"
+                )
+                continue
+
+            self._note(
+                f"[relay-control] -> {upstream.alias} {method} {path} "
+                f"status={response.status_code} bytes={len(content)} "
+                f"total_s={time.monotonic() - started:.3f}"
+            )
+            return RelayedResponse(
+                status_code=response.status_code,
+                content_type=response.headers.get("content-type", "application/json"),
+                body=_buffered_body(content),
+                feedback_headers={
+                    "x-scitex-admission-mode": "control-plane-bypass",
+                    "x-scitex-cache-residency": CacheResidency.UNKNOWN.value,
+                    "x-scitex-session-key": "none",
+                },
+            )
+
+        aliases = ", ".join(upstream.alias for upstream in candidates)
+        raise UpstreamUnreachable(
+            "No metadata upstream answered within the independent "
+            f"{self.metadata_timeout_s:g}s deadline: "
+            + "; ".join(failures)
+            + f". Eligible upstreams ({len(candidates)}): {aliases}."
+        )
 
     @staticmethod
     async def _wait_for_client_disconnect(
