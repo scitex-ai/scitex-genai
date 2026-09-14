@@ -61,6 +61,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from ._admission import AdmissionController, CacheResidency
@@ -1647,6 +1648,7 @@ class InferenceBackend:
         cache_report_enabled: bool = False,
         scheduler_probe: Callable[[str, float], Awaitable[SGLangSchedulerObservation]]
         | None = None,
+        admission_history_path: Path | str | None = None,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -1689,7 +1691,9 @@ class InferenceBackend:
         )
         self.cache_report_enabled = cache_report_enabled
         self.relay_metrics = RelayMetrics()
-        self.admission_predictions = AdmissionPredictionTelemetry()
+        self.admission_predictions = AdmissionPredictionTelemetry(
+            state_path=admission_history_path
+        )
         self._engine_generations: dict[str, str | None] = {
             upstream.alias: None for upstream in self.pool.upstreams
         }
@@ -1718,10 +1722,9 @@ class InferenceBackend:
             raise ValueError("engine_generation must be non-empty")
         if running < 0 or queued < 0 or not 0 <= token_usage <= 1:
             raise ValueError("backend scheduler metrics are outside valid bounds")
-        generation = hashlib.sha256(
-            b"scitex-genai-engine-generation-v1\0" + engine_generation.encode()
-        ).hexdigest()[:16]
-        self._engine_generations[upstream] = generation
+        generation = self.observe_engine_generation(
+            upstream=upstream, engine_generation=engine_generation
+        )
         self._backend_scheduler = {
             "state": "observed",
             "upstream": public_upstream_url(upstream),
@@ -1731,6 +1734,22 @@ class InferenceBackend:
             "token_usage": token_usage,
             "reason": "engine-metrics-observed",
         }
+
+    def observe_engine_generation(
+        self, *, upstream: str, engine_generation: str
+    ) -> str:
+        """Bind prediction history to one authoritative engine incarnation."""
+        if upstream not in self._engine_generations:
+            raise ValueError("engine generation names an unknown upstream")
+        if not engine_generation or engine_generation == "unavailable":
+            raise ValueError("engine_generation must be authoritative")
+        generation = hashlib.sha256(
+            b"scitex-genai-engine-generation-v1\0" + engine_generation.encode()
+        ).hexdigest()[:16]
+        if self._engine_generations[upstream] != generation:
+            self._engine_generations[upstream] = generation
+            self.admission_predictions.restore_state(self._engine_generations)
+        return generation
 
     def _backend_observation_failed(self, upstream: str, reason: str) -> None:
         """Make history non-reusable whenever generation cannot be established."""
@@ -2752,6 +2771,7 @@ class InferenceBackend:
                     cached_tokens=token_report.observed_cached_tokens(),
                     cache_tier=token_report.observed_cache_tier(),
                 )
+                self.admission_predictions.save_state(self._engine_generations)
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 total = (

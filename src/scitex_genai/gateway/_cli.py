@@ -45,7 +45,7 @@ from ._secrets import (
     write_key,
 )
 from ._server import create_app, run_uvicorn
-from ._settings import load_settings
+from ._settings import default_admission_history_path, load_settings
 from ._unit import DEFAULT_UNIT_DIR, UNIT_NAME, install_unit
 
 INSTALL_UNIT = "install-unit"
@@ -441,6 +441,7 @@ def main(
                 settings.inference_continuation_qos_min_preempt_tokens
             ),
             cache_report_enabled=settings.inference_cache_report_enabled,
+            admission_history_path=default_admission_history_path(),
         )
         print(announce(settings.host, settings.port, pool), flush=True)
     else:

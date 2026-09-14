@@ -213,6 +213,17 @@ option defaults to false because arbitrary OpenAI-compatible providers may
 reject the SGLang-only request field.  Prompts, generated text, credentials,
 and raw session identifiers are never journaled.
 
+The gateway keeps the bounded admission predictor across a gateway-only
+restart in ``~/.scitex/genai/runtime/admission-history.json``.  The file is an
+atomic, mode-0600 handoff artifact, not conversation storage: it contains only
+hashed session and upstream labels, lineage digests, token counts, cache tier,
+the hashed engine generation, and timestamps.  Entries expire after 300
+seconds.  The gateway restores an entry only after its engine probe supplies
+the same authoritative generation; an absent or changed generation is a cold,
+unknown prediction and never reuses the file.  This is deliberately local
+rather than Postgres state: the hint describes one node-local KV-cache
+incarnation and must not acquire cross-host availability or durability.
+
 The gateway releases its reservation after closing a disconnected upstream
 HTTP stream.  The inference engine must actually abort that request too.
 SGLang regressions `#36333 <https://github.com/sgl-project/sglang/issues/36333>`_

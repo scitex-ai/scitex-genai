@@ -1,4 +1,6 @@
 import json
+import stat
+from pathlib import Path
 
 import pytest
 
@@ -328,6 +330,166 @@ def test_observations_and_recent_rows_are_bounded() -> None:
         len(snapshot["recent"]),
         "session-" not in json.dumps(snapshot),
     ) == (2, 2, True)
+
+
+def test_fresh_matching_generation_history_survives_gateway_restart(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    now = [1_000.0]
+    path = tmp_path / "runtime" / "admission-history.json"
+    first = AdmissionPredictionTelemetry(
+        clock=lambda: now[0], wall_clock=lambda: now[0], state_path=path
+    )
+    prior = [{"role": "user", "content": "private prompt"}]
+    _observe(
+        first,
+        messages=prior,
+        estimated=640_000,
+        reported=640_000,
+        cached=639_000,
+        generation="engine-a",
+    )
+    saved = first.save_state({"upstream": "engine-a"})
+    now[0] += 1
+    restarted = AdmissionPredictionTelemetry(
+        clock=lambda: now[0], wall_clock=lambda: now[0], state_path=path
+    )
+
+    # Act
+    restored = restarted.restore_state({"upstream": "engine-a"})
+    prediction = restarted.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(prior + [{"role": "user", "content": "next"}]),
+        estimated_input_tokens=641_000,
+    )
+
+    # Assert
+    serialized = path.read_text(encoding="utf-8")
+    assert (
+        saved,
+        restored,
+        prediction.evidence,
+        prediction.predicted_uncached_tokens,
+        "private prompt" in serialized,
+        '"session"' in serialized,
+        "http://" in serialized,
+        stat.S_IMODE(path.stat().st_mode),
+    ) == (True, 1, "historical-lineage-extension", 2_000, False, False, False, 0o600)
+
+
+@pytest.mark.parametrize(
+    ("generation", "elapsed"),
+    (("engine-b", 1.0), ("engine-a", 300.001), ("unavailable", 1.0)),
+)
+def test_history_is_not_restored_for_wrong_unknown_or_expired_engine(
+    tmp_path: Path, generation: str, elapsed: float
+) -> None:
+    # Arrange
+    now = [1_000.0]
+    path = tmp_path / "admission-history.json"
+    first = AdmissionPredictionTelemetry(
+        clock=lambda: now[0], wall_clock=lambda: now[0], state_path=path
+    )
+    messages = [{"role": "user", "content": "one"}]
+    _observe(
+        first,
+        messages=messages,
+        estimated=100,
+        reported=100,
+        cached=100,
+        generation="engine-a",
+    )
+    first.save_state({"upstream": "engine-a"})
+    now[0] += elapsed
+    restarted = AdmissionPredictionTelemetry(
+        clock=lambda: now[0], wall_clock=lambda: now[0], state_path=path
+    )
+
+    # Act
+    restored = restarted.restore_state({"upstream": generation})
+    prediction = restarted.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation=generation,
+        body=_body(messages),
+        estimated_input_tokens=100,
+    )
+
+    # Assert
+    assert (restored, prediction.evidence, prediction.predicted_uncached_tokens) == (
+        0,
+        "no-compatible-history",
+        100,
+    )
+
+
+def test_partial_engine_identity_never_overwrites_prior_handoff(tmp_path: Path) -> None:
+    # Arrange
+    path = tmp_path / "admission-history.json"
+    telemetry = AdmissionPredictionTelemetry(state_path=path)
+    path.write_text("keep until every engine is identified", encoding="utf-8")
+
+    # Act
+    saved = telemetry.save_state(
+        {"http://one:1": "generation-one", "http://two:2": "unavailable"}
+    )
+
+    # Assert
+    assert (saved, path.read_text(encoding="utf-8")) == (
+        False,
+        "keep until every engine is identified",
+    )
+
+
+def test_backend_generation_hook_restores_only_after_authoritative_identity(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    path = tmp_path / "admission-history.json"
+    upstream = "http://engine:1"
+    first = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream), admission_history_path=path
+    )
+    generation = first.observe_engine_generation(
+        upstream=upstream, engine_generation="pid-123-start-456"
+    )
+    messages = [{"role": "user", "content": "one"}]
+    prediction = first.admission_predictions.predict(
+        session_id="session",
+        upstream=upstream,
+        engine_generation=generation,
+        body=_body(messages),
+        estimated_input_tokens=100,
+    )
+    first.admission_predictions.observe(
+        prediction,
+        session_id="session",
+        upstream=upstream,
+        reported_input_tokens=100,
+        cached_tokens=100,
+        cache_tier="device",
+    )
+    first.admission_predictions.save_state(first._engine_generations)
+    restarted = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream), admission_history_path=path
+    )
+
+    # Act
+    before = restarted.admission_predictions.snapshot()["observations"]
+    restarted.observe_engine_generation(
+        upstream=upstream, engine_generation="pid-123-start-456"
+    )
+    after = restarted.admission_predictions.snapshot()
+
+    # Assert
+    assert (before, after["observations"], after["state_handoff"]["restored"]) == (
+        0,
+        1,
+        1,
+    )
 
 
 @pytest.mark.asyncio
