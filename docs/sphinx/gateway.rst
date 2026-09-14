@@ -136,6 +136,11 @@ The engine's request limit (for example SGLang
 Drained deployment restart
 --------------------------
 
+For continuously active fleets, use the permanent blue/green frontend and
+generation rollout described in ``docs/GATEWAY_ZERO_LOSS_ROLLOUT.md``. The
+one-time migration from the legacy direct listener requires a coordinated
+client pause; later rollouts do not.
+
 Restart through the package command, not ``systemctl restart`` directly::
 
    scitex-genai-gateway restart-unit --drain-timeout-s 1800

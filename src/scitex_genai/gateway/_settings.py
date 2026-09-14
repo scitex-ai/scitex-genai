@@ -219,6 +219,11 @@ def default_admission_history_path() -> Path:
     return Path(get_scitex_dir()) / "genai" / "runtime" / "admission-history.json"
 
 
+def default_gateway_session_state_path() -> Path:
+    """Payload-free sticky/QoS metadata shared by rolling generations."""
+    return Path(get_scitex_dir()) / "genai" / "runtime" / "gateway-session-state.json"
+
+
 def check_host(host: Any) -> str:
     """A bare address or name: non-empty, no whitespace."""
     text = str(host)

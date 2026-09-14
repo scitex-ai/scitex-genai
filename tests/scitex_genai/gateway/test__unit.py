@@ -16,10 +16,16 @@ import pytest
 
 from scitex_genai.gateway._unit import (
     DEFAULT_UNIT_DIR,
+    FRONTEND_SERVICE_UNIT,
+    FRONTEND_SOCKET_UNIT,
     MODULE,
     UNIT_NAME,
     gateway_command,
+    install_rollout_frontend,
     install_unit,
+    render_backend_unit,
+    render_frontend_service,
+    render_frontend_socket,
     render_unit,
 )
 
@@ -374,3 +380,74 @@ def test_default_unit_dir_is_the_user_manager_directory():
 
     # Assert
     assert DEFAULT_UNIT_DIR == expected
+
+
+def test_rollout_frontend_uses_systemd_socket_proxy_without_request_retries():
+    # Arrange
+    current_socket = "/run/user/1000/scitex-genai-gateway/current.sock"
+
+    # Act
+    socket = _sections(render_frontend_socket(host="0.0.0.0", port=18772))
+    service = _sections(render_frontend_service(current_socket=current_socket))
+
+    # Assert
+    assert (
+        socket["Socket"]["ListenStream"],
+        socket["Socket"]["Service"],
+        service["Service"]["ExecStart"].split()[0],
+    ) == (
+        "0.0.0.0:18772",
+        FRONTEND_SERVICE_UNIT,
+        "/usr/lib/systemd/systemd-socket-proxyd",
+    )
+
+
+def test_generation_backend_has_private_socket_and_unbounded_graceful_stop():
+    # Arrange
+    socket = "/run/user/1000/scitex-genai-gateway/a1.sock"
+    command = gateway_command(
+        interpreter="/deploy/a1/venv/bin/python",
+        config="/deploy/a1/config.yaml",
+        uds=socket,
+        gateway_build="commit-a1",
+        gateway_incarnation="process-a1",
+        frontend_generation="a1",
+        graceful_rollout_shutdown=True,
+    )
+    # Act
+    sections = _sections(
+        render_backend_unit(command=command, socket_path=socket, generation="a1")
+    )
+    service = sections["Service"]
+
+    # Assert
+    assert (
+        "--uds" in shlex.split(service["ExecStart"]),
+        "--graceful-rollout-shutdown" in shlex.split(service["ExecStart"]),
+        service["TimeoutStopSec"],
+        service["Restart"],
+        sections["Install"]["WantedBy"],
+    ) == (True, True, "infinity", "on-failure", "default.target")
+
+
+def test_rollout_frontend_install_only_writes_and_reloads(tmp_path: Path):
+    # Arrange
+    calls: list[list[str]] = []
+
+    # Act
+    paths = install_rollout_frontend(
+        host="127.0.0.1",
+        port=18772,
+        current_socket=tmp_path / "run" / "current.sock",
+        unit_dir=tmp_path,
+        runner=_record(calls),
+    )
+
+    # Assert
+    assert (
+        {path.name for path in paths},
+        calls,
+    ) == (
+        {FRONTEND_SOCKET_UNIT, FRONTEND_SERVICE_UNIT},
+        [["systemctl", "--user", "daemon-reload"]],
+    )
