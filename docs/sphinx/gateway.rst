@@ -89,10 +89,12 @@ with explicit members:
        url: http://127.0.0.1:18774
        token_capacity: 500000
 
-The measured TP=1 engine reports ``max_total_num_tokens=563215``, already lower
-than its one-million-token configured context ceiling; the example uses a
-500,000-token gateway budget to retain headroom. Context validity is not
-resident KV capacity. New sessions are placed
+The production TP=1 512k and 256k profiles report measured
+``max_total_num_tokens`` values of 565,263 and 572,149 respectively. Their
+gateway budgets remain 500,000 and 250,000 tokens: the engine totals are not
+budgets, and the lower values retain output and estimation headroom. See
+``docs/QWEN_TP1_PROFILES.md`` in the source tree for the exact profile-to-port
+mapping. Context validity is not resident KV capacity. New sessions are placed
 only on members that can ever fit their current estimated input. If a pinned
 session grows beyond its member's hard capacity, it is deliberately repinned
 to a capable member and pays one cold-cache turn; if no member fits, admission

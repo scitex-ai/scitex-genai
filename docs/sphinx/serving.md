@@ -5,6 +5,12 @@ single-port inference gateway. Model settings live in
 `~/.scitex/genai/models.d/<key>.conf`; start from the tracked
 `examples/serve/qwen38-27b-sglang.conf` profiles.
 
+The measured one-H100 512k and 256k production profiles, their distinct
+ports, launch commands, and conservative gateway budgets are documented in
+`docs/QWEN_TP1_PROFILES.md` in the source tree. They run through the same
+supervisor described here; the older TP=1 context-concurrency fixture remains
+an isolated benchmark and is not a production launcher.
+
 ## Session-aware SGLang caching
 
 Cache locality has three separate parts:
