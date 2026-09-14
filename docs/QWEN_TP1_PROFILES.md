@@ -39,10 +39,10 @@ ownership explicit even if the two leases land on different nodes:
 
 ```console
 scitex-genai-serve launch qwen-tp1-512k \
-  --lease qwen-tp1-512k --host spartan --gpus h100:1 \
+  --lease qwen-tp1-512k --host hpc --gpus h100:1 \
   --partition gpu-h100 --time 7-00:00:00
 scitex-genai-serve launch qwen-tp1-256k \
-  --lease qwen-tp1-256k --host spartan --gpus h100:1 \
+  --lease qwen-tp1-256k --host hpc --gpus h100:1 \
   --partition gpu-h100 --time 7-00:00:00
 ```
 
