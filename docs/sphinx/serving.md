@@ -26,6 +26,13 @@ is refused instead of silently starting without session retention. The
 canonical Qwen profiles enable metrics for cache/eviction observation on the
 next controlled server activation.
 
+Each supervised SGLang process start also receives a fresh opaque
+`scitex_engine_generation` label through `--extra-metric-labels`. The gateway
+consumes that label from the scheduler gauges to prevent cache-report history
+from surviving an engine restart. The label is process identity only; it
+contains no model, host, job, request, or session data. The name is reserved by
+`scitex-genai serve` if a profile supplies other extra labels.
+
 Clients should send a stable `X-SciTeX-Session-ID` header. The compatibility
 headers `session_id` and `x-session-id` are also accepted, in that order after
 the canonical header. The gateway replaces the raw value with a bounded,

@@ -16,6 +16,7 @@ driven in tests with hand-written doubles on real temporary directories.
 
 from __future__ import annotations
 
+import secrets
 import subprocess
 import threading
 import time
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ._ready import READY, Readiness, probe_health, wait_ready
-from ._render import CACHE_SUBDIRS, Launch
+from ._render import CACHE_SUBDIRS, SGLANG_ENGINE_GENERATION_PLACEHOLDER, Launch
 
 Popen = Callable[..., Any]
 Log = Callable[[str], None]
@@ -51,6 +52,7 @@ class EngineRunner:
         tunnel_retry_s: float = 20.0,
         idle_limit_s: float = 1800.0,
         poll_s: float = 15.0,
+        engine_generation_factory: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
         self.launch = launch
         self._popen = popen
@@ -63,6 +65,7 @@ class EngineRunner:
         self.tunnel_retry_s = tunnel_retry_s
         self.idle_limit_s = idle_limit_s
         self.poll_s = poll_s
+        self._engine_generation_factory = engine_generation_factory
         self._stop = threading.Event()
         self._tunnel_thread: threading.Thread | None = None
         self._sidecar_thread: threading.Thread | None = None
@@ -180,9 +183,24 @@ class EngineRunner:
         self._append(
             self.launch.engine_log, f"[{_stamp()}] starting engine {self.launch.key}"
         )
-        proc = self._spawn(
-            self.launch.engine_argv, self.launch.engine_log, self.launch.env
-        )
+        engine_argv = self.launch.engine_argv
+        if self.launch.engine_name == "sglang":
+            generation = self._engine_generation_factory()
+            if len(generation) != 32 or any(
+                ch not in "0123456789abcdef" for ch in generation
+            ):
+                raise RuntimeError(
+                    "engine generation factory must return lowercase hex"
+                )
+            engine_argv = tuple(
+                value.replace(SGLANG_ENGINE_GENERATION_PLACEHOLDER, generation)
+                for value in engine_argv
+            )
+            if engine_argv == self.launch.engine_argv:
+                raise RuntimeError(
+                    "SGLang launch is missing its generation placeholder"
+                )
+        proc = self._spawn(engine_argv, self.launch.engine_log, self.launch.env)
         readiness = wait_ready(
             self.launch.health_url,
             process_alive=lambda: proc.poll() is None,

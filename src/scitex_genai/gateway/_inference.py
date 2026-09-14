@@ -80,6 +80,7 @@ from ._health import (
 )
 from ._pool import StickyPool
 from ._prediction import AdmissionPrediction, AdmissionPredictionTelemetry
+from ._sglang_metrics import SGLangSchedulerObservation, probe_sglang_metrics
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
 #: working unchanged. Comma-separated base URLs, seconds, and a truthy flag.
@@ -1644,6 +1645,8 @@ class InferenceBackend:
             DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
         ),
         cache_report_enabled: bool = False,
+        scheduler_probe: Callable[[str, float], Awaitable[SGLangSchedulerObservation]]
+        | None = None,
     ) -> None:
         self.pool = pool
         self.timeout_s = timeout_s
@@ -1669,6 +1672,11 @@ class InferenceBackend:
         self._health_probe_lock = asyncio.Lock()
         self._health_probe_task: asyncio.Task[list[UpstreamReachability]] | None = None
         self._health_cache: tuple[float, list[UpstreamReachability]] | None = None
+        self._scheduler_probe = scheduler_probe
+        self._scheduler_probe_lock = asyncio.Lock()
+        self._scheduler_probe_tasks: dict[
+            str, asyncio.Task[SGLangSchedulerObservation]
+        ] = {}
         self._health_failures = {upstream.alias: 0 for upstream in self.pool.upstreams}
         # SAC/Hermes currently supplies stable identity but no authoritative
         # pre-admission cache-residency result. Record UNKNOWN observations;
@@ -1682,8 +1690,8 @@ class InferenceBackend:
         self.cache_report_enabled = cache_report_enabled
         self.relay_metrics = RelayMetrics()
         self.admission_predictions = AdmissionPredictionTelemetry()
-        self._engine_generations = {
-            upstream.alias: "unavailable" for upstream in self.pool.upstreams
+        self._engine_generations: dict[str, str | None] = {
+            upstream.alias: None for upstream in self.pool.upstreams
         }
         self._backend_scheduler: dict[str, Any] = {
             "state": "unobserved",
@@ -1724,8 +1732,54 @@ class InferenceBackend:
             "reason": "engine-metrics-observed",
         }
 
+    def _backend_observation_failed(self, upstream: str, reason: str) -> None:
+        """Make history non-reusable whenever generation cannot be established."""
+        self._engine_generations[upstream] = None
+        self._backend_scheduler = {
+            "state": "unobserved",
+            "upstream": public_upstream_url(upstream),
+            "engine_generation": "unavailable",
+            "running": None,
+            "queued": None,
+            "token_usage": None,
+            "reason": reason,
+        }
+
+    async def refresh_backend_scheduler(self, upstream: str) -> None:
+        """Coalesce a generation-bearing SGLang metrics probe for one upstream."""
+        async with self._scheduler_probe_lock:
+            task = self._scheduler_probe_tasks.get(upstream)
+            if task is None:
+                probe = self._scheduler_probe or probe_sglang_metrics
+                task = asyncio.create_task(probe(upstream, self.health_probe_timeout_s))
+                self._scheduler_probe_tasks[upstream] = task
+        try:
+            observation = await asyncio.shield(task)
+        except Exception as exc:  # metrics absence is fail-closed, never a relay outage
+            self._backend_observation_failed(
+                upstream, f"engine-metrics-{type(exc).__name__.lower()}"
+            )
+        else:
+            self.observe_backend_scheduler(
+                upstream=upstream,
+                engine_generation=observation.engine_generation,
+                running=observation.running,
+                queued=observation.queued,
+                token_usage=observation.token_usage,
+            )
+        finally:
+            async with self._scheduler_probe_lock:
+                if self._scheduler_probe_tasks.get(upstream) is task and task.done():
+                    self._scheduler_probe_tasks.pop(upstream, None)
+
     async def observability_snapshot(self) -> dict[str, Any]:
         """Return the stable operator-facing status document."""
+        await asyncio.gather(
+            *(
+                self.refresh_backend_scheduler(upstream.alias)
+                for upstream in self.pool.upstreams
+            )
+        )
         admission = await self.pool.observability_snapshot()
         admission["cumulative"].update(self.relay_metrics.snapshot())
         queued_tickets = [
@@ -1975,6 +2029,7 @@ class InferenceBackend:
                     predicted_alias = await self.pool.route_alias(
                         routing_session, exclude=attempted
                     )
+                    await self.refresh_backend_scheduler(predicted_alias)
                     prediction = self.admission_predictions.predict(
                         session_id=routing_session,
                         upstream=predicted_alias,
