@@ -87,7 +87,7 @@ def render_hold_body(
         "  local key=$1",
         "  while true; do",
         '    echo "[serve-launch] $(date -u +%FT%TZ) starting step for $key" >&2',
-        '    "$SRUN" --overlap --ntasks=1 --exact bash -c "$SERVE $key"',
+        '    "$SRUN" --overlap --nodes=1 --ntasks=1 --exact --gres=gpu:1 bash -c "$SERVE $key"',
         "    rc=$?",
         f'    echo "[serve-launch] $(date -u +%FT%TZ) step $key exited rc=$rc; restart in {restart_s}s" >&2',
         '    if [ "$rc" -eq 127 ]; then',
