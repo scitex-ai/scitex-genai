@@ -125,18 +125,28 @@ QoS, not a claim that an engine prefix is currently resident.
 
 For supported OpenAI routes, the gateway replaces any caller ``rid`` with a
 fresh opaque SGLang request ID. If a proven continuation targets an upstream
-where a first turn is still waiting for response headers, the gateway posts
-that ID to the same upstream's ``/abort_request``, closes the old transport,
-waits for its capacity release, runs the continuation, and then replays the
-fully buffered first-turn body. It never preempts after response headers have
-been exposed. Retry count is bounded by
+where replay-safe cold work has not produced its first response-body byte, the
+gateway posts that ID to the same upstream's ``/abort_request``, closes the old
+transport, waits for its capacity release, runs the continuation, and then
+replays the fully buffered body. Upstream headers do not end eligibility:
+SGLang can send them before prefill produces a token. The first body byte does,
+so work whose output may have reached the caller is never replayed. Retry count
+is bounded by
 ``inference_continuation_qos_max_retries`` (default 1), and an unconfirmed
 abort refuses the continuation instead of dispatching both requests together.
-Only first turns at or above
-``inference_continuation_qos_min_preempt_tokens`` are eligible. That threshold
-defaults to 0 for simple semantics; deployments should set it from measured
-harmful cold-prefill sizes (400,000 estimated tokens in the current measured
-fleet), rather than making small requests pay an abort/replay cycle.
+Eligible work is a first turn, a request classified as a large uncached
+prefill, or a continuation whose last cache report came from host or storage.
+It must also meet ``inference_continuation_qos_min_preempt_tokens``. A
+predicted-cold or host/storage-restored continuation joins that replay-safe
+victim class; only a predicted-hot continuation initiates a handoff or receives
+continuation admission priority. The token threshold defaults to 0 for simple
+semantics; deployments should set it from
+measured harmful cold-prefill sizes (400,000 estimated tokens in the current
+measured fleet), rather than making small requests pay an abort/replay cycle.
+Predicted-cold work also waits while any non-cold request is already in flight
+on its upstream. This protects decoding that has passed the replay boundary;
+the existing bounded-bypass admission rule eventually drains new work so the
+older cold ticket cannot starve.
 
 The corresponding CLI/unit flags are ``--inference-continuation-qos`` (or
 ``--no-inference-continuation-qos``) and

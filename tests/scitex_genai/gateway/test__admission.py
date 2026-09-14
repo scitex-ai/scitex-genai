@@ -441,7 +441,7 @@ async def test_finished_upstream_releases_when_slow_client_closes_stream() -> No
 
 
 @pytest.mark.asyncio
-async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
+async def test_aged_uncached_work_waits_for_all_non_cold_work_to_finish() -> None:
     # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
@@ -465,15 +465,15 @@ async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
 
     # Act
     await pool.release(cold, input_tokens=200, session_id="cold")
-    next_member = await asyncio.wait_for(aged, 1)
-    priority_waited = priority.done() is False
-    await pool.release(next_member, input_tokens=200, session_id="aged")
     next_priority = await asyncio.wait_for(priority, 1)
+    cold_waited = aged.done() is False
     await pool.release(blocker, input_tokens=1, session_id="blocker")
     await pool.release(next_priority, input_tokens=1, session_id="priority")
+    next_member = await asyncio.wait_for(aged, 1)
+    await pool.release(next_member, input_tokens=200, session_id="aged")
 
     # Assert
-    assert priority_waited is True
+    assert cold_waited is True
 
 
 @pytest.mark.asyncio

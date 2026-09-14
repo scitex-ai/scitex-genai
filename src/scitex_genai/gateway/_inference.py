@@ -1144,13 +1144,13 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         for ticket in waiters:
             self._expire_cache_prediction(ticket, now)
         oldest = waiters[0]
-        token_blocked = (
-            oldest.session_id not in self._active_sessions
-            and member.token_capacity is not None
-            and member.input_tokens_in_flight + oldest.input_tokens
-            > member.token_capacity
+        oldest_blocked = not self._fits(
+            member,
+            oldest.input_tokens,
+            oldest.session_id,
+            oldest.cold_prefill,
         )
-        if token_blocked and oldest.bypasses >= self.max_admission_bypasses:
+        if oldest_blocked and oldest.bypasses >= self.max_admission_bypasses:
             return None
 
         fitting = [
@@ -1211,9 +1211,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cold_prefill: bool = False,
     ) -> bool:
         token_capacity = member.token_capacity
+        running = self._running_tickets[member.alias]
         return (
             session_id not in self._active_sessions
             and member.in_flight < member.capacity
+            and (not cold_prefill or all(ticket.cold_prefill for ticket in running))
             and (
                 not cold_prefill
                 or self.cold_prefill_limit_per_upstream is None
@@ -1231,6 +1233,10 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             return "session-serialization"
         if member.in_flight >= member.capacity:
             return "request-capacity"
+        if ticket.cold_prefill and any(
+            not running.cold_prefill for running in self._running_tickets[member.alias]
+        ):
+            return "hot-work-in-flight"
         if (
             ticket.cold_prefill
             and self.cold_prefill_limit_per_upstream is not None
@@ -1466,10 +1472,11 @@ async def _empty_body() -> AsyncIterator[bytes]:
 
 
 @dataclass
-class _FirstTurnAttempt:
-    """A replay-safe first turn currently waiting for response headers."""
+class _ReplaySafeAttempt:
+    """Replay-safe cold work that has not emitted its first body byte."""
 
     upstream_alias: str
+    admission_class: str
     preempt: asyncio.Event = field(default_factory=asyncio.Event)
     resume_after: asyncio.Future[None] | None = None
     released: asyncio.Future[None] | None = None
@@ -1479,6 +1486,17 @@ class _FirstTurnAttempt:
 class _ContinuationHandoff:
     resume_first_turn: asyncio.Future[None]
     victim_released: asyncio.Future[None]
+
+
+def _replay_safe_for_preemption(
+    *, admission_class: str, cold_prefill: bool, prior_cache_tier: str
+) -> bool:
+    """Whether unfinished work may yield to a latency-sensitive continuation."""
+    return (
+        admission_class == "first-turn"
+        or cold_prefill
+        or prior_cache_tier in {"host", "storage"}
+    )
 
 
 class ContinuationQoS:
@@ -1504,7 +1522,7 @@ class ContinuationQoS:
         self.max_retries = max_retries
         self.min_preempt_tokens = min_preempt_tokens
         self._successful: OrderedDict[str, None] = OrderedDict()
-        self._first_turns: dict[str, deque[_FirstTurnAttempt]] = {}
+        self._replay_safe: dict[str, deque[_ReplaySafeAttempt]] = {}
         self._counters = {
             "first_turn": 0,
             "continuation": 0,
@@ -1512,6 +1530,8 @@ class ContinuationQoS:
             "preemptions_requested": 0,
             "first_turns_preempted": 0,
             "first_turn_retries": 0,
+            "cold_continuations_preempted": 0,
+            "cold_continuation_retries": 0,
             "retry_budget_exhausted": 0,
             "abort_failures": 0,
             "unconfirmed_cleanup_holds": 0,
@@ -1540,13 +1560,15 @@ class ContinuationQoS:
         while len(self._successful) > MAX_ROUTES:
             self._successful.popitem(last=False)
 
-    def register_first_turn(self, upstream_alias: str) -> _FirstTurnAttempt:
-        attempt = _FirstTurnAttempt(upstream_alias)
-        self._first_turns.setdefault(upstream_alias, deque()).append(attempt)
+    def register_replay_safe(
+        self, upstream_alias: str, *, admission_class: str = "first-turn"
+    ) -> _ReplaySafeAttempt:
+        attempt = _ReplaySafeAttempt(upstream_alias, admission_class)
+        self._replay_safe.setdefault(upstream_alias, deque()).append(attempt)
         return attempt
 
-    def unregister_first_turn(self, attempt: _FirstTurnAttempt) -> None:
-        attempts = self._first_turns.get(attempt.upstream_alias)
+    def unregister_replay_safe(self, attempt: _ReplaySafeAttempt) -> None:
+        attempts = self._replay_safe.get(attempt.upstream_alias)
         if attempts is None:
             return
         try:
@@ -1554,11 +1576,11 @@ class ContinuationQoS:
         except ValueError:
             pass
         if not attempts:
-            self._first_turns.pop(attempt.upstream_alias, None)
+            self._replay_safe.pop(attempt.upstream_alias, None)
 
     def request_preemption(self, upstream_alias: str) -> _ContinuationHandoff | None:
         """Signal one replay-safe first turn and return its continuation barrier."""
-        attempts = self._first_turns.get(upstream_alias, ())
+        attempts = self._replay_safe.get(upstream_alias, ())
         victim = next((item for item in attempts if not item.preempt.is_set()), None)
         if victim is None:
             return None
@@ -1570,11 +1592,17 @@ class ContinuationQoS:
         self._counters["preemptions_requested"] += 1
         return _ContinuationHandoff(barrier, released)
 
-    def preempted(self) -> None:
-        self._counters["first_turns_preempted"] += 1
+    def preempted(self, admission_class: str = "first-turn") -> None:
+        if admission_class == "continuation":
+            self._counters["cold_continuations_preempted"] += 1
+        else:
+            self._counters["first_turns_preempted"] += 1
 
-    def retried(self) -> None:
-        self._counters["first_turn_retries"] += 1
+    def retried(self, admission_class: str = "first-turn") -> None:
+        if admission_class == "continuation":
+            self._counters["cold_continuation_retries"] += 1
+        else:
+            self._counters["first_turn_retries"] += 1
 
     def exhausted(self) -> None:
         self._counters["retry_budget_exhausted"] += 1
@@ -1615,7 +1643,17 @@ class ContinuationQoS:
             "max_retries": self.max_retries,
             "min_preempt_tokens": self.min_preempt_tokens,
             "known_successful_sessions": len(self._successful),
-            "replay_safe_first_turns": sum(map(len, self._first_turns.values())),
+            "replay_safe_attempts": sum(map(len, self._replay_safe.values())),
+            "replay_safe_first_turns": sum(
+                attempt.admission_class == "first-turn"
+                for attempts in self._replay_safe.values()
+                for attempt in attempts
+            ),
+            "replay_safe_cold_continuations": sum(
+                attempt.admission_class == "continuation"
+                for attempts in self._replay_safe.values()
+                for attempt in attempts
+            ),
             **self._counters,
         }
 
@@ -2033,16 +2071,6 @@ class InferenceBackend:
         continuation_handoff: _ContinuationHandoff | None = None
         handed_to_stream = False
         try:
-            if qos_kind == "continuation":
-                target_alias = await self.pool.route_alias(routing_session)
-                continuation_handoff = self.continuation_qos.request_preemption(
-                    target_alias
-                )
-                if continuation_handoff is not None:
-                    # Do not overlap at the engine: capacity=2 means gateway
-                    # admission alone cannot tell that the continuation is
-                    # queued behind a long prefill inside SGLang.
-                    await continuation_handoff.victim_released
             while len(attempted) < len(self.pool.upstreams):
                 try:
                     predicted_alias = await self.pool.route_alias(
@@ -2072,6 +2100,12 @@ class InferenceBackend:
                         and prediction.predicted_uncached_tokens
                         >= (self.pool.cold_prefill_min_tokens or 1)
                     )
+                    replay_safe = _replay_safe_for_preemption(
+                        admission_class=qos_kind,
+                        cold_prefill=cold_prefill,
+                        prior_cache_tier=prediction.prior_cache_tier,
+                    )
+                    latency_sensitive = qos_kind == "continuation" and not replay_safe
                     feedback_headers["x-scitex-admission-mode"] = (
                         "uncached-prefill"
                         if self.pool.cold_prefill_limit_per_upstream is not None
@@ -2080,11 +2114,20 @@ class InferenceBackend:
                     feedback_headers["x-scitex-cache-residency"] = (
                         cache_classification.value
                     )
+                    if latency_sensitive and continuation_handoff is None:
+                        continuation_handoff = self.continuation_qos.request_preemption(
+                            predicted_alias
+                        )
+                        if continuation_handoff is not None:
+                            # Do not overlap at the engine: capacity=2 means
+                            # gateway admission alone cannot tell that this hot
+                            # continuation is queued behind a long prefill.
+                            await continuation_handoff.victim_released
                     upstream = await self._acquire_while_connected(
                         routing_session,
                         exclude=attempted,
                         input_tokens=input_tokens,
-                        priority=qos_kind == "continuation",
+                        priority=latency_sensitive,
                         cold_prefill=cold_prefill,
                         admission_class=qos_kind,
                         cache_classification=cache_classification.value,
@@ -2180,16 +2223,70 @@ class InferenceBackend:
                 disconnect_stop: asyncio.Event | None = None
                 first_chunk_task: asyncio.Task[bytes] | None = None
                 stream: AsyncIterator[bytes] | None = None
-                first_attempt = None
+                replay_attempt = None
                 if (
-                    qos_kind == "first-turn"
+                    replay_safe
                     and rid_confirmed
                     and input_tokens >= self.continuation_qos.min_preempt_tokens
                     and replay_count < self.continuation_qos.max_retries
                 ):
-                    first_attempt = self.continuation_qos.register_first_turn(
-                        upstream.alias
+                    replay_attempt = self.continuation_qos.register_replay_safe(
+                        upstream.alias, admission_class=qos_kind
                     )
+
+                async def preempt_for_continuation() -> bool:
+                    """Abort and release this replay-safe attempt before retry."""
+                    nonlocal replay_attempt, preempt_task
+                    assert replay_attempt is not None
+                    abort_ok = await self._abort_request(
+                        upstream, dispatch_request_id, headers=forwarded
+                    )
+                    if not abort_ok:
+                        if (
+                            replay_attempt.released is not None
+                            and not replay_attempt.released.done()
+                        ):
+                            replay_attempt.released.set_exception(
+                                InferenceAdmissionError(
+                                    "Continuation QoS could not confirm upstream abort"
+                                )
+                            )
+                        self.continuation_qos.unregister_replay_safe(replay_attempt)
+                        replay_attempt = None
+                        preempt_task = None
+                        return False
+                    for task in (send_task, first_chunk_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(
+                            task
+                            for task in (send_task, first_chunk_task)
+                            if task is not None
+                        ),
+                        return_exceptions=True,
+                    )
+                    admission_class = replay_attempt.admission_class
+                    self.continuation_qos.preempted(admission_class)
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} <- "
+                        f"{upstream.alias} cooperatively_preempted_before_first_byte"
+                    )
+                    await asyncio.shield(client.aclose())
+                    await release_slot()
+                    if (
+                        replay_attempt.released is not None
+                        and not replay_attempt.released.done()
+                    ):
+                        replay_attempt.released.set_result(None)
+                    barrier = replay_attempt.resume_after
+                    self.continuation_qos.unregister_replay_safe(replay_attempt)
+                    replay_attempt = None
+                    if barrier is not None:
+                        await barrier
+                    self.continuation_qos.retried(admission_class)
+                    return True
+
                 try:
                     request = client.build_request(
                         method,
@@ -2208,8 +2305,10 @@ class InferenceBackend:
                                 client_disconnected, stop=disconnect_stop
                             )
                         )
-                    if first_attempt is not None:
-                        preempt_task = asyncio.create_task(first_attempt.preempt.wait())
+                    if replay_attempt is not None:
+                        preempt_task = asyncio.create_task(
+                            replay_attempt.preempt.wait()
+                        )
                     waiters = tuple(
                         task
                         for task in (send_task, preempt_task, disconnect_task)
@@ -2220,70 +2319,18 @@ class InferenceBackend:
                             waiters,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        # Upstream headers end preemption eligibility, but do
-                        # not prove that a streaming body exists. Keep the
-                        # downstream monitor alive until the first body byte.
                         if send_task is not None and send_task in done:
-                            for task in (preempt_task,):
-                                if task is not None:
-                                    task.cancel()
-                            await asyncio.gather(
-                                *(task for task in (preempt_task,) if task is not None),
-                                return_exceptions=True,
-                            )
-                            if (
-                                first_attempt is not None
-                                and first_attempt.preempt.is_set()
-                                and first_attempt.released is not None
-                                and not first_attempt.released.done()
-                            ):
-                                first_attempt.released.set_result(None)
                             response = await send_task
                         elif disconnect_task is not None and disconnect_task in done:
                             raise _ClientDisconnected
                         else:
-                            abort_ok = await self._abort_request(
-                                upstream, dispatch_request_id, headers=forwarded
-                            )
-                            if not abort_ok:
-                                if (
-                                    first_attempt.released is not None
-                                    and not first_attempt.released.done()
-                                ):
-                                    first_attempt.released.set_exception(
-                                        InferenceAdmissionError(
-                                            "Continuation QoS could not confirm upstream abort"
-                                        )
-                                    )
-                                response = await send_task
-                            else:
-                                send_task.cancel()
-                                await asyncio.gather(send_task, return_exceptions=True)
-                                self.continuation_qos.preempted()
-                                self._note(
-                                    f"[relay] conv={routing_session[:8] or '-'} <- "
-                                    f"{upstream.alias} cooperatively_preempted_before_response"
-                                )
-                                await asyncio.shield(client.aclose())
-                                await release_slot()
-                                if (
-                                    first_attempt.released is not None
-                                    and not first_attempt.released.done()
-                                ):
-                                    first_attempt.released.set_result(None)
-                                barrier = first_attempt.resume_after
-                                self.continuation_qos.unregister_first_turn(
-                                    first_attempt
-                                )
-                                first_attempt = None
-                                if barrier is not None:
-                                    await barrier
+                            if await preempt_for_continuation():
                                 replay_count += 1
-                                self.continuation_qos.retried()
                                 if replay_count >= self.continuation_qos.max_retries:
                                     self.continuation_qos.exhausted()
                                 attempted.clear()
                                 continue
+                            response = await send_task
                     else:
                         response = await client.send(request, stream=True)
 
@@ -2294,15 +2341,50 @@ class InferenceBackend:
                     # monitor can still abort the request deterministically.
                     stream = response.aiter_bytes()
                     first_chunk_task = asyncio.create_task(anext(stream))
-                    if disconnect_task is not None:
+                    body_waiters = tuple(
+                        task
+                        for task in (
+                            first_chunk_task,
+                            preempt_task,
+                            disconnect_task,
+                        )
+                        if task is not None
+                    )
+                    if len(body_waiters) > 1:
                         done, _ = await asyncio.wait(
-                            (first_chunk_task, disconnect_task),
+                            body_waiters,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        if first_chunk_task not in done:
+                        if first_chunk_task in done:
+                            if preempt_task is not None and not preempt_task.done():
+                                preempt_task.cancel()
+                                await asyncio.gather(
+                                    preempt_task, return_exceptions=True
+                                )
+                        elif disconnect_task is not None and disconnect_task in done:
                             raise _ClientDisconnected
-                        disconnect_stop.set()
-                        await asyncio.gather(disconnect_task, return_exceptions=True)
+                        else:
+                            if await preempt_for_continuation():
+                                replay_count += 1
+                                if replay_count >= self.continuation_qos.max_retries:
+                                    self.continuation_qos.exhausted()
+                                attempted.clear()
+                                continue
+                            remaining = tuple(
+                                task
+                                for task in (first_chunk_task, disconnect_task)
+                                if task is not None
+                            )
+                            done, _ = await asyncio.wait(
+                                remaining, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            if first_chunk_task not in done:
+                                raise _ClientDisconnected
+                        if disconnect_task is not None and first_chunk_task in done:
+                            disconnect_stop.set()
+                            await asyncio.gather(
+                                disconnect_task, return_exceptions=True
+                            )
                     try:
                         first_chunk = await first_chunk_task
                     except StopAsyncIteration:
@@ -2395,14 +2477,14 @@ class InferenceBackend:
                             cold_prefill=cold_prefill,
                         )
                     if (
-                        first_attempt is not None
-                        and first_attempt.preempt.is_set()
-                        and first_attempt.released is not None
-                        and not first_attempt.released.done()
+                        replay_attempt is not None
+                        and replay_attempt.preempt.is_set()
+                        and replay_attempt.released is not None
+                        and not replay_attempt.released.done()
                     ):
-                        first_attempt.released.set_exception(
+                        replay_attempt.released.set_exception(
                             InferenceAdmissionError(
-                                "Preempted first-turn client disconnected"
+                                "Preempted replay-safe client disconnected"
                             )
                         )
                     if observed_disconnect:
@@ -2454,18 +2536,18 @@ class InferenceBackend:
                             disconnect_stop.set()
                             disconnect_task.cancel()
                         await asyncio.gather(disconnect_task, return_exceptions=True)
-                    if first_attempt is not None:
+                    if replay_attempt is not None:
                         if (
-                            first_attempt.preempt.is_set()
-                            and first_attempt.released is not None
-                            and not first_attempt.released.done()
+                            replay_attempt.preempt.is_set()
+                            and replay_attempt.released is not None
+                            and not replay_attempt.released.done()
                         ):
-                            first_attempt.released.set_exception(
+                            replay_attempt.released.set_exception(
                                 InferenceAdmissionError(
-                                    "First-turn handoff did not complete"
+                                    "Replay-safe handoff did not complete"
                                 )
                             )
-                        self.continuation_qos.unregister_first_turn(first_attempt)
+                        self.continuation_qos.unregister_replay_safe(replay_attempt)
                 handed_to_stream = True
                 return RelayedResponse(
                     status_code=response.status_code,
