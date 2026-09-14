@@ -17,7 +17,13 @@ from ._codex import CodexBackend
 from ._drain import DEFAULT_DRAIN_TIMEOUT_S
 from ._errors import GatewayError, UpstreamError
 from ._health import public_upstream_url
-from ._inference import InferenceBackend, InferenceDrainTimeout, estimate_input_tokens
+from ._inference import (
+    InferenceBackend,
+    InferenceDrainTimeout,
+    InferenceMemberQuiesceTimeout,
+    InferenceMemberResumeError,
+    estimate_input_tokens,
+)
 from ._secrets import resolve_gateway_key
 
 
@@ -183,6 +189,7 @@ def create_app(
                     "active_members": sum(member["active"] for member in members),
                     "in_flight": drain.in_flight,
                     "queued": drain.queued,
+                    "held": sum(member.get("held", 0) for member in members),
                     "draining": drain.draining,
                     "cache_admission": backend.cache_admission.snapshot(),
                     "continuation_qos": backend.continuation_qos.snapshot(),
@@ -243,6 +250,7 @@ def create_app(
                 "active_members": active_members,
                 "in_flight": drain.in_flight,
                 "queued": drain.queued,
+                "held": sum(member.get("held", 0) for member in members),
                 "draining": drain.draining,
                 "cache_admission": backend.cache_admission.snapshot(),
                 "continuation_qos": backend.continuation_qos.snapshot(),
@@ -335,6 +343,70 @@ def create_app(
                 )
             await backend.pool.resume()
             return (await backend.pool.drain_state()).as_dict()
+
+        @app.post("/admin/members/{alias}/quiesce")
+        async def quiesce_member(
+            alias: str, request: Request, timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
+        ) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                return JSONResponse(
+                    _openai_error(
+                        "quiesce timeout_s must be finite and > 0",
+                        "invalid_request_error",
+                        400,
+                    ),
+                    400,
+                )
+            try:
+                state = await backend.quiesce_member(alias, timeout_s)
+            except KeyError:
+                return JSONResponse(
+                    _openai_error(
+                        f"Unknown inference member: {alias}",
+                        "member_not_found",
+                        404,
+                    ),
+                    404,
+                )
+            except InferenceMemberQuiesceTimeout as exc:
+                return JSONResponse(
+                    {
+                        **_openai_error(str(exc), "member_quiesce_timeout", 409),
+                        **exc.state.as_dict(),
+                    },
+                    409,
+                )
+            return state.as_dict()
+
+        @app.post("/admin/members/{alias}/resume")
+        async def resume_member(alias: str, request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            try:
+                state = await backend.resume_member(alias)
+            except KeyError:
+                return JSONResponse(
+                    _openai_error(
+                        f"Unknown inference member: {alias}",
+                        "member_not_found",
+                        404,
+                    ),
+                    404,
+                )
+            except InferenceMemberResumeError as exc:
+                return JSONResponse(
+                    _openai_error(str(exc), "member_resume_validation_failed", 409),
+                    409,
+                )
+            return state.as_dict()
 
         async def relay(request: Request) -> Any:
             path = request.url.path

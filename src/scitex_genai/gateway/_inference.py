@@ -79,6 +79,11 @@ from ._health import (
     public_upstream_url,
     timed_out_reachability,
 )
+from ._member_quiesce import (
+    InferenceMemberQuiesceState,
+    InferenceMemberQuiesceTimeout,
+    InferenceMemberResumeError,
+)
 from ._pool import StickyPool
 from ._prediction import AdmissionPrediction, AdmissionPredictionTelemetry
 from ._request_observability import (
@@ -787,6 +792,10 @@ class InferenceUpstream:
     cooling_since: float | None = None
     #: Incremented under the pool lock for race-safe health reconciliation.
     cooldown_generation: int = 0
+    #: Operator cutover gate. Existing owned work drains; later work is held.
+    quiesced: bool = False
+    held: int = 0
+    input_tokens_held: int = 0
 
     @property
     def base_url(self) -> str:
@@ -811,11 +820,15 @@ class InferenceUpstream:
     def status(self, *, closing: bool = False) -> dict[str, Any]:
         status = {
             "url": self.base_url,
-            "active": not closing and self.cooldown_until <= time.time(),
+            "active": (
+                not closing and not self.quiesced and self.cooldown_until <= time.time()
+            ),
             "in_flight": self.in_flight,
             "queued": self.queued,
             "capacity": self.capacity,
         }
+        if self.quiesced or self.held:
+            status.update(held=self.held, quiesced=self.quiesced)
         if self.url is not None:
             status["label"] = self.alias
         if self.token_capacity is not None:
@@ -824,6 +837,8 @@ class InferenceUpstream:
                 input_tokens_queued=self.input_tokens_queued,
                 token_capacity=self.token_capacity,
             )
+            if self.quiesced or self.held:
+                status["input_tokens_held"] = self.input_tokens_held
         return status
 
 
@@ -850,7 +865,7 @@ class _PoolTicket:
             "state": state,
             "input_tokens": self.input_tokens,
             "queue_age_s": (
-                max(0.0, now - self.queued_at) if state == "queued" else 0.0
+                max(0.0, now - self.queued_at) if state in {"queued", "held"} else 0.0
             ),
             "priority": self.priority,
             "admission_class": self.admission_class,
@@ -973,6 +988,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._waiters: dict[str, deque[_PoolTicket]] = {
             upstream.alias: deque() for upstream in self.upstreams
         }
+        self._held_waiters: dict[str, deque[_PoolTicket]] = {
+            upstream.alias: deque() for upstream in self.upstreams
+        }
         self._running_tickets: dict[str, deque[_PoolTicket]] = {
             upstream.alias: deque() for upstream in self.upstreams
         }
@@ -981,6 +999,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._queue_time_s_sum = 0.0
         self._queue_time_samples = 0
         self._blocked_total: dict[str, int] = {}
+        self._held_total = 0
+        self._member_quiesces_total = 0
+        self._member_resumes_total = 0
         self._active_sessions: set[str] = set()
         self._closing = False
 
@@ -1095,6 +1116,13 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             and sticky_alias not in hard_excluded
             and self._by_alias(sticky_alias) is not None
         ):
+            sticky = self._by_alias(sticky_alias)
+            assert sticky is not None
+            if sticky.quiesced:
+                # Quiescing is a routing fence, not a cache-eviction event.
+                # Hold a capable sticky request on its exact home.
+                sticky.last_used_at = now
+                return sticky
             # A compatible gateway-owned route is authoritative cache affinity.
             # Let StickyPool preserve it (including its reload hold semantics)
             # before applying any first-placement preference.
@@ -1102,10 +1130,16 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         if sticky_alias is not None:
             self._sessions.pop(session_id, None)
 
-        available = [
+        quiesced = {member.alias for member in self.upstreams if member.quiesced}
+        nonquiesced_capable = [
             upstream
             for upstream in self.upstreams
-            if upstream.alias not in hard_excluded and upstream.cooldown_until <= now
+            if upstream.alias not in hard_excluded | quiesced
+        ]
+        available = [
+            upstream
+            for upstream in nonquiesced_capable
+            if upstream.cooldown_until <= now
         ]
         if available:
             # ``None`` is an unbounded/unspecified capacity and therefore the
@@ -1120,7 +1154,33 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 for upstream in available
                 if upstream.token_capacity != tier_capacity
             }
-            hard_excluded |= outside_tier
+            return self._select_locked(
+                session_id,
+                hard_excluded | quiesced | outside_tier,
+                now=now,
+            )
+
+        if nonquiesced_capable:
+            # Preserve ordinary cooldown/reload behavior when another member
+            # is capable but temporarily unavailable.
+            return self._select_locked(session_id, hard_excluded | quiesced, now=now)
+
+        # No non-quiesced member can ever fit this request. Keep it losslessly
+        # on a capable quiesced member instead of returning 503 or repinning it
+        # to an undersized member.
+        held_candidates = [
+            member
+            for member in self.upstreams
+            if member.quiesced
+            and member.alias not in excluded
+            and member.alias not in incapable
+        ]
+        if held_candidates:
+            selected = self._choose(held_candidates)
+            selected.last_used_at = now
+            if session_id:
+                self._sessions[session_id] = selected.alias
+            return selected
         return self._select_locked(session_id, hard_excluded, now=now)
 
     async def acquire(
@@ -1154,7 +1214,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 if (
                     selected is None
                     or selected.alias in excluded
-                    or selected.cooldown_until > time.time()
+                    or (not selected.quiesced and selected.cooldown_until > time.time())
                 ):
                     # Never apply a cache prediction to a different upstream.
                     raise InferenceAdmissionError(
@@ -1196,7 +1256,12 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     else None
                 ),
             )
-            if (
+            was_held = selected.quiesced
+            if was_held:
+                await self._hold_ticket_locked(selected, ticket)
+                # Resume promotes the ticket into the ordinary queue under this
+                # same lock. From here it obeys all existing capacity/QoS rules.
+            if not was_held and (
                 self._fits(selected, input_tokens, session_id, cold_prefill)
                 and not selected.queued
             ):
@@ -1208,21 +1273,22 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 if session_id:
                     self._active_sessions.add(session_id)
                 return selected
-            total_queued = sum(upstream.queued for upstream in self.upstreams)
-            if total_queued >= self.max_queue_size:
-                raise InferenceAdmissionError(
-                    f"Inference queue is full ({total_queued}/{self.max_queue_size})"
-                )
-            ticket.queued_at = time.monotonic()
-            ticket.block_reason = self._block_reason(selected, ticket)
-            self._blocked_total[ticket.block_reason] = (
-                self._blocked_total.get(ticket.block_reason, 0) + 1
-            )
             waiters = self._waiters[selected.alias]
-            waiters.append(ticket)
-            self._queued_total += 1
-            selected.queued += 1
-            selected.input_tokens_queued += input_tokens
+            if not was_held:
+                total_queued = sum(upstream.queued for upstream in self.upstreams)
+                if total_queued >= self.max_queue_size:
+                    raise InferenceAdmissionError(
+                        f"Inference queue is full ({total_queued}/{self.max_queue_size})"
+                    )
+                ticket.queued_at = time.monotonic()
+                ticket.block_reason = self._block_reason(selected, ticket)
+                self._blocked_total[ticket.block_reason] = (
+                    self._blocked_total.get(ticket.block_reason, 0) + 1
+                )
+                waiters.append(ticket)
+                self._queued_total += 1
+                selected.queued += 1
+                selected.input_tokens_queued += input_tokens
             queued = True
             try:
                 while True:
@@ -1242,7 +1308,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         queued = False
                         selected.in_flight += 1
                         selected.input_tokens_in_flight += input_tokens
-                        selected.cold_prefills_in_flight += int(cold_prefill)
+                        selected.cold_prefills_in_flight += int(ticket.cold_prefill)
                         self._running_tickets[selected.alias].append(ticket)
                         self._admissions_total += 1
                         self._queue_time_s_sum += max(
@@ -1268,6 +1334,29 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     selected.queued -= 1
                     selected.input_tokens_queued -= input_tokens
                     self._admission.notify_all()
+
+    async def _hold_ticket_locked(
+        self, member: InferenceUpstream, ticket: _PoolTicket
+    ) -> None:
+        """Hold post-cutoff work without consuming the bounded active queue."""
+        held = self._held_waiters[member.alias]
+        ticket.queued_at = time.monotonic()
+        ticket.block_reason = "member-quiesced"
+        held.append(ticket)
+        member.held += 1
+        member.input_tokens_held += ticket.input_tokens
+        self._held_total += 1
+        try:
+            while ticket in held:
+                if self._closing:
+                    raise InferenceAdmissionError("Inference gateway is shutting down")
+                await self._admission.wait()
+        finally:
+            if ticket in held:
+                held.remove(ticket)
+                member.held -= 1
+                member.input_tokens_held -= ticket.input_tokens
+                self._admission.notify_all()
 
     def _next_admissible_ticket(self, member: InferenceUpstream) -> _PoolTicket | None:
         """Choose work that fits now without permitting indefinite bypass.
@@ -1485,7 +1574,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         return InferenceDrainState(
             draining=self._closing,
             in_flight=sum(upstream.in_flight for upstream in self.upstreams),
-            queued=sum(upstream.queued for upstream in self.upstreams),
+            queued=sum(upstream.queued + upstream.held for upstream in self.upstreams),
         )
 
     async def drain_state(self) -> InferenceDrainState:
@@ -1507,15 +1596,24 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 for upstream in self.upstreams
                 for ticket in self._waiters[upstream.alias]
             ]
-            tickets = admitted + queued
+            held = [
+                ticket.status(state="held", now=now, upstream=upstream.alias)
+                for upstream in self.upstreams
+                for ticket in self._held_waiters[upstream.alias]
+            ]
+            tickets = admitted + queued + held
             return {
                 "admitted": len(admitted),
                 "queued": len(queued),
+                "held": len(held),
                 "input_tokens_admitted": sum(
                     upstream.input_tokens_in_flight for upstream in self.upstreams
                 ),
                 "input_tokens_queued": sum(
                     upstream.input_tokens_queued for upstream in self.upstreams
+                ),
+                "input_tokens_held": sum(
+                    upstream.input_tokens_held for upstream in self.upstreams
                 ),
                 "oldest_queue_age_s": max(
                     (ticket["queue_age_s"] for ticket in queued), default=0.0
@@ -1528,8 +1626,100 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     "queue_time_s_sum": self._queue_time_s_sum,
                     "queue_time_samples": self._queue_time_samples,
                     "blocked_total": dict(sorted(self._blocked_total.items())),
+                    "held_total": self._held_total,
+                    "member_quiesces_total": self._member_quiesces_total,
+                    "member_resumes_total": self._member_resumes_total,
                 },
             }
+
+    def _member_state_locked(
+        self, member: InferenceUpstream
+    ) -> InferenceMemberQuiesceState:
+        return InferenceMemberQuiesceState(
+            alias=member.alias,
+            quiesced=member.quiesced,
+            in_flight=member.in_flight,
+            queued=member.queued,
+            held=member.held,
+        )
+
+    async def member_state(self, alias: str) -> InferenceMemberQuiesceState:
+        async with self._admission:
+            member = self._by_alias(alias)
+            if member is None:
+                raise KeyError(alias)
+            return self._member_state_locked(member)
+
+    async def begin_member_quiesce(
+        self,
+        alias: str,
+        timeout_s: float,
+        *,
+        on_cutoff: Callable[[], None] | None = None,
+    ) -> InferenceMemberQuiesceState:
+        """Fence one member atomically and drain only its pre-cutoff work."""
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and > 0")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        async with self._admission:
+            member = self._by_alias(alias)
+            if member is None:
+                raise KeyError(alias)
+            if not member.quiesced:
+                member.quiesced = True
+                self._member_quiesces_total += 1
+                if on_cutoff is not None:
+                    on_cutoff()
+                self._admission.notify_all()
+            while True:
+                state = self._member_state_locked(member)
+                if state.empty:
+                    return state
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise InferenceMemberQuiesceTimeout(state)
+                try:
+                    await asyncio.wait_for(self._admission.wait(), remaining)
+                except TimeoutError:
+                    state = self._member_state_locked(member)
+                    if not state.empty:
+                        raise InferenceMemberQuiesceTimeout(state) from None
+
+    async def _resume_member_after_validation(
+        self, alias: str
+    ) -> InferenceMemberQuiesceState:
+        """Promote held work after the backend validates a replacement engine."""
+        async with self._admission:
+            member = self._by_alias(alias)
+            if member is None:
+                raise KeyError(alias)
+            if not member.quiesced:
+                raise InferenceMemberResumeError(f"member {alias} is not quiesced")
+            member.quiesced = False
+            held = self._held_waiters[alias]
+            waiters = self._waiters[alias]
+            while held:
+                ticket = held.popleft()
+                member.held -= 1
+                member.input_tokens_held -= ticket.input_tokens
+                # A prediction made before or during replacement cannot describe
+                # the new engine cache. Resume it conservatively as cold/unknown.
+                ticket.cache_classification = CacheResidency.UNKNOWN.value
+                ticket.predicted_uncached_tokens = ticket.input_tokens
+                ticket.prediction_expires_at = None
+                ticket.cold_prefill = bool(
+                    self.cold_prefill_min_tokens is not None
+                    and ticket.input_tokens >= self.cold_prefill_min_tokens
+                )
+                ticket.block_reason = "queue-order"
+                waiters.append(ticket)
+                member.queued += 1
+                member.input_tokens_queued += ticket.input_tokens
+                self._queued_total += 1
+            self._member_resumes_total += 1
+            self._admission.notify_all()
+            return self._member_state_locked(member)
 
     async def begin_drain(self, timeout_s: float) -> InferenceDrainState:
         """Atomically close admission and wait for all owned work to settle.
@@ -1891,6 +2081,7 @@ class InferenceBackend:
         self._engine_generations: dict[str, str | None] = {
             upstream.alias: None for upstream in self.pool.upstreams
         }
+        self._quiesce_generations: dict[str, str | None] = {}
         self._backend_scheduler: dict[str, Any] = {
             "state": "unobserved",
             "running": None,
@@ -2028,6 +2219,56 @@ class InferenceBackend:
                 },
             },
         }
+
+    async def quiesce_member(
+        self, alias: str, timeout_s: float
+    ) -> InferenceMemberQuiesceState:
+        """Fence one member and invalidate cache evidence at the exact cutoff."""
+        state = await self.pool.member_state(alias)
+        if not state.quiesced:
+            # Capture the last authoritative incarnation before the admission
+            # fence. Metrics failure is allowed: a later authoritative identity
+            # is still safer than reopening without any identity at all.
+            await self.refresh_backend_scheduler(alias)
+
+        def cutoff() -> None:
+            self._quiesce_generations[alias] = self._engine_generations[alias]
+            self._backend_observation_failed(alias, "member-quiesced")
+
+        return await self.pool.begin_member_quiesce(alias, timeout_s, on_cutoff=cutoff)
+
+    async def resume_member(self, alias: str) -> InferenceMemberQuiesceState:
+        """Require reachable health and a new authoritative engine generation."""
+        state = await self.pool.member_state(alias)
+        if not state.quiesced:
+            raise InferenceMemberResumeError(f"member {alias} is not quiesced")
+
+        observations = await self._probe_upstreams_fresh()
+        index = next(
+            index
+            for index, member in enumerate(self.pool.upstreams)
+            if member.alias == alias
+        )
+        observed = observations[index]
+        if not observed.reachable:
+            raise InferenceMemberResumeError(
+                f"member {alias} did not pass fresh health validation: {observed.reason}"
+            )
+
+        await self.refresh_backend_scheduler(alias)
+        generation = self._engine_generations[alias]
+        prior = self._quiesce_generations.get(alias)
+        if generation is None:
+            raise InferenceMemberResumeError(
+                f"member {alias} lacks an authoritative engine generation"
+            )
+        if prior is not None and generation == prior:
+            raise InferenceMemberResumeError(
+                f"member {alias} still reports its pre-quiesce engine generation"
+            )
+        resumed = await self.pool._resume_member_after_validation(alias)
+        self._quiesce_generations.pop(alias, None)
+        return resumed
 
     def request_health_snapshot(self) -> dict[str, Any]:
         """Return labeled active phases for the unauthenticated health API."""
@@ -2356,6 +2597,44 @@ class InferenceBackend:
                         selected_alias=predicted_alias,
                         client_disconnected=client_disconnected,
                     )
+                    current_generation = (
+                        self._engine_generations[upstream.alias] or "unavailable"
+                    )
+                    if prediction.engine_generation != current_generation:
+                        # A member-quiesce hold may span an engine replacement.
+                        # Never dispatch or record that request with cache evidence
+                        # from the incarnation observed before it entered the hold.
+                        prediction = self.admission_predictions.predict(
+                            session_id=routing_session,
+                            upstream=upstream.alias,
+                            engine_generation=self._engine_generations[upstream.alias],
+                            body=prediction_body,
+                            estimated_input_tokens=input_tokens,
+                        )
+                        cache_classification = CacheResidency.UNKNOWN
+                        if (
+                            self.pool.cold_prefill_min_tokens is not None
+                            and prediction.evidence != "no-compatible-history"
+                        ):
+                            cache_classification = (
+                                CacheResidency.HOT
+                                if prediction.predicted_uncached_tokens
+                                < self.pool.cold_prefill_min_tokens
+                                else CacheResidency.COLD
+                            )
+                        cold_prefill = bool(
+                            self.pool.cold_prefill_limit_per_upstream is not None
+                            and prediction.predicted_uncached_tokens
+                            >= (self.pool.cold_prefill_min_tokens or 1)
+                        )
+                        replay_safe = _replay_safe_for_preemption(
+                            admission_class=qos_kind,
+                            cold_prefill=cold_prefill,
+                            prior_cache_tier=prediction.prior_cache_tier,
+                        )
+                        feedback_headers["x-scitex-cache-residency"] = (
+                            cache_classification.value
+                        )
                 except _ClientDisconnected:
                     self.request_lifecycle.disconnected(
                         request_observation,
