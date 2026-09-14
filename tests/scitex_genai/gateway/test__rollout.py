@@ -300,7 +300,38 @@ def test_bootstrap_requires_empty_legacy_gateway_before_stopping_it(tmp_path: Pa
     ) == (True, True, True)
 
 
-def test_empty_bootstrap_disables_legacy_and_enables_durable_frontend(tmp_path: Path):
+def test_bootstrap_rejects_nonzero_legacy_held_before_stopping_it(tmp_path: Path):
+    # Arrange
+    calls: list[list[str]] = []
+
+    def health(target, _timeout):
+        if isinstance(target, Path):
+            return _candidate("new", "build", "new-process")
+        return {"status": "ok", "in_flight": 0, "queued": 0, "held": 1}
+
+    # Act
+    with pytest.raises(RolloutError, match="not empty"):
+        rollout(
+            generation="new",
+            build="build",
+            config=tmp_path / "config.yaml",
+            public_health_url="http://127.0.0.1:18772/health",
+            runtime_dir=tmp_path / "run",
+            unit_dir=tmp_path / "units",
+            state_path=tmp_path / "state.json",
+            current_socket_path=tmp_path / "current.sock",
+            bootstrap_coordinated=True,
+            systemctl=lambda argv: calls.append(list(argv)),
+            health_call=health,
+        )
+
+    # Assert
+    assert ["systemctl", "--user", "disable", "--now", UNIT_NAME] not in calls
+
+
+def test_empty_legacy_schema_without_held_bootstraps_durable_frontend(
+    tmp_path: Path,
+):
     # Arrange
     runtime = tmp_path / "run"
     current = tmp_path / "current.sock"
@@ -309,7 +340,7 @@ def test_empty_bootstrap_disables_legacy_and_enables_durable_frontend(tmp_path: 
     def health(target, _timeout):
         if isinstance(target, Path) or current.is_symlink():
             return _candidate("new", "build", "new-process")
-        return {"status": "ok", "in_flight": 0, "queued": 0, "held": 0}
+        return {"status": "ok", "in_flight": 0, "queued": 0}
 
     # Act
     rollout(
