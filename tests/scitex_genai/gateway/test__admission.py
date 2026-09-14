@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import httpx
 import pytest
 
 from scitex_genai.gateway._admission import AdmissionController, CacheResidency
+from scitex_genai.gateway._errors import UpstreamUnreachable
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
+    is_read_only_control_route,
     request_session_key,
 )
 from scitex_genai.gateway._server import create_app
@@ -109,19 +113,14 @@ async def test_keyless_relay_reports_unknown_without_failing(upstream_factory) -
         reply.status_code,
         content,
         reply.feedback_headers,
-        len(reply.feedback_headers["x-scitex-request-label"]),
     ) == (
         200,
         b'{"data":[]}',
         {
-            "x-scitex-admission-mode": "observe-only",
+            "x-scitex-admission-mode": "control-plane-bypass",
             "x-scitex-cache-residency": "unknown",
             "x-scitex-session-key": "none",
-            "x-scitex-request-label": reply.feedback_headers["x-scitex-request-label"],
-            "x-scitex-agent-label": "unknown",
-            "x-scitex-session-label": "anonymous",
         },
-        16,
     )
 
 
@@ -180,7 +179,7 @@ async def test_streaming_response_propagates_admission_feedback(
 
 
 @pytest.mark.asyncio
-async def test_health_exposes_incremented_observe_only_snapshot(
+async def test_metadata_does_not_enter_cache_or_generation_admission_snapshot(
     upstream_factory,
 ) -> None:
     # Arrange
@@ -210,11 +209,259 @@ async def test_health_exposes_incremented_observe_only_snapshot(
         snapshot["queued"],
     ) == (
         "observe-only",
-        {"hot": 0, "cold": 0, "unknown": 1},
+        {"hot": 0, "cold": 0, "unknown": 0},
         0,
         {"hot": 0, "cold": 0, "unknown": 0},
         0,
     )
+
+
+@pytest.mark.asyncio
+async def test_non_model_get_remains_in_generation_admission(upstream_factory) -> None:
+    # Arrange: /v1/{path} is a GET catch-all. Keep the exemption explicit so a
+    # future compute-bearing GET cannot silently bypass generation admission.
+    upstream = upstream_factory()
+    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+
+    # Act
+    reply = await backend.relay("GET", "/v1/batches/work", body=None, headers={})
+    _ = b"".join([chunk async for chunk in reply.body])
+
+    # Assert
+    assert (
+        reply.feedback_headers["x-scitex-admission-mode"],
+        "x-scitex-request-label" in reply.feedback_headers,
+        backend.cache_admission.snapshot()["observed"],
+    ) == (
+        "observe-only",
+        True,
+        {"hot": 0, "cold": 0, "unknown": 1},
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "expected"),
+    [
+        ("GET", "/v1/models", True),
+        ("HEAD", "/v1/models/", True),
+        ("GET", "/v1/models/props?refresh=false", True),
+        ("POST", "/v1/models", False),
+        ("GET", "/v1/batches/work", False),
+        ("HEAD", "/v1/responses", False),
+    ],
+)
+def test_only_model_discovery_is_read_only_control_plane(
+    method: str, path: str, expected: bool
+) -> None:
+    # Arrange
+    route = (method, path)
+
+    # Act
+    actual = is_read_only_control_route(*route)
+
+    # Assert
+    assert actual is expected
+
+
+def _body_with_estimated_tokens(tokens: int) -> bytes:
+    prefix = b'{"model":"m","messages":[{"role":"user","content":"'
+    suffix = b'"}]}'
+    target_bytes = tokens * 4
+    return prefix + (b"x" * (target_bytes - len(prefix) - len(suffix))) + suffix
+
+
+@pytest.mark.asyncio
+async def test_reproduces_stale_zero_token_ticket_blocking_sticky_224793_turn() -> None:
+    # Arrange: reproduce the operator snapshot independently of HTTP cleanup.
+    pool = InferenceUpstreamPool.from_urls(
+        ["http://qwen-tp1-256k:1", "http://qwen-tp2:2"],
+        capacity_per_upstream=8,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    pool.upstreams[0].token_capacity = 250_000
+    pool.upstreams[1].token_capacity = 1_600_000
+    pinned = await pool.acquire("cards", input_tokens=1, predicted_uncached_tokens=1)
+    await pool.release(pinned, input_tokens=1, session_id="cards")
+    stale_get = await pool.acquire(
+        "",
+        input_tokens=0,
+        cold_prefill=False,
+        selected_alias=pool.upstreams[0].alias,
+    )
+    continuation = asyncio.create_task(
+        pool.acquire(
+            "cards",
+            input_tokens=224_793,
+            predicted_uncached_tokens=224_793,
+        )
+    )
+    await _wait_for_pool_queue(pool, 1)
+
+    # Act
+    snapshot = await pool.observability_snapshot()
+    queued = next(
+        ticket for ticket in snapshot["tickets"] if ticket["state"] == "queued"
+    )
+    admitted = next(
+        ticket for ticket in snapshot["tickets"] if ticket["state"] == "admitted"
+    )
+
+    # Assert: stickiness, not member capacity, keeps the turn behind the stale
+    # zero-token hot ticket while the 1.6m-token second member is completely free.
+    assert (
+        admitted["input_tokens"],
+        queued["input_tokens"],
+        queued["cold_prefill"],
+        queued["block_reason"],
+        pool.upstreams[1].in_flight,
+        continuation.done(),
+    ) == (0, 224_793, True, "hot-work-in-flight", 0, False)
+
+    await pool.release(stale_get, input_tokens=0, session_id="")
+    recovered = await asyncio.wait_for(continuation, 0.5)
+    await pool.release(
+        recovered, input_tokens=224_793, session_id="cards", cold_prefill=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hung_metadata_cannot_block_sticky_224793_token_continuation(
+    upstream_factory,
+) -> None:
+    # Arrange: this is the production incident shape. A discovery GET hangs on
+    # the 256k member while a session already pinned there sends a cold turn.
+    metadata_release = threading.Event()
+    tp1 = upstream_factory(
+        block_until=metadata_release,
+        block_path="/v1/models",
+    )
+    tp2 = upstream_factory()
+    pool = InferenceUpstreamPool.from_urls(
+        [tp1.url, tp2.url],
+        capacity_per_upstream=8,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    pool.upstreams[0].token_capacity = 250_000
+    pool.upstreams[1].token_capacity = 1_600_000
+    backend = InferenceBackend(pool, metadata_timeout_s=1.0)
+    headers = {"X-SciTeX-Session-ID": "cards-session"}
+    first = await backend.relay(
+        "POST",
+        "/v1/chat/completions",
+        body=b'{"model":"m","messages":[{"role":"user","content":"pin"}]}',
+        headers=headers,
+    )
+    _ = b"".join([chunk async for chunk in first.body])
+    tp1.request_started.clear()
+    metadata = asyncio.create_task(
+        backend.relay("GET", "/v1/models", body=None, headers={})
+    )
+    metadata_started = await asyncio.to_thread(tp1.request_started.wait, 1.0)
+    body = _body_with_estimated_tokens(224_793)
+
+    # Act
+    continuation = await asyncio.wait_for(
+        backend.relay("POST", "/v1/chat/completions", body=body, headers=headers),
+        timeout=1.0,
+    )
+    _ = b"".join([chunk async for chunk in continuation.body])
+    snapshot = await pool.observability_snapshot()
+
+    # Assert: metadata owns no ticket, the sticky request used tp1, and tp2
+    # remained free instead of being needed to hide a leaked admission slot.
+    assert (
+        len(body),
+        snapshot["admitted"],
+        snapshot["queued"],
+        pool.upstreams[1].in_flight,
+        metadata_started,
+        metadata.done(),
+        tp1.requests[-1]["path"],
+    ) == (224_793 * 4, 0, 0, 0, True, False, "/v1/chat/completions")
+
+    metadata_release.set()
+    metadata_reply = await asyncio.wait_for(metadata, timeout=1.0)
+    _ = b"".join([chunk async for chunk in metadata_reply.body])
+
+
+@pytest.mark.asyncio
+async def test_metadata_absolute_deadline_never_consumes_generation_slot(
+    upstream_factory,
+) -> None:
+    # Arrange
+    metadata_release = threading.Event()
+    upstream = upstream_factory(
+        block_until=metadata_release,
+        block_path="/v1/models",
+    )
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, timeout_s=60.0, metadata_timeout_s=0.02)
+    started = time.monotonic()
+
+    # Act
+    error = None
+    try:
+        await backend.relay("GET", "/v1/models", body=None, headers={})
+    except UpstreamUnreachable as exc:
+        error = exc
+    elapsed = time.monotonic() - started
+    snapshot = await pool.observability_snapshot()
+
+    # Assert: the independent wall-clock deadline wins over the generation
+    # timeout and cannot leave an admitted or queued ticket behind.
+    assert (
+        isinstance(error, UpstreamUnreachable),
+        elapsed < 1.0,
+        snapshot["admitted"],
+        snapshot["queued"],
+        pool.status()[0]["in_flight"],
+        backend.request_health_snapshot()["active"],
+    ) == (True, True, 0, 0, 0, 0)
+    metadata_release.set()
+
+
+@pytest.mark.asyncio
+async def test_legacy_non_addressable_ticket_is_reaped_on_caller_deadline(
+    upstream_factory,
+) -> None:
+    # Arrange: before read-only admission was bypassed, the incident's GET
+    # followed this non-addressable cleanup path. Model it with a POST route
+    # that likewise has no injectable SGLang request id.
+    release = threading.Event()
+    upstream = upstream_factory(block_until=release)
+    pool = InferenceUpstreamPool.from_urls(upstream.url)
+    backend = InferenceBackend(pool, continuation_qos_enabled=True)
+    request = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/messages",
+            body=b'{"model":"m","messages":[]}',
+            headers={},
+        )
+    )
+    request_started = await asyncio.to_thread(upstream.request_started.wait, 1.0)
+
+    # Act: this is the client's 900-second deadline, compressed for the test.
+    request.cancel()
+    cancelled = None
+    try:
+        await asyncio.wait_for(request, timeout=0.5)
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+    snapshot = await pool.observability_snapshot()
+
+    # Assert: cleanup is bounded and no stale zero-token admission survives.
+    assert (
+        request_started,
+        isinstance(cancelled, asyncio.CancelledError),
+        snapshot["admitted"],
+        snapshot["queued"],
+        pool.status()[0]["in_flight"],
+        backend.request_health_snapshot()["active"],
+    ) == (True, True, 0, 0, 0, 0)
+    release.set()
 
 
 @pytest.mark.asyncio

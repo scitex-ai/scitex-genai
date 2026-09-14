@@ -79,6 +79,7 @@ class RecordingUpstream:
         content_type: str = "application/json",
         chunks: tuple[bytes, ...] = (b'{"ok": true}',),
         block_until: threading.Event | None = None,
+        block_path: str | None = None,
         abort_releases: bool = False,
         abort_status: int = 200,
         block_before_first_chunk: threading.Event | None = None,
@@ -89,6 +90,7 @@ class RecordingUpstream:
         self.content_type = content_type
         self.chunks = chunks
         self.block_until = block_until
+        self.block_path = block_path
         self.abort_releases = abort_releases
         self.abort_status = abort_status
         self.block_before_first_chunk = block_before_first_chunk
@@ -133,7 +135,9 @@ class RecordingUpstream:
                     release = upstream.block_until or upstream.block_before_first_chunk
                     assert release is not None
                     release.set()
-                if upstream.block_until is not None:
+                if upstream.block_until is not None and (
+                    upstream.block_path is None or self.path == upstream.block_path
+                ):
                     upstream.block_until.wait(timeout=10)
                 response_status = (
                     upstream.abort_status
