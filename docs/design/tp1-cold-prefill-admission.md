@@ -49,6 +49,12 @@ slot; cancelled waiters release their queue ownership.  Both cold-prefill
 settings default to unset, so merging this mechanism alone changes no deployed
 profile and makes no SGLang, TP, or context-window change.
 
+Streaming ownership is a separate boundary: a slow downstream can retain a
+gateway admission after the engine scheduler has finished if response bytes or
+EOF remain buffered.  Downstream close/cancellation drains the finished stream
+and releases exactly once, but this change does not add an unbounded response
+spool or claim to fix a client that never advances and never closes.
+
 `SGLangCacheTierValidator` is fail-closed. Device capacity becomes usable when
 the startup log reports `max_total_num_tokens`. Merely allocating host or file
 HiCache does not make it usable; an actual positive tier hit validates the tier.
