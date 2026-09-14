@@ -105,14 +105,23 @@ async def test_keyless_relay_reports_unknown_without_failing(upstream_factory) -
     content = b"".join([chunk async for chunk in reply.body])
 
     # Assert
-    assert (reply.status_code, content, reply.feedback_headers) == (
+    assert (
+        reply.status_code,
+        content,
+        reply.feedback_headers,
+        len(reply.feedback_headers["x-scitex-request-label"]),
+    ) == (
         200,
         b'{"data":[]}',
         {
             "x-scitex-admission-mode": "observe-only",
             "x-scitex-cache-residency": "unknown",
             "x-scitex-session-key": "none",
+            "x-scitex-request-label": reply.feedback_headers["x-scitex-request-label"],
+            "x-scitex-agent-label": "unknown",
+            "x-scitex-session-label": "anonymous",
         },
+        16,
     )
 
 

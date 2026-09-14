@@ -1715,14 +1715,28 @@ async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
     pool = InferenceUpstreamPool.from_urls(upstream.url)
     backend = InferenceBackend(pool, continuation_qos_enabled=True)
     member = await pool.acquire("held", input_tokens=10)
+    observation = backend.request_lifecycle.start(
+        agent_label="agent", session_label="session", estimated_input_tokens=10
+    )
+    backend.request_lifecycle.upstream_inflight(
+        observation,
+        upstream=upstream.url,
+        admitted_input_tokens=10,
+        gateway_input_tokens_admitted=10,
+        predicted_uncached_tokens=10,
+        cache_classification="unknown",
+    )
+    backend.request_lifecycle.disconnected(observation)
     backend._schedule_cleanup_reaper(
         member,
         "rid-held",
         headers={},
         input_tokens=10,
         session_id="held",
+        request_observation=observation,
     )
     await _wait_for_requests(upstream, 1)
+    held = backend.request_lifecycle.snapshot()
 
     # Act
     upstream.abort_status = 200
@@ -1730,6 +1744,7 @@ async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
     await _wait_for_in_flight(pool, 0)
     await asyncio.wait_for(asyncio.gather(*reapers), timeout=2)
     snapshot = backend.continuation_qos.snapshot()
+    settled = backend.request_lifecycle.snapshot()
     await backend.close()
 
     # Assert
@@ -1738,7 +1753,11 @@ async def test_cleanup_reaper_retries_abort_then_releases_exactly_once(
         snapshot["cleanup_reaper_attempts"] >= 2,
         snapshot["cleanup_reaper_recoveries"],
         pool.status()[0]["in_flight"],
-    ) == (0, True, 1, 0)
+        held["active"],
+        held["requests"][0]["gateway_capacity_owned"],
+        settled["active"],
+        settled["requests"][0]["gateway_capacity_owned"],
+    ) == (0, True, 1, 0, 1, True, 0, False)
 
 
 @pytest.mark.asyncio
@@ -1921,12 +1940,16 @@ async def test_relay_holds_the_upstream_in_flight_while_streaming(
     await anext(relayed.body)
     while_streaming = pool.upstreams[0].in_flight
     await relayed.body.aclose()
+    lifecycle = backend.request_lifecycle.snapshot()
     # Assert
     assert (
         while_streaming,
         pool.upstreams[0].in_flight,
+        lifecycle["terminal_total"],
+        lifecycle["requests"][0]["phase"],
         any("outcome=client_disconnected" in line for line in lines),
-    ) == (1, 0, True)
+        any("phase=disconnected" in line for line in lines),
+    ) == (1, 0, {"disconnected": 1}, "disconnected", True, True)
 
 
 @pytest.mark.asyncio
@@ -2151,20 +2174,21 @@ async def test_relay_journal_reports_ttft_prefix_and_upstream_cache_tiers(
 
     # Assert
     sent = json.loads(upstream.requests[0]["body"])
+    relay_lines = [line for line in lines if line.startswith("[relay]")]
     assert (
         sent["return_cached_tokens_details"],
         sent["stream_options"]["include_usage"],
-        "prefix_fingerprint=" in lines[0],
-        "cache_report_requested=true" in lines[0],
-        "queue_s=" in lines[0],
-        "ttft_s=" in lines[1],
-        "total_s=" in lines[1],
-        "reported_input_tokens=500" in lines[1],
-        "reported_output_tokens=7" in lines[1],
-        "cached_tokens=425" in lines[1],
-        "cache_device_tokens=400" in lines[1],
-        "cache_host_tokens=20" in lines[1],
-        "cache_storage_tokens=5" in lines[1],
+        "prefix_fingerprint=" in relay_lines[0],
+        "cache_report_requested=true" in relay_lines[0],
+        "queue_s=" in relay_lines[0],
+        "ttft_s=" in relay_lines[1],
+        "total_s=" in relay_lines[1],
+        "reported_input_tokens=500" in relay_lines[1],
+        "reported_output_tokens=7" in relay_lines[1],
+        "cached_tokens=425" in relay_lines[1],
+        "cache_device_tokens=400" in relay_lines[1],
+        "cache_host_tokens=20" in relay_lines[1],
+        "cache_storage_tokens=5" in relay_lines[1],
         SECRET in "\n".join(lines),
     ) == (
         True,
@@ -2205,7 +2229,10 @@ async def test_the_journal_is_written_without_the_prefix_telemetry_opt_in(
     await _collect(relayed.body)
 
     # Assert
-    assert [line.startswith("[relay]") for line in lines] == [True, True]
+    assert (
+        sum(line.startswith("[relay]") for line in lines),
+        sum(line.startswith("[request]") for line in lines),
+    ) == (2, 3)
 
 
 @pytest.mark.asyncio
