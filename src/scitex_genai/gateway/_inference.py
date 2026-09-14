@@ -79,6 +79,11 @@ from ._health import (
     public_upstream_url,
     timed_out_reachability,
 )
+from ._member_quiesce import (
+    InferenceMemberQuiesceState,
+    InferenceMemberQuiesceTimeout,
+    InferenceMemberResumeError,
+)
 from ._pool import StickyPool
 from ._prediction import AdmissionPrediction, AdmissionPredictionTelemetry
 from ._request_observability import (
@@ -906,46 +911,6 @@ class InferenceDrainTimeout(TimeoutError):
             "drain deadline expired with "
             f"in_flight={state.in_flight} queued={state.queued}; admission remains closed"
         )
-
-
-@dataclass(frozen=True)
-class InferenceMemberQuiesceState:
-    """Admission-locked state for one member's zero-loss cutover."""
-
-    alias: str
-    quiesced: bool
-    in_flight: int
-    queued: int
-    held: int
-
-    @property
-    def empty(self) -> bool:
-        """Whether all pre-cutoff work is gone; held work is deliberately ignored."""
-        return self.in_flight == 0 and self.queued == 0
-
-    def as_dict(self) -> dict[str, str | bool | int]:
-        return {
-            "member": self.alias,
-            "quiesced": self.quiesced,
-            "in_flight": self.in_flight,
-            "queued": self.queued,
-            "held": self.held,
-        }
-
-
-class InferenceMemberQuiesceTimeout(TimeoutError):
-    """The member stays quiesced when its pre-cutoff barrier times out."""
-
-    def __init__(self, state: InferenceMemberQuiesceState) -> None:
-        self.state = state
-        super().__init__(
-            f"member {state.alias} quiesce deadline expired with "
-            f"in_flight={state.in_flight} queued={state.queued}; member remains quiesced"
-        )
-
-
-class InferenceMemberResumeError(RuntimeError):
-    """A quiesced member has not proven a safe new engine incarnation."""
 
 
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
