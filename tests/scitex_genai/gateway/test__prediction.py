@@ -1,12 +1,41 @@
 import json
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
 from scitex_genai.gateway._prediction import AdmissionPredictionTelemetry
 from scitex_genai.gateway._sglang_metrics import SGLangSchedulerObservation
+
+
+@pytest.mark.asyncio
+async def test_structured_scheduler_probe_uses_url_and_keeps_label_identity() -> None:
+    # Arrange
+    seen = []
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(
+                label="qwen-tp1", url="http://engine:18773", token_capacity=500_000
+            ),
+        )
+    )
+
+    async def scheduler_probe(url: str, timeout_s: float) -> SGLangSchedulerObservation:
+        seen.append(url)
+        return SGLangSchedulerObservation("1" * 32, 0, 0, 0.0)
+
+    backend = InferenceBackend(pool, scheduler_probe=scheduler_probe)
+
+    # Act
+    await backend.refresh_backend_scheduler("qwen-tp1")
+
+    # Assert
+    assert (seen, set(backend._engine_generations)) == (
+        ["http://engine:18773"],
+        {"qwen-tp1"},
+    )
 
 
 def _body(messages: list[dict[str, str]], *, tools: str = "stable") -> bytes:

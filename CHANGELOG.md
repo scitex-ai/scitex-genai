@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Local gateway upstreams now use one structured
+  `gateway.inference_upstreams` schema with a non-secret label, URL, and
+  measured token capacity per member. Placement rejects incapable members and
+  balances feasible new sessions by normalized token pressure. Bare URL lists,
+  `HOIST_UPSTREAM`, `--inference-upstream`, and the uniform global token-capacity
+  setting are retired; deployment migration is documented in the gateway guide.
+
 ### Fixed
 
 - Gateway drained restarts now cross one admission-locked, server-side empty

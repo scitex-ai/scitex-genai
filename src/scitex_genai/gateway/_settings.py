@@ -9,17 +9,17 @@ primitive exists it is used rather than re-invented.
 So this module reads ONE file, ``~/.scitex/genai/config.yaml``, through
 scitex-config's ``ScitexConfig`` (the ecosystem's YAML + environment cascade)
 and answers with a fixed dataclass. Precedence is the primitive's own:
-direct (command line) -> config file -> environment -> default.
-``HOIST_UPSTREAM`` stays the environment name for the upstream list because
-the relay's users already export it::
+direct (command line) -> config file -> environment -> default. Local inference
+members deliberately have one schema: the structured list below::
 
     # ~/.scitex/genai/config.yaml
     gateway:
       host: 0.0.0.0
       port: 18772
       inference_upstreams:
-        - http://127.0.0.1:18773
-        - http://127.0.0.1:18774
+        - label: qwen-tp2
+          url: http://127.0.0.1:18773
+          token_capacity: 1600000
       inference_timeout_s: 1800
 
 A missing file is not an error: the package must run for someone who has no
@@ -34,6 +34,7 @@ import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from scitex_config import ScitexConfig, get_scitex_dir, load_yaml
 
@@ -44,10 +45,7 @@ from ._inference import (
     DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS,
     DEFAULT_MAX_QUEUE_SIZE,
     DEFAULT_TIMEOUT_S,
-    DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
     TIMEOUT_ENV,
-    UPSTREAM_ENV,
-    parse_upstreams,
 )
 
 DEFAULT_HOST = "127.0.0.1"
@@ -58,7 +56,6 @@ KEY_UPSTREAMS = "gateway.inference_upstreams"
 KEY_TIMEOUT = "gateway.inference_timeout_s"
 KEY_CAPACITY = "gateway.inference_capacity_per_upstream"
 KEY_MAX_QUEUE = "gateway.inference_max_queue_size"
-KEY_TOKEN_CAPACITY = "gateway.inference_token_capacity_per_upstream"
 KEY_CONTINUATION_QOS = "gateway.inference_continuation_qos_enabled"
 KEY_CONTINUATION_RETRIES = "gateway.inference_continuation_qos_max_retries"
 KEY_CONTINUATION_MIN_TOKENS = "gateway.inference_continuation_qos_min_preempt_tokens"
@@ -68,6 +65,8 @@ KEY_COLD_PREFILL_MIN_TOKENS = "gateway.inference_cold_prefill_min_tokens"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
+RETIRED_UPSTREAM_ENVS = ("HOIST_UPSTREAM", "SCITEX_GATEWAY_INFERENCE_UPSTREAMS")
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -130,6 +129,86 @@ class ExternalGatewaySettings:
         object.__setattr__(self, "upstream", upstream)
 
 
+@dataclass(frozen=True)
+class InferenceUpstreamSettings:
+    """One named engine endpoint with its measured admission capacity."""
+
+    label: str
+    url: str
+    token_capacity: int
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "InferenceUpstreamSettings":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(
+                "gateway.inference_upstreams entries must be mappings with "
+                "label, url, and token_capacity; migrate bare URLs explicitly"
+            )
+        unknown = sorted(set(value) - {"label", "url", "token_capacity"})
+        missing = sorted({"label", "url", "token_capacity"} - set(value))
+        if unknown or missing:
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unknown:
+                details.append("unknown: " + ", ".join(unknown))
+            raise ValueError("invalid inference upstream (" + "; ".join(details) + ")")
+        return cls(**value)
+
+    def __post_init__(self) -> None:
+        label = str(self.label).strip()
+        url = str(self.url).rstrip("/")
+        if not label or any(ch.isspace() for ch in label):
+            raise ValueError(
+                "inference upstream label must be non-empty and whitespace-free"
+            )
+        parsed_url = urlsplit(url)
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.netloc
+            or any(ch.isspace() for ch in url)
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or bool(parsed_url.query)
+            or bool(parsed_url.fragment)
+        ):
+            raise ValueError(
+                "inference upstream url must be an http(s) base URL without "
+                "credentials, query, or fragment"
+            )
+        if not isinstance(self.token_capacity, int) or isinstance(
+            self.token_capacity, bool
+        ):
+            raise ValueError("inference upstream token_capacity must be an integer")
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "url", url)
+        object.__setattr__(
+            self,
+            "token_capacity",
+            check_count(
+                "inference upstream token_capacity", self.token_capacity, minimum=1
+            ),
+        )
+
+
+def upstream_settings(value: Any) -> tuple[InferenceUpstreamSettings, ...]:
+    """Validate the single structured local-upstream configuration schema."""
+    if value is _MISSING:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("gateway.inference_upstreams must be a list of mappings")
+    parsed = tuple(InferenceUpstreamSettings.from_mapping(item) for item in value)
+    labels = [item.label for item in parsed]
+    urls = [item.url for item in parsed]
+    if len(labels) != len(set(labels)):
+        raise ValueError("gateway.inference_upstreams labels must be unique")
+    if len(urls) != len(set(urls)):
+        raise ValueError("gateway.inference_upstreams urls must be unique")
+    return parsed
+
+
 def default_config_path() -> Path:
     """``$SCITEX_DIR/genai/config.yaml`` -- ``~/.scitex/genai/config.yaml`` normally."""
     return Path(get_scitex_dir()) / "genai" / "config.yaml"
@@ -187,29 +266,17 @@ def check_bool(name: str, value: Any) -> bool:
     raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
-def upstream_string(value: Any) -> str:
-    """The comma-separated form the server takes; a list, a string or nothing."""
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        value = ",".join(str(item) for item in value)
-    return ",".join(parse_upstreams(str(value)))
-
-
 @dataclass(frozen=True)
 class GatewaySettings:
-    """One gateway, fully described. ``inference_upstream`` empty = Codex backend."""
+    """One gateway; no configured local members means the Codex backend."""
 
     host: str
     port: int
-    inference_upstream: str
     source: Path | None
+    inference_upstreams: tuple[InferenceUpstreamSettings, ...] = ()
     inference_timeout_s: float = DEFAULT_TIMEOUT_S
     inference_capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM
     inference_max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE
-    inference_token_capacity_per_upstream: int | None = (
-        DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM
-    )
     inference_continuation_qos_enabled: bool = DEFAULT_CONTINUATION_QOS_ENABLED
     inference_continuation_qos_max_retries: int = DEFAULT_CONTINUATION_QOS_MAX_RETRIES
     inference_continuation_qos_min_preempt_tokens: int = (
@@ -224,7 +291,7 @@ class GatewaySettings:
         object.__setattr__(self, "host", check_host(self.host))
         object.__setattr__(self, "port", check_port(self.port))
         object.__setattr__(
-            self, "inference_upstream", upstream_string(self.inference_upstream)
+            self, "inference_upstreams", upstream_settings(self.inference_upstreams)
         )
         object.__setattr__(
             self, "inference_timeout_s", check_timeout_s(self.inference_timeout_s)
@@ -238,17 +305,7 @@ class GatewaySettings:
                 minimum=1,
             ),
         )
-        if self.inference_token_capacity_per_upstream is not None:
-            object.__setattr__(
-                self,
-                "inference_token_capacity_per_upstream",
-                check_count(
-                    "inference_token_capacity_per_upstream",
-                    self.inference_token_capacity_per_upstream,
-                    minimum=1,
-                ),
-            )
-        if self.external_provider is not None and self.inference_upstream:
+        if self.external_provider is not None and self.inference_upstreams:
             raise ValueError(
                 "gateway.external_provider and gateway.inference_upstreams are mutually exclusive"
             )
@@ -318,11 +375,9 @@ def load_settings(
     *,
     host: str | None = None,
     port: int | None = None,
-    inference_upstream: str | None = None,
     inference_timeout_s: float | None = None,
     inference_capacity_per_upstream: int | None = None,
     inference_max_queue_size: int | None = None,
-    inference_token_capacity_per_upstream: int | None = None,
     inference_continuation_qos_enabled: bool | None = None,
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
@@ -334,11 +389,6 @@ def load_settings(
     path = Path(config_path) if config_path is not None else default_config_path()
     present = path.is_file()
     config = ScitexConfig(config_path=path if present else None)
-    upstream = config.resolve(
-        KEY_UPSTREAMS, direct_val=inference_upstream, default=None
-    )
-    if upstream is None:
-        upstream = os.getenv(UPSTREAM_ENV, "")
     # Spell this cascade out: ScitexConfig.resolve() would otherwise put its
     # implicit SCITEX_GATEWAY_INFERENCE_TIMEOUT_S ahead of the older,
     # documented HOIST_TIMEOUT_S contract.
@@ -351,13 +401,41 @@ def load_settings(
         )
     raw_config = load_yaml(path) if present else {}
     raw_gateway = raw_config.get("gateway", {}) if isinstance(raw_config, dict) else {}
+    retired_envs = [name for name in RETIRED_UPSTREAM_ENVS if os.getenv(name, "")]
+    if retired_envs:
+        raise ValueError(
+            "retired local inference environment: "
+            + ", ".join(retired_envs)
+            + "; migrate each member to gateway.inference_upstreams with "
+            "label, url, and token_capacity"
+        )
+    retired = {
+        key
+        for key in (
+            "inference_upstream",
+            "inference_token_capacity_per_upstream",
+        )
+        if isinstance(raw_gateway, dict) and key in raw_gateway
+    }
+    if retired:
+        raise ValueError(
+            "retired local inference configuration: "
+            + ", ".join(sorted(retired))
+            + "; migrate each member to gateway.inference_upstreams with "
+            "label, url, and token_capacity"
+        )
+    structured_upstreams = (
+        raw_gateway.get("inference_upstreams", _MISSING)
+        if isinstance(raw_gateway, dict)
+        else _MISSING
+    )
     external_mapping = (
         raw_gateway.get("external_provider") if isinstance(raw_gateway, dict) else None
     )
     return GatewaySettings(
         host=config.resolve(KEY_HOST, direct_val=host, default=DEFAULT_HOST),
         port=config.resolve(KEY_PORT, direct_val=port, default=DEFAULT_PORT, type=int),
-        inference_upstream=upstream,
+        inference_upstreams=upstream_settings(structured_upstreams),
         source=path if present else None,
         inference_timeout_s=timeout,
         inference_capacity_per_upstream=config.resolve(
@@ -369,11 +447,6 @@ def load_settings(
             KEY_MAX_QUEUE,
             direct_val=inference_max_queue_size,
             default=DEFAULT_MAX_QUEUE_SIZE,
-        ),
-        inference_token_capacity_per_upstream=config.resolve(
-            KEY_TOKEN_CAPACITY,
-            direct_val=inference_token_capacity_per_upstream,
-            default=DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         ),
         inference_continuation_qos_enabled=config.resolve(
             KEY_CONTINUATION_QOS,

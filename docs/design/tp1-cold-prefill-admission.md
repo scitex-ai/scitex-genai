@@ -70,7 +70,10 @@ initial replay candidate is:
 
 ```yaml
 gateway:
-  inference_token_capacity_per_upstream: 1600000
+  inference_upstreams:
+    - label: qwen-tp2
+      url: http://127.0.0.1:18773
+      token_capacity: 1600000
   inference_cold_prefill_limit_per_upstream: 1
   inference_cold_prefill_min_tokens: 128000
 ```

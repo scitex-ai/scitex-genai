@@ -92,7 +92,6 @@ from ._sglang_metrics import SGLangSchedulerObservation, probe_sglang_metrics
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
 #: working unchanged. Comma-separated base URLs, seconds, and a truthy flag.
-UPSTREAM_ENV = "HOIST_UPSTREAM"
 TIMEOUT_ENV = "HOIST_TIMEOUT_S"
 PREFIX_TELEMETRY_ENV = "HOIST_PREFIX_TELEMETRY"
 DEFAULT_TIMEOUT_S = 600.0
@@ -155,7 +154,7 @@ _CHECKPOINTS = (1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 16384)
 
 
 def parse_upstreams(value: str) -> list[str]:
-    """``HOIST_UPSTREAM`` format: comma-separated, whitespace-tolerant, no empties."""
+    """Parse a programmatic comma-separated URL list for legacy/external pools."""
     return [url.strip() for url in value.split(",") if url.strip()]
 
 
@@ -759,11 +758,13 @@ def prefix_report(payload: dict[str, Any], key: str | None) -> str | None:
 class InferenceUpstream:
     """One Anthropic-compatible inference server.
 
-    Its alias IS its base URL: that is the name the fleet's drop-ins, the boot
-    line and every refusal use, and there is nothing else to call it.
+    ``alias`` is the stable non-secret routing identity; ``base_url`` is the
+    transport address. Legacy programmatic pools may omit ``url``, making the
+    URL its own alias, but deployment configuration is structured and named.
     """
 
     alias: str
+    url: str | None = None
     in_flight: int = 0
     last_used_at: float = 0.0
     capacity: int = DEFAULT_CAPACITY_PER_UPSTREAM
@@ -780,12 +781,19 @@ class InferenceUpstream:
 
     @property
     def base_url(self) -> str:
-        return self.alias
+        return self.url or self.alias
 
     @property
     def usage_score(self) -> float:
-        """No quota notion: the pool assumes interchangeable upstreams."""
-        return 0.0
+        """Worst normalized request/token pressure across heterogeneous members."""
+        request_pressure = (self.in_flight + self.queued) / self.capacity
+        token_pressure = (
+            (self.input_tokens_in_flight + self.input_tokens_queued)
+            / self.token_capacity
+            if self.token_capacity is not None
+            else 0.0
+        )
+        return max(request_pressure, token_pressure)
 
     @property
     def scheduling_load(self) -> int:
@@ -793,12 +801,14 @@ class InferenceUpstream:
 
     def status(self, *, closing: bool = False) -> dict[str, Any]:
         status = {
-            "url": self.alias,
+            "url": self.base_url,
             "active": not closing and self.cooldown_until <= time.time(),
             "in_flight": self.in_flight,
             "queued": self.queued,
             "capacity": self.capacity,
         }
+        if self.url is not None:
+            status["label"] = self.alias
         if self.token_capacity is not None:
             status.update(
                 input_tokens_in_flight=self.input_tokens_in_flight,
@@ -934,7 +944,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             raise ValueError("cold_prefill_min_tokens must be >= 1")
         for upstream in upstreams:
             upstream.capacity = capacity_per_upstream
-            upstream.token_capacity = token_capacity_per_upstream
+            if token_capacity_per_upstream is not None:
+                upstream.token_capacity = token_capacity_per_upstream
         self.max_queue_size = max_queue_size
         self.max_admission_bypasses = max_admission_bypasses
         self.priority_aging_s = priority_aging_s
@@ -981,7 +992,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
     ) -> "InferenceUpstreamPool":
-        """Build from the ``HOIST_UPSTREAM`` string or an already-split list."""
+        """Build a programmatic legacy/external pool from transport URLs."""
         if isinstance(urls, str):
             urls = parse_upstreams(urls)
         return cls(
@@ -996,16 +1007,76 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             cold_prefill_min_tokens=cold_prefill_min_tokens,
         )
 
+    @classmethod
+    def from_specs(
+        cls,
+        specs: list[Any] | tuple[Any, ...],
+        *,
+        capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+        cold_prefill_limit_per_upstream: int | None = None,
+        cold_prefill_min_tokens: int | None = None,
+    ) -> "InferenceUpstreamPool":
+        """Build named members from validated deployment settings."""
+        return cls(
+            [
+                InferenceUpstream(
+                    alias=spec.label,
+                    url=spec.url,
+                    token_capacity=spec.token_capacity,
+                )
+                for spec in specs
+            ],
+            capacity_per_upstream=capacity_per_upstream,
+            max_queue_size=max_queue_size,
+            token_capacity_per_upstream=None,
+            cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
+            cold_prefill_min_tokens=cold_prefill_min_tokens,
+        )
+
     async def route_alias(
-        self, session_id: str, *, exclude: set[str] | None = None
+        self,
+        session_id: str,
+        *,
+        exclude: set[str] | None = None,
+        input_tokens: int = 0,
     ) -> str:
         """Resolve and pin a session's target without consuming capacity."""
+        if input_tokens < 0:
+            raise ValueError("input_tokens must be >= 0")
         async with self._admission:
             if self._closing:
                 raise InferenceAdmissionError("Inference gateway is shutting down")
-            return self._select_locked(
-                session_id, exclude or set(), now=time.time()
+            return self._select_for_input_locked(
+                session_id, set(exclude or ()), input_tokens=input_tokens
             ).alias
+
+    def _select_for_input_locked(
+        self, session_id: str, excluded: set[str], *, input_tokens: int
+    ) -> InferenceUpstream:
+        """Select only a member on which this request can ever be resident."""
+        incapable = {
+            upstream.alias
+            for upstream in self.upstreams
+            if upstream.token_capacity is not None
+            and input_tokens > upstream.token_capacity
+        }
+        if len(incapable) == len(self.upstreams):
+            maximum = max(
+                (upstream.token_capacity or 0 for upstream in self.upstreams),
+                default=0,
+            )
+            raise InferenceAdmissionError(
+                "Estimated request input exceeds every configured upstream's "
+                f"token capacity ({input_tokens}; maximum {maximum})"
+            )
+        sticky_alias = self._sessions.get(session_id) if session_id else None
+        if sticky_alias in incapable:
+            # Capacity is a hard correctness boundary. Repin only when the
+            # existing member can never fit the grown session; the new member
+            # starts cold because cache prediction is label-bound.
+            self._sessions.pop(session_id, None)
+        return self._select_locked(session_id, excluded | incapable, now=time.time())
 
     async def acquire(
         self,
@@ -1030,7 +1101,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 raise InferenceAdmissionError("Inference gateway is shutting down")
             excluded = exclude or set()
             if selected_alias is None:
-                selected = self._select_locked(session_id, excluded, now=time.time())
+                selected = self._select_for_input_locked(
+                    session_id, set(excluded), input_tokens=input_tokens
+                )
             else:
                 selected = self._by_alias(selected_alias)
                 if (
@@ -1469,7 +1542,9 @@ def announce(host: str, port: int, pool: InferenceUpstreamPool) -> str:
     agent funnelled to one card. One line at start makes the next such
     misconfiguration a five-second read of the journal.
     """
-    urls = ", ".join(upstream.alias for upstream in pool.upstreams)
+    urls = ", ".join(
+        f"{upstream.alias}={upstream.base_url}" for upstream in pool.upstreams
+    )
     return (
         f"scitex-genai-gateway: listening {host}:{port} -> "
         f"{len(pool.upstreams)} inference upstream(s): {urls}  [sticky per conversation]"
@@ -1834,7 +1909,12 @@ class InferenceBackend:
             task = self._scheduler_probe_tasks.get(upstream)
             if task is None:
                 probe = self._scheduler_probe or probe_sglang_metrics
-                task = asyncio.create_task(probe(upstream, self.health_probe_timeout_s))
+                member = self.pool._by_alias(upstream)
+                if member is None:
+                    raise ValueError("scheduler probe names an unknown upstream")
+                task = asyncio.create_task(
+                    probe(member.base_url, self.health_probe_timeout_s)
+                )
                 self._scheduler_probe_tasks[upstream] = task
         try:
             observation = await asyncio.shield(task)
@@ -2145,7 +2225,7 @@ class InferenceBackend:
                     self._note_request(request_observation)
                 try:
                     predicted_alias = await self.pool.route_alias(
-                        routing_session, exclude=attempted
+                        routing_session, exclude=attempted, input_tokens=input_tokens
                     )
                     await self.refresh_backend_scheduler(predicted_alias)
                     prediction = self.admission_predictions.predict(

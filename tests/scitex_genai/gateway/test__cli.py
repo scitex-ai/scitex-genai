@@ -21,15 +21,12 @@ from scitex_genai.gateway._secrets import (
 )
 from scitex_genai.gateway._unit import UNIT_NAME, render_unit
 
-UPSTREAM = "http://127.0.0.1:18773,http://127.0.0.1:18774"
 INSTALL_ARGS = [
     INSTALL_UNIT,
     "--host",
     "0.0.0.0",
     "--port",
     "18772",
-    "--inference-upstream",
-    UPSTREAM,
 ]
 
 
@@ -56,15 +53,13 @@ def test_serve_flags_default_to_unset_so_the_settings_file_decides():
         args.config,
         args.host,
         args.port,
-        args.inference_upstream,
         args.inference_timeout_s,
         args.inference_capacity_per_upstream,
         args.inference_max_queue_size,
-        args.inference_token_capacity_per_upstream,
         args.inference_continuation_qos,
         args.inference_continuation_qos_max_retries,
         args.inference_continuation_qos_min_preempt_tokens,
-    ) == (None, None, None, None, None, None, None, None, None, None, None)
+    ) == (None, None, None, None, None, None, None, None, None)
 
 
 def test_install_unit_is_recognised():
@@ -125,10 +120,9 @@ def test_install_unit_takes_the_settings_flags():
     args = parser.parse_args(INSTALL_ARGS)
 
     # Assert
-    assert (args.host, args.port, args.inference_upstream) == (
+    assert (args.host, args.port) == (
         "0.0.0.0",
         18772,
-        UPSTREAM,
     )
 
 
@@ -164,16 +158,12 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "0.0.0.0",
         "--port",
         "18772",
-        "--inference-upstream",
-        "http://one",
         "--inference-timeout-s",
         "123",
         "--inference-capacity-per-upstream",
         "3",
         "--inference-max-queue-size",
         "9",
-        "--inference-token-capacity-per-upstream",
-        "1600000",
         "--inference-continuation-qos",
         "--inference-continuation-qos-max-retries",
         "2",
@@ -190,11 +180,9 @@ def test_all_shared_settings_accept_the_same_parent_or_subcommand_placement():
         "config",
         "host",
         "port",
-        "inference_upstream",
         "inference_timeout_s",
         "inference_capacity_per_upstream",
         "inference_max_queue_size",
-        "inference_token_capacity_per_upstream",
         "inference_continuation_qos",
         "inference_continuation_qos_max_retries",
         "inference_continuation_qos_min_preempt_tokens",
@@ -234,9 +222,7 @@ def test_main_install_unit_writes_the_unit_without_starting_a_server(tmp_path: P
     main(argv)
 
     # Assert
-    assert (tmp_path / UNIT_NAME).read_text() == render_unit(
-        host="0.0.0.0", port=18772, upstream=UPSTREAM
-    )
+    assert (tmp_path / UNIT_NAME).read_text() == render_unit(host="0.0.0.0", port=18772)
 
 
 def test_main_install_unit_reports_the_path_and_the_state(
@@ -255,7 +241,9 @@ def test_main_install_unit_reports_the_path_and_the_state(
     )
 
 
-def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
+def test_main_forwards_structured_upstream_to_inference_backend(
+    tmp_path, gateway_key_env
+):
     # Arrange
     gateway_key_env("test-key")
     calls = []
@@ -263,9 +251,17 @@ def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
     def record(app, **kwargs):
         calls.append((app, kwargs))
 
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "gateway:\n"
+        "  inference_upstreams:\n"
+        "    - label: qwen-tp1\n"
+        "      url: http://127.0.0.1:18773\n"
+        "      token_capacity: 563215\n"
+    )
     argv = [
-        "--inference-upstream",
-        "http://127.0.0.1:18773",
+        "--config",
+        str(config),
         "--inference-timeout-s",
         "123",
         "--inference-capacity-per-upstream",
@@ -284,11 +280,17 @@ def test_main_forwards_timeout_to_foreground_inference_backend(gateway_key_env):
         app.state.scitex_backend.timeout_s,
         kwargs,
         pool.upstreams[0].capacity,
+        pool.upstreams[0].alias,
+        pool.upstreams[0].base_url,
+        pool.upstreams[0].token_capacity,
         pool.max_queue_size,
     ) == (
         123.0,
         {"host": "127.0.0.1", "port": 8765, "log_level": "info"},
         3,
+        "qwen-tp1",
+        "http://127.0.0.1:18773",
+        563_215,
         9,
     )
 

@@ -5,7 +5,7 @@ default (see ``_settings``), so the plain form needs no flags on a configured
 host::
 
     scitex-genai-gateway                       # the process IS the server
-    scitex-genai-gateway --host 127.0.0.1 --port 8765 --inference-upstream URL,URL
+    scitex-genai-gateway --host 127.0.0.1 --port 8765
 
 ``install-unit`` writes the systemd user unit that runs that same command line
 under supervision, reloads the user manager and enables it (see ``_unit``)::
@@ -79,16 +79,6 @@ def _add_settings_args(
         help="port (default: gateway.port, else 8765)",
     )
     parser.add_argument(
-        "--inference-upstream",
-        default=default,
-        help=(
-            "Comma-separated base URLs of Anthropic-compatible inference "
-            "upstreams (vLLM, LiteLLM). When set, /v1/messages is relayed to "
-            "that pool instead of the Codex accounts. Default: "
-            "gateway.inference_upstreams in the settings file, else $HOIST_UPSTREAM."
-        ),
-    )
-    parser.add_argument(
         "--inference-timeout-s",
         type=float,
         default=default,
@@ -114,16 +104,6 @@ def _add_settings_args(
         help=(
             "Maximum requests waiting for inference capacity across the pool "
             "(default: gateway.inference_max_queue_size, else 128)."
-        ),
-    )
-    parser.add_argument(
-        "--inference-token-capacity-per-upstream",
-        type=int,
-        default=default,
-        help=(
-            "Maximum estimated input tokens admitted concurrently per inference "
-            "upstream (default: gateway.inference_token_capacity_per_upstream; "
-            "unset disables the token budget)."
         ),
     )
     parser.add_argument(
@@ -296,13 +276,9 @@ def _install_unit(args: argparse.Namespace) -> None:
     path = install_unit(
         host=args.host,
         port=args.port,
-        upstream=args.inference_upstream,
         inference_timeout_s=args.inference_timeout_s,
         inference_capacity_per_upstream=args.inference_capacity_per_upstream,
         inference_max_queue_size=args.inference_max_queue_size,
-        inference_token_capacity_per_upstream=(
-            args.inference_token_capacity_per_upstream
-        ),
         inference_continuation_qos_enabled=args.inference_continuation_qos,
         inference_continuation_qos_max_retries=(
             args.inference_continuation_qos_max_retries
@@ -353,13 +329,9 @@ def main(
         args.config,
         host=args.host,
         port=args.port,
-        inference_upstream=args.inference_upstream,
         inference_timeout_s=args.inference_timeout_s,
         inference_capacity_per_upstream=args.inference_capacity_per_upstream,
         inference_max_queue_size=args.inference_max_queue_size,
-        inference_token_capacity_per_upstream=(
-            args.inference_token_capacity_per_upstream
-        ),
         inference_continuation_qos_enabled=args.inference_continuation_qos,
         inference_continuation_qos_max_retries=(
             args.inference_continuation_qos_max_retries
@@ -381,9 +353,7 @@ def main(
             [external.upstream],
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
-            token_capacity_per_upstream=(
-                settings.inference_token_capacity_per_upstream
-            ),
+            token_capacity_per_upstream=None,
             cold_prefill_limit_per_upstream=(
                 settings.inference_cold_prefill_limit_per_upstream
             ),
@@ -415,14 +385,11 @@ def main(
             f"{external.canonical_model} only",
             flush=True,
         )
-    elif settings.inference_upstream:
-        pool = InferenceUpstreamPool.from_urls(
-            settings.inference_upstream,
+    elif settings.inference_upstreams:
+        pool = InferenceUpstreamPool.from_specs(
+            settings.inference_upstreams,
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
-            token_capacity_per_upstream=(
-                settings.inference_token_capacity_per_upstream
-            ),
             cold_prefill_limit_per_upstream=(
                 settings.inference_cold_prefill_limit_per_upstream
             ),
