@@ -55,6 +55,45 @@ EOF remain buffered.  Downstream close/cancellation drains the finished stream
 and releases exactly once, but this change does not add an unbounded response
 spool or claim to fix a client that never advances and never closes.
 
+Pre-deployment trace replay
+---------------------------
+
+Do not copy the example directly into a live profile.  Replay the captured
+admission trace first with the observed full-input sizes 695k, 643k, 607k, and
+144k.  The current 1.1M full-input cap admits each large+144k pair (839k, 787k,
+and 751k) but rejects concurrent large pairs (1.338M, 1.302M, and 1.250M).
+That is why a hot continuation can still wait even after the cold-prefill guard
+is enabled: the full-input cap remains an independent safety ceiling.
+
+For the measured SGLang ``max_total_num_tokens=2,180,096``, the conservative
+initial replay candidate is:
+
+```yaml
+gateway:
+  inference_token_capacity_per_upstream: 1600000
+  inference_cold_prefill_limit_per_upstream: 1
+  inference_cold_prefill_min_tokens: 128000
+```
+
+At 1.6M, every observed pair fits.  Any two large requests plus 144k also fit:
+1.482M (695+643+144), 1.446M (695+607+144), and 1.394M
+(643+607+144).  All three large requests total 1.945M and remain gated, leaving
+580,096 tokens of engine headroom at the gateway cap for output, estimation
+error, and engine overhead.  A single cold request below 1.6M still drains and
+makes progress; only a request above the explicit total-input cap is refused as
+before.
+
+During replay and any later canary, compare schema-v2 gateway admitted/queued
+counts with SGLang running/queued/token usage.  Track hot and unknown queue age,
+``predicted_uncached_tokens``, ``blocked_total`` for ``cold-prefill-limit`` and
+``token-capacity``, missing cache reports, cache tier, TTFT, total latency,
+engine restarts/OOMs, and cancellation cleanup.  Roll back by restoring the
+1.1M token cap and unsetting both cold-prefill settings if hot queue/TTFT tails
+regress, unknown work serializes excessively, gateway/backend ownership
+diverges, cache reports disappear, or SGLang approaches exhaustion/restarts.
+No configuration change belongs in this PR; review and CI must pass before a
+separate canary deployment.
+
 `SGLangCacheTierValidator` is fail-closed. Device capacity becomes usable when
 the startup log reports `max_total_num_tokens`. Merely allocating host or file
 HiCache does not make it usable; an actual positive tier hit validates the tier.

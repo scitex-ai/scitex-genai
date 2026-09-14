@@ -94,6 +94,7 @@ def test_observed_hub_append_only_turn_predicts_only_growth() -> None:
 
 
 def test_partial_actual_cache_report_remains_in_the_next_uncached_budget() -> None:
+    # Arrange
     telemetry = AdmissionPredictionTelemetry()
     messages = [{"role": "user", "content": "large turn"}]
     _observe(
@@ -104,6 +105,7 @@ def test_partial_actual_cache_report_remains_in_the_next_uncached_budget() -> No
         cached=103_296,
     )
 
+    # Act
     prediction = telemetry.predict(
         session_id="session",
         upstream="upstream",
@@ -112,10 +114,12 @@ def test_partial_actual_cache_report_remains_in_the_next_uncached_budget() -> No
         estimated_input_tokens=243_434,
     )
 
+    # Assert
     assert prediction.predicted_uncached_tokens == 140_138
 
 
 def test_hot_history_expires_before_the_observed_residency_loss_window() -> None:
+    # Arrange
     now = [0.0]
     telemetry = AdmissionPredictionTelemetry(
         max_observation_age_s=300.0, clock=lambda: now[0]
@@ -130,6 +134,7 @@ def test_hot_history_expires_before_the_observed_residency_loss_window() -> None
     )
     now[0] = 362.803
 
+    # Act
     prediction = telemetry.predict(
         session_id="session",
         upstream="upstream",
@@ -138,6 +143,7 @@ def test_hot_history_expires_before_the_observed_residency_loss_window() -> None
         estimated_input_tokens=642_616,
     )
 
+    # Assert
     assert (prediction.evidence, prediction.predicted_uncached_tokens) == (
         "no-compatible-history",
         642_616,
@@ -214,9 +220,11 @@ def test_generation_change_and_missing_report_never_reuse_history() -> None:
 
 
 def test_missing_cache_report_invalidates_same_generation_history() -> None:
+    # Arrange
     telemetry = AdmissionPredictionTelemetry()
     messages = [{"role": "user", "content": "one"}]
     _observe(telemetry, messages=messages, estimated=100, reported=100, cached=100)
+    # Act
     missing = telemetry.predict(
         session_id="session",
         upstream="upstream",
@@ -241,6 +249,7 @@ def test_missing_cache_report_invalidates_same_generation_history() -> None:
         estimated_input_tokens=120,
     )
 
+    # Assert
     assert (next_prediction.evidence, next_prediction.predicted_uncached_tokens) == (
         "no-compatible-history",
         120,

@@ -212,6 +212,7 @@ async def test_health_exposes_incremented_observe_only_snapshot(
 async def test_actual_partial_cache_report_drives_next_relay_admission(
     upstream_factory,
 ) -> None:
+    # Arrange
     report = {
         "usage": {
             "prompt_tokens": 243_434,
@@ -233,12 +234,14 @@ async def test_actual_partial_cache_report_drives_next_relay_admission(
     )
     _ = b"".join([chunk async for chunk in first.body])
 
+    # Act
     second = await backend.relay(
         "POST", "/v1/chat/completions", body=body, headers=headers
     )
     snapshot = await pool.observability_snapshot()
     ticket = snapshot["tickets"][0]
 
+    # Assert
     assert (
         second.feedback_headers["x-scitex-cache-residency"],
         ticket["predicted_uncached_tokens"],
@@ -257,6 +260,7 @@ async def _wait_for_pool_queue(pool: InferenceUpstreamPool, size: int) -> None:
 
 @pytest.mark.asyncio
 async def test_predicted_hot_and_hot_prefills_coexist() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=2,
@@ -264,6 +268,7 @@ async def test_predicted_hot_and_hot_prefills_coexist() -> None:
         cold_prefill_min_tokens=128_000,
     )
 
+    # Act
     first = await pool.acquire(
         "hot-1",
         input_tokens=640_000,
@@ -277,6 +282,7 @@ async def test_predicted_hot_and_hot_prefills_coexist() -> None:
         cache_classification="hot",
     )
 
+    # Assert
     assert (first.in_flight, first.cold_prefills_in_flight) == (2, 0)
     await pool.release(first, input_tokens=640_000, session_id="hot-1")
     await pool.release(second, input_tokens=640_000, session_id="hot-2")
@@ -284,6 +290,7 @@ async def test_predicted_hot_and_hot_prefills_coexist() -> None:
 
 @pytest.mark.asyncio
 async def test_predicted_hot_and_large_uncached_prefill_coexist() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=2,
@@ -291,6 +298,7 @@ async def test_predicted_hot_and_large_uncached_prefill_coexist() -> None:
         cold_prefill_min_tokens=128_000,
     )
 
+    # Act
     cold = await pool.acquire(
         "cold",
         input_tokens=243_434,
@@ -304,6 +312,7 @@ async def test_predicted_hot_and_large_uncached_prefill_coexist() -> None:
         cache_classification="hot",
     )
 
+    # Assert
     assert (cold.in_flight, cold.cold_prefills_in_flight) == (2, 1)
     await pool.release(cold, input_tokens=243_434, session_id="cold")
     await pool.release(hot, input_tokens=640_000, session_id="hot")
@@ -311,6 +320,7 @@ async def test_predicted_hot_and_large_uncached_prefill_coexist() -> None:
 
 @pytest.mark.asyncio
 async def test_large_uncached_prefills_serialize_and_unknown_is_conservative() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=3,
@@ -333,21 +343,26 @@ async def test_large_uncached_prefills_serialize_and_unknown_is_conservative() -
     )
     await _wait_for_pool_queue(pool, 1)
 
+    # Act
     hot = await pool.acquire(
         "hot",
         input_tokens=640_000,
         predicted_uncached_tokens=0,
         cache_classification="hot",
     )
-    assert unknown.done() is False
+    blocked = unknown.done() is False
     await pool.release(hot, input_tokens=640_000, session_id="hot")
     await pool.release(first, input_tokens=677_000, session_id="cold")
     admitted = await asyncio.wait_for(unknown, 1)
     await pool.release(admitted, input_tokens=243_434, session_id="unknown")
 
+    # Assert
+    assert blocked is True
+
 
 @pytest.mark.asyncio
 async def test_cancelled_uncached_waiter_releases_its_queue_ownership() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=2,
@@ -360,15 +375,20 @@ async def test_cancelled_uncached_waiter_releases_its_queue_ownership() -> None:
     )
     await _wait_for_pool_queue(pool, 1)
 
+    # Act
     waiting.cancel()
     await asyncio.gather(waiting, return_exceptions=True)
 
-    assert pool.status()[0]["queued"] == 0
+    queued = pool.status()[0]["queued"]
     await pool.release(first, input_tokens=200, session_id="first")
+
+    # Assert
+    assert queued == 0
 
 
 @pytest.mark.asyncio
 async def test_finished_upstream_releases_when_slow_client_closes_stream() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         cold_prefill_limit_per_upstream=1,
@@ -401,16 +421,19 @@ async def test_finished_upstream_releases_when_slow_client_closes_stream() -> No
         session_id="session",
         cold_prefill=True,
     )
-    assert await anext(relayed) == b"already-buffered"
+    # Act
+    first_chunk = await anext(relayed)
     held_while_client_is_slow = member.in_flight
-
     await relayed.aclose()
 
+    # Assert
     assert (
+        first_chunk,
         held_while_client_is_slow,
         member.in_flight,
         member.cold_prefills_in_flight,
     ) == (
+        b"already-buffered",
         1,
         0,
         0,
@@ -419,6 +442,7 @@ async def test_finished_upstream_releases_when_slow_client_closes_stream() -> No
 
 @pytest.mark.asyncio
 async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=2,
@@ -439,18 +463,22 @@ async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
     )
     await _wait_for_pool_queue(pool, 2)
 
+    # Act
     await pool.release(cold, input_tokens=200, session_id="cold")
     next_member = await asyncio.wait_for(aged, 1)
-
-    assert priority.done() is False
+    priority_waited = priority.done() is False
     await pool.release(next_member, input_tokens=200, session_id="aged")
     next_priority = await asyncio.wait_for(priority, 1)
     await pool.release(blocker, input_tokens=1, session_id="blocker")
     await pool.release(next_priority, input_tokens=1, session_id="priority")
 
+    # Assert
+    assert priority_waited is True
+
 
 @pytest.mark.asyncio
 async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
+    # Arrange
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
         capacity_per_upstream=2,
@@ -472,6 +500,7 @@ async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
     )
     await _wait_for_pool_queue(pool, 1)
 
+    # Act
     await pool.release(blocker, input_tokens=1, session_id="blocker")
     await asyncio.sleep(0)
     snapshot = await pool.observability_snapshot()
@@ -479,12 +508,51 @@ async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
     queued = next(
         ticket for ticket in snapshot["tickets"] if ticket["state"] == "queued"
     )
-    assert (
+    observed = (
         stale_hot.done(),
         queued["cache_classification"],
         queued["predicted_uncached_tokens"],
         queued["cold_prefill"],
-    ) == (False, "unknown", 642_616, True)
+    )
     stale_hot.cancel()
     await asyncio.gather(stale_hot, return_exceptions=True)
     await pool.release(cold, input_tokens=500_000, session_id="cold")
+
+    # Assert
+    assert observed == (False, "unknown", 642_616, True)
+
+
+@pytest.mark.asyncio
+async def test_single_large_cold_prefill_drains_then_makes_progress() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=3,
+        token_capacity_per_upstream=1_600_000,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    hot = await pool.acquire(
+        "hot", input_tokens=144_000, predicted_uncached_tokens=1_000
+    )
+    large = asyncio.create_task(
+        pool.acquire(
+            "large-cold",
+            input_tokens=1_590_000,
+            predicted_uncached_tokens=1_590_000,
+        )
+    )
+    await _wait_for_pool_queue(pool, 1)
+
+    # Act
+    backfill = await pool.acquire(
+        "backfill", input_tokens=144_000, predicted_uncached_tokens=1_000
+    )
+    await pool.release(backfill, input_tokens=144_000, session_id="backfill")
+    remained_queued = large.done() is False
+    await pool.release(hot, input_tokens=144_000, session_id="hot")
+    admitted = await asyncio.wait_for(large, 1)
+    await pool.release(admitted, input_tokens=1_590_000, session_id="large-cold")
+
+    # Assert
+    assert (remained_queued, pool.status()[0]["in_flight"]) == (True, 0)
