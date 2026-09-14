@@ -4,6 +4,7 @@ import pytest
 
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
 from scitex_genai.gateway._prediction import AdmissionPredictionTelemetry
+from scitex_genai.gateway._sglang_metrics import SGLangSchedulerObservation
 
 
 def _body(messages: list[dict[str, str]], *, tools: str = "stable") -> bytes:
@@ -256,6 +257,46 @@ def test_missing_cache_report_invalidates_same_generation_history() -> None:
     )
 
 
+def test_unavailable_generation_never_records_reusable_history() -> None:
+    # Arrange
+    telemetry = AdmissionPredictionTelemetry()
+    first = telemetry.predict(
+        session_id="session",
+        upstream="engine",
+        engine_generation=None,
+        body=b'{"messages":[{"role":"user","content":"first"}]}',
+        estimated_input_tokens=100,
+    )
+    telemetry.observe(
+        first,
+        session_id="session",
+        upstream="engine",
+        reported_input_tokens=100,
+        cached_tokens=90,
+        cache_tier="device",
+    )
+
+    # Act
+    second = telemetry.predict(
+        session_id="session",
+        upstream="engine",
+        engine_generation=None,
+        body=(
+            b'{"messages":[{"role":"user","content":"first"},'
+            b'{"role":"user","content":"second"}]}'
+        ),
+        estimated_input_tokens=120,
+    )
+
+    # Assert
+    assert (
+        first.engine_generation,
+        second.evidence,
+        second.predicted_uncached_tokens,
+        telemetry.snapshot()["observations"],
+    ) == ("unavailable", "no-compatible-history", 120, 0)
+
+
 def test_observations_and_recent_rows_are_bounded() -> None:
     # Arrange
     telemetry = AdmissionPredictionTelemetry(max_sessions=2, max_recent=2)
@@ -295,15 +336,14 @@ async def test_operator_snapshot_distinguishes_gateway_admitted_from_backend_que
 ):
     # Arrange
     pool = InferenceUpstreamPool.from_urls("http://engine:1")
-    backend = InferenceBackend(pool)
+
+    async def scheduler_probe(
+        upstream: str, timeout_s: float
+    ) -> SGLangSchedulerObservation:
+        return SGLangSchedulerObservation("1" * 32, 0, 2, 0.22)
+
+    backend = InferenceBackend(pool, scheduler_probe=scheduler_probe)
     member = await pool.acquire("session", input_tokens=500_000)
-    backend.observe_backend_scheduler(
-        upstream=member.alias,
-        engine_generation="process-123",
-        running=0,
-        queued=2,
-        token_usage=0.22,
-    )
 
     # Act
     snapshot = await backend.observability_snapshot()
@@ -318,5 +358,112 @@ async def test_operator_snapshot_distinguishes_gateway_admitted_from_backend_que
         comparison["backend"]["queued"],
         comparison["backend"]["token_usage"],
         comparison["block_reason"],
-        comparison["backend"]["engine_generation"] != "process-123",
+        comparison["backend"]["engine_generation"] != "1" * 32,
     ) == (1, 0, 0, 2, 0.22, "backend-scheduler-queue", True)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_generation_change_invalidates_prediction_history() -> None:
+    # Arrange
+    generations = iter(("1" * 32, "2" * 32))
+
+    async def scheduler_probe(
+        upstream: str, timeout_s: float
+    ) -> SGLangSchedulerObservation:
+        return SGLangSchedulerObservation(next(generations), 0, 0, 0.0)
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls("http://engine:1"),
+        scheduler_probe=scheduler_probe,
+    )
+    # Act
+    await backend.refresh_backend_scheduler("http://engine:1")
+    first = backend.admission_predictions.predict(
+        session_id="session",
+        upstream="http://engine:1",
+        engine_generation=backend._engine_generations["http://engine:1"],
+        body=b'{"messages":[{"role":"user","content":"one"}]}',
+        estimated_input_tokens=100,
+    )
+    backend.admission_predictions.observe(
+        first,
+        session_id="session",
+        upstream="http://engine:1",
+        reported_input_tokens=100,
+        cached_tokens=90,
+        cache_tier="device",
+    )
+
+    await backend.refresh_backend_scheduler("http://engine:1")
+    second = backend.admission_predictions.predict(
+        session_id="session",
+        upstream="http://engine:1",
+        engine_generation=backend._engine_generations["http://engine:1"],
+        body=(
+            b'{"messages":[{"role":"user","content":"one"},'
+            b'{"role":"user","content":"two"}]}'
+        ),
+        estimated_input_tokens=120,
+    )
+
+    # Assert
+    assert (first.engine_generation != second.engine_generation, second.evidence) == (
+        True,
+        "no-compatible-history",
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_probe_makes_prior_history_non_reusable() -> None:
+    # Arrange
+    calls = 0
+
+    async def scheduler_probe(
+        upstream: str, timeout_s: float
+    ) -> SGLangSchedulerObservation:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise TimeoutError
+        return SGLangSchedulerObservation("1" * 32, 0, 0, 0.0)
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls("http://engine:1"),
+        scheduler_probe=scheduler_probe,
+    )
+    # Act
+    await backend.refresh_backend_scheduler("http://engine:1")
+    first = backend.admission_predictions.predict(
+        session_id="session",
+        upstream="http://engine:1",
+        engine_generation=backend._engine_generations["http://engine:1"],
+        body=b'{"messages":[{"role":"user","content":"one"}]}',
+        estimated_input_tokens=100,
+    )
+    backend.admission_predictions.observe(
+        first,
+        session_id="session",
+        upstream="http://engine:1",
+        reported_input_tokens=100,
+        cached_tokens=90,
+        cache_tier="device",
+    )
+
+    await backend.refresh_backend_scheduler("http://engine:1")
+    second = backend.admission_predictions.predict(
+        session_id="session",
+        upstream="http://engine:1",
+        engine_generation=backend._engine_generations["http://engine:1"],
+        body=(
+            b'{"messages":[{"role":"user","content":"one"},'
+            b'{"role":"user","content":"two"}]}'
+        ),
+        estimated_input_tokens=120,
+    )
+
+    # Assert
+    assert (
+        second.engine_generation,
+        second.evidence,
+        second.predicted_uncached_tokens,
+    ) == ("unavailable", "no-compatible-history", 120)

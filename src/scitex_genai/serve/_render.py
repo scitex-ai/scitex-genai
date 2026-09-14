@@ -24,6 +24,7 @@ a cold FlashInfer JIT (2 h 27 m measured) on every resubmit.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +49,9 @@ CACHE_SUBDIRS = {
 SGLANG_UNIFIED_RADIX_ENV = "SGLANG_ENABLE_UNIFIED_RADIX_TREE"
 SGLANG_SESSION_FLAG = "--enable-session-radix-cache"
 SGLANG_METRICS_FLAG = "--enable-metrics"
+SGLANG_EXTRA_METRIC_LABELS_FLAG = "--extra-metric-labels"
+SGLANG_ENGINE_GENERATION_LABEL = "scitex_engine_generation"
+SGLANG_ENGINE_GENERATION_PLACEHOLDER = "__SCITEX_ENGINE_GENERATION__"
 SGLANG_HICACHE_STORAGE_ENV = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
 
 
@@ -186,9 +190,7 @@ def _sglang_container_prefix(
     )
 
 
-def _sglang_writable_dirs(
-    conf: EngineConf, env: dict[str, str]
-) -> tuple[Path, ...]:
+def _sglang_writable_dirs(conf: EngineConf, env: dict[str, str]) -> tuple[Path, ...]:
     """Host directories that the clean SGLang container must write.
 
     Apptainer happens to expose ``/tmp`` at many sites, but an explicitly
@@ -213,7 +215,7 @@ def sglang_preflight_argv(
         "from sglang.srt.server_args import ServerArgs; "
         "from sglang.srt import environ; "
         "fields=ServerArgs.__dataclass_fields__; "
-        "required=('enable_session_radix_cache','enable_metrics'); "
+        "required=('enable_session_radix_cache','enable_metrics','extra_metric_labels'); "
         "missing=[name for name in required if name not in fields]; "
         "assert not missing, f'unsupported SGLang image; missing flags: {missing}'; "
         "assert hasattr(environ.envs, 'SGLANG_ENABLE_UNIFIED_RADIX_TREE'), "
@@ -227,6 +229,53 @@ def sglang_preflight_argv(
     return (*_sglang_container_prefix(settings, conf, env), "python3", "-c", script)
 
 
+def _with_engine_generation_label(args: tuple[str, ...]) -> tuple[str, ...]:
+    """Reserve one SGLang metrics label for the per-process cache generation."""
+    values = list(args)
+    positions = [
+        index
+        for index, value in enumerate(values)
+        if value == SGLANG_EXTRA_METRIC_LABELS_FLAG
+        or value.startswith(f"{SGLANG_EXTRA_METRIC_LABELS_FLAG}=")
+    ]
+    if len(positions) > 1:
+        raise ValueError("SGLang --extra-metric-labels may be specified only once")
+    labels: dict[str, str] = {}
+    if positions:
+        index = positions[0]
+        if values[index] == SGLANG_EXTRA_METRIC_LABELS_FLAG:
+            if index + 1 >= len(values):
+                raise ValueError("SGLang --extra-metric-labels requires JSON")
+            raw = values.pop(index + 1)
+            values.pop(index)
+        else:
+            raw = values.pop(index).split("=", 1)[1]
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SGLang --extra-metric-labels must be a JSON object"
+            ) from exc
+        if not isinstance(parsed, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in parsed.items()
+        ):
+            raise ValueError("SGLang --extra-metric-labels must map strings to strings")
+        labels.update(parsed)
+    if SGLANG_ENGINE_GENERATION_LABEL in labels:
+        raise ValueError(
+            f"SGLang metric label {SGLANG_ENGINE_GENERATION_LABEL!r} is reserved"
+        )
+    labels[SGLANG_ENGINE_GENERATION_LABEL] = SGLANG_ENGINE_GENERATION_PLACEHOLDER
+    values.extend(
+        (
+            SGLANG_EXTRA_METRIC_LABELS_FLAG,
+            json.dumps(labels, sort_keys=True, separators=(",", ":")),
+        )
+    )
+    return tuple(values)
+
+
 def sglang_argv(
     settings: ServeSettings, conf: EngineConf, env: dict[str, str]
 ) -> tuple[str, ...]:
@@ -236,6 +285,7 @@ def sglang_argv(
         for flag in (SGLANG_SESSION_FLAG, SGLANG_METRICS_FLAG)
         if flag not in conf.extra_sglang_args
     )
+    extra_args = _with_engine_generation_label(conf.extra_sglang_args)
     return (
         *_sglang_container_prefix(settings, conf, env),
         "python3",
@@ -254,7 +304,7 @@ def sglang_argv(
         "--max-running-requests",
         str(conf.max_num_seqs),
         *required,
-        *conf.extra_sglang_args,
+        *extra_args,
         "--host",
         LOCAL,
         "--port",

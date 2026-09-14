@@ -160,9 +160,7 @@ def test_prepare_creates_and_checks_engine_writable_directories(tmp_path: Path):
     # Arrange
     launch = _launch(tmp_path)
     storage = tmp_path / "persistent-hicache"
-    launch = type(launch)(
-        **{**launch.__dict__, "writable_dirs": (storage,)}
-    )
+    launch = type(launch)(**{**launch.__dict__, "writable_dirs": (storage,)})
 
     # Act
     EngineRunner(launch, popen=_Spawner()).prepare()
@@ -291,4 +289,34 @@ def test_run_forever_starts_the_sidecar(tmp_path: Path):
     assert spawner.argvs("litellm")[0][:2] == [
         str(tmp_path / "venv" / "bin" / "litellm"),
         "--config",
+    ]
+
+
+def test_every_sglang_process_start_gets_a_distinct_metrics_generation(
+    tmp_path: Path,
+):
+    # Arrange
+    spawner = _Spawner(engine_alive_polls=0)
+    generations = iter(("1" * 32, "2" * 32))
+    runner = EngineRunner(
+        _sglang_launch(tmp_path),
+        popen=spawner,
+        http_get=lambda url: False,
+        engine_generation_factory=lambda: next(generations),
+        idle_limit_s=1,
+        poll_s=1,
+        sleep=lambda seconds: None,
+    )
+    runner.prepare()
+
+    # Act
+    runner.run_once()
+    runner.run_once()
+    engine_calls = [argv for argv, _ in spawner.calls if "sglang.launch_server" in argv]
+    labels = [argv[argv.index("--extra-metric-labels") + 1] for argv in engine_calls]
+
+    # Assert
+    assert labels == [
+        '{"scitex_engine_generation":"' + "1" * 32 + '"}',
+        '{"scitex_engine_generation":"' + "2" * 32 + '"}',
     ]

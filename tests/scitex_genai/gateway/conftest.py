@@ -21,7 +21,9 @@ from scitex_genai.gateway._secrets import GATEWAY_KEY_ENV
 
 
 @pytest.fixture(autouse=True)
-def isolate_the_scitex_store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+def isolate_the_scitex_store(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
     """No gateway test may read or write the developer's real ``~/.scitex``.
 
     ``install-unit`` LEGITIMATELY writes the gateway key to
@@ -41,9 +43,7 @@ def isolate_the_scitex_store(tmp_path_factory: pytest.TempPathFactory) -> Iterat
     cannot forget to do this, which is the difference between a rule and a
     barrier.
     """
-    previous = {
-        name: os.environ.get(name) for name in ("SCITEX_DIR", GATEWAY_KEY_ENV)
-    }
+    previous = {name: os.environ.get(name) for name in ("SCITEX_DIR", GATEWAY_KEY_ENV)}
     os.environ["SCITEX_DIR"] = str(tmp_path_factory.mktemp("scitex"))
     # scitex-config loads dotenv on every path resolution. A present blank
     # value prevents python-dotenv from repopulating the developer's real key,
@@ -83,6 +83,7 @@ class RecordingUpstream:
         abort_status: int = 200,
         block_before_first_chunk: threading.Event | None = None,
         block_after_first_chunk: threading.Event | None = None,
+        engine_generation: str = "0123456789abcdef0123456789abcdef",
     ) -> None:
         self.status = status
         self.content_type = content_type
@@ -92,6 +93,7 @@ class RecordingUpstream:
         self.abort_status = abort_status
         self.block_before_first_chunk = block_before_first_chunk
         self.block_after_first_chunk = block_after_first_chunk
+        self.engine_generation = engine_generation
         self.request_started = threading.Event()
         self.response_headers_sent = threading.Event()
         self.requests: list[dict[str, Any]] = []
@@ -102,6 +104,20 @@ class RecordingUpstream:
 
             def _serve(self) -> None:
                 length = int(self.headers.get("content-length") or 0)
+                if self.path == "/metrics":
+                    generation = upstream.engine_generation
+                    payload = (
+                        f'sglang:num_running_reqs{{scitex_engine_generation="{generation}"}} 0\n'
+                        f'sglang:num_queue_reqs{{scitex_engine_generation="{generation}"}} 0\n'
+                        f'sglang:token_usage{{scitex_engine_generation="{generation}"}} 0\n'
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "text/plain")
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    return
                 upstream.requests.append(
                     {
                         "method": self.command,
@@ -157,7 +173,9 @@ class RecordingUpstream:
         # A short poll so ``shutdown()`` returns promptly at fixture teardown;
         # the default 0.5 s would add half a second per upstream to the suite.
         self.thread = threading.Thread(
-            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
         )
         self.thread.start()
 
