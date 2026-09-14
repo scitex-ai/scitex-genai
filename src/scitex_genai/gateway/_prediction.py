@@ -1,15 +1,18 @@
-"""Payload-free, observe-only admission prediction telemetry.
+"""Payload-free admission prediction and actual-report feedback.
 
 The predictor records what an upstream *reported* after a request.  Historical
 reports are useful evidence, but never prove that pages are still resident.
-Consequently this module has no admission API and cannot alter scheduling.
+Callers may conservatively budget predicted *uncached prefill work*; the
+prediction is not an authoritative cache-residency lookup.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -117,15 +120,27 @@ class _Observation:
     reported_input_tokens: int
     cached_tokens: int
     cache_tier: str
+    observed_at: float
 
 
 class AdmissionPredictionTelemetry:
     """Bounded historical predictor with an explicit non-authoritative mode."""
 
-    def __init__(self, *, max_sessions: int = 512, max_recent: int = 32) -> None:
+    def __init__(
+        self,
+        *,
+        max_sessions: int = 512,
+        max_recent: int = 32,
+        max_observation_age_s: float = 300.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         if max_sessions < 1 or max_recent < 1:
             raise ValueError("prediction bounds must be positive")
+        if max_observation_age_s < 0:
+            raise ValueError("max_observation_age_s must be non-negative")
         self.max_sessions = max_sessions
+        self.max_observation_age_s = max_observation_age_s
+        self._clock = clock
         self._observations: OrderedDict[tuple[str, str, str], _Observation] = (
             OrderedDict()
         )
@@ -156,6 +171,12 @@ class AdmissionPredictionTelemetry:
         lineage = request_lineage(body)
         key = (session_id, upstream, engine_generation)
         prior = self._observations.get(key)
+        if (
+            prior is not None
+            and self._clock() - prior.observed_at > self.max_observation_age_s
+        ):
+            self._observations.pop(key, None)
+            prior = None
         predecessor = (
             prior.lineage_digest
             if prior is not None and prior.lineage_digest in lineage.prefix_digests
@@ -166,7 +187,11 @@ class AdmissionPredictionTelemetry:
             # Translate byte-estimator growth onto the last tokenizer report.
             growth = max(0, estimated_input_tokens - prior.estimated_input_tokens)
             predicted_input = prior.reported_input_tokens + growth
-            predicted_uncached = max(0, predicted_input - prior.reported_input_tokens)
+            # The last actual cache report, rather than the full prompt, is the
+            # evidence for reusable work.  A 640k/640k report predicts only the
+            # appended suffix; a 243k/103k report keeps the unreported 140k in
+            # the next admission budget instead of incorrectly calling it hot.
+            predicted_uncached = max(0, predicted_input - prior.cached_tokens)
             evidence = "historical-lineage-extension"
         else:
             predicted_uncached = estimated_input_tokens
@@ -208,6 +233,10 @@ class AdmissionPredictionTelemetry:
         missing = reported_input_tokens is None or cached_tokens is None
         if missing:
             self._counters["missing_cache_reports_total"] += 1
+            # Absence is evidence of nothing.  Do not let an older successful
+            # report make the next turn look hot after the feedback chain broke.
+            key = (session_id, upstream, prediction.engine_generation)
+            self._observations.pop(key, None)
         else:
             self._counters["cache_reports_total"] += 1
             error = abs(prediction.predicted_uncached_tokens - actual_uncached)
@@ -220,6 +249,7 @@ class AdmissionPredictionTelemetry:
                 reported_input_tokens=reported_input_tokens,
                 cached_tokens=cached_tokens,
                 cache_tier=cache_tier,
+                observed_at=self._clock(),
             )
             self._observations.move_to_end(key)
             while len(self._observations) > self.max_sessions:
@@ -236,7 +266,7 @@ class AdmissionPredictionTelemetry:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "mode": "observe-only",
+            "mode": "admission-feedback",
             "authoritative_for_admission": False,
             "observations": len(self._observations),
             "cumulative": dict(self._counters),

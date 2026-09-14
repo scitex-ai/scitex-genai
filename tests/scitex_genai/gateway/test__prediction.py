@@ -90,7 +90,64 @@ def test_observed_hub_append_only_turn_predicts_only_growth() -> None:
         prediction.evidence,
         prediction.predecessor_digest is not None,
         prediction.predicted_uncached_tokens,
-    ) == ("historical-lineage-extension", True, 1_000)
+    ) == ("historical-lineage-extension", True, 2_000)
+
+
+def test_partial_actual_cache_report_remains_in_the_next_uncached_budget() -> None:
+    # Arrange
+    telemetry = AdmissionPredictionTelemetry()
+    messages = [{"role": "user", "content": "large turn"}]
+    _observe(
+        telemetry,
+        messages=messages,
+        estimated=243_434,
+        reported=243_434,
+        cached=103_296,
+    )
+
+    # Act
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(messages),
+        estimated_input_tokens=243_434,
+    )
+
+    # Assert
+    assert prediction.predicted_uncached_tokens == 140_138
+
+
+def test_hot_history_expires_before_the_observed_residency_loss_window() -> None:
+    # Arrange
+    now = [0.0]
+    telemetry = AdmissionPredictionTelemetry(
+        max_observation_age_s=300.0, clock=lambda: now[0]
+    )
+    messages = [{"role": "user", "content": "large turn"}]
+    _observe(
+        telemetry,
+        messages=messages,
+        estimated=642_616,
+        reported=642_616,
+        cached=642_616,
+    )
+    now[0] = 362.803
+
+    # Act
+    prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(messages),
+        estimated_input_tokens=642_616,
+    )
+
+    # Assert
+    assert (prediction.evidence, prediction.predicted_uncached_tokens) == (
+        "no-compatible-history",
+        642_616,
+    )
 
 
 def test_observed_ui_historical_hot_can_still_miss_and_feedback_records_error() -> None:
@@ -160,6 +217,43 @@ def test_generation_change_and_missing_report_never_reuse_history() -> None:
         snapshot["cumulative"]["missing_cache_reports_total"],
         snapshot["observations"],
     ) == ("no-compatible-history", 120, 1, 1)
+
+
+def test_missing_cache_report_invalidates_same_generation_history() -> None:
+    # Arrange
+    telemetry = AdmissionPredictionTelemetry()
+    messages = [{"role": "user", "content": "one"}]
+    _observe(telemetry, messages=messages, estimated=100, reported=100, cached=100)
+    # Act
+    missing = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(messages + [{"role": "user", "content": "two"}]),
+        estimated_input_tokens=110,
+    )
+    telemetry.observe(
+        missing,
+        session_id="session",
+        upstream="upstream",
+        reported_input_tokens=110,
+        cached_tokens=None,
+        cache_tier="unknown",
+    )
+
+    next_prediction = telemetry.predict(
+        session_id="session",
+        upstream="upstream",
+        engine_generation="engine-a",
+        body=_body(messages + [{"role": "user", "content": "three"}]),
+        estimated_input_tokens=120,
+    )
+
+    # Assert
+    assert (next_prediction.evidence, next_prediction.predicted_uncached_tokens) == (
+        "no-compatible-history",
+        120,
+    )
 
 
 def test_observations_and_recent_rows_are_bounded() -> None:
