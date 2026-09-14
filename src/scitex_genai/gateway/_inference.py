@@ -901,8 +901,9 @@ class InferenceDrainTimeout(TimeoutError):
 class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
     """Sticky per-conversation pool with bounded per-upstream admission.
 
-    First placement remains least-loaded round robin across interchangeable
-    upstreams. Once placed, a conversation waits for that same member's
+    First placement uses the smallest token-capacity tier that can hold the
+    request, then least-loaded round robin among interchangeable members in
+    that tier. Once placed, a conversation waits for that same member's
     capacity so admission never trades away prefix-cache locality.
     """
 
@@ -1064,6 +1065,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self, session_id: str, excluded: set[str], *, input_tokens: int
     ) -> InferenceUpstream:
         """Select only a member on which this request can ever be resident."""
+        now = time.time()
         incapable = {
             upstream.alias
             for upstream in self.upstreams
@@ -1085,7 +1087,41 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             # existing member can never fit the grown session; the new member
             # starts cold because cache prediction is label-bound.
             self._sessions.pop(session_id, None)
-        return self._select_locked(session_id, excluded | incapable, now=time.time())
+            sticky_alias = None
+
+        hard_excluded = excluded | incapable
+        if (
+            sticky_alias is not None
+            and sticky_alias not in hard_excluded
+            and self._by_alias(sticky_alias) is not None
+        ):
+            # A compatible gateway-owned route is authoritative cache affinity.
+            # Let StickyPool preserve it (including its reload hold semantics)
+            # before applying any first-placement preference.
+            return self._select_locked(session_id, hard_excluded, now=now)
+        if sticky_alias is not None:
+            self._sessions.pop(session_id, None)
+
+        available = [
+            upstream
+            for upstream in self.upstreams
+            if upstream.alias not in hard_excluded and upstream.cooldown_until <= now
+        ]
+        if available:
+            # ``None`` is an unbounded/unspecified capacity and therefore the
+            # last-resort tier after every finite capable tier. Selection
+            # inside the chosen tier remains normalized-load then round robin.
+            tier_capacity = min(
+                (upstream.token_capacity for upstream in available),
+                key=lambda capacity: (capacity is None, capacity or 0),
+            )
+            outside_tier = {
+                upstream.alias
+                for upstream in available
+                if upstream.token_capacity != tier_capacity
+            }
+            hard_excluded |= outside_tier
+        return self._select_locked(session_id, hard_excluded, now=now)
 
     async def acquire(
         self,
