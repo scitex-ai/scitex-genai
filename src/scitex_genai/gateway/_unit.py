@@ -54,8 +54,12 @@ from ._settings import (
 )
 
 UNIT_NAME = "scitex-genai-gateway.service"
+FRONTEND_SOCKET_UNIT = "scitex-genai-gateway-frontend.socket"
+FRONTEND_SERVICE_UNIT = "scitex-genai-gateway-frontend.service"
+BACKEND_UNIT_PREFIX = "scitex-genai-gateway-backend-"
 DEFAULT_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 MODULE = "scitex_genai.gateway._cli"
+SOCKET_PROXY = Path("/usr/lib/systemd/systemd-socket-proxyd")
 
 Runner = Callable[[Sequence[str]], None]
 
@@ -78,6 +82,11 @@ def gateway_command(
     inference_cache_report_enabled: bool | None = None,
     config: Path | str | None = None,
     interpreter: str | None = None,
+    uds: Path | str | None = None,
+    gateway_build: str | None = None,
+    gateway_incarnation: str | None = None,
+    frontend_generation: str | None = None,
+    graceful_rollout_shutdown: bool = False,
 ) -> list[str]:
     """The argv the unit execs: this package's server under an absolute interpreter.
 
@@ -85,6 +94,16 @@ def gateway_command(
     its settings file at each start.
     """
     argv = [str(interpreter or sys.executable), "-m", MODULE]
+    if uds is not None:
+        argv += ["--uds", str(uds)]
+    if gateway_build is not None:
+        argv += ["--gateway-build", gateway_build]
+    if gateway_incarnation is not None:
+        argv += ["--gateway-incarnation", gateway_incarnation]
+    if frontend_generation is not None:
+        argv += ["--frontend-generation", frontend_generation]
+    if graceful_rollout_shutdown:
+        argv.append("--graceful-rollout-shutdown")
     if config is not None:
         argv += ["--config", str(config)]
     if host is not None:
@@ -153,6 +172,87 @@ def gateway_command(
             else "--no-inference-cache-report"
         )
     return argv
+
+
+def backend_unit_name(generation: str) -> str:
+    """Systemd unit name for one already-validated generation label."""
+    return f"{BACKEND_UNIT_PREFIX}{generation}.service"
+
+
+def render_frontend_socket(*, host: str, port: int) -> str:
+    """Stable fleet-facing listener retained across backend generations."""
+    return (
+        "[Unit]\n"
+        "Description=scitex-genai stable gateway frontend socket\n\n"
+        "[Socket]\n"
+        f"ListenStream={check_host(host)}:{check_port(port)}\n"
+        "NoDelay=true\n"
+        f"Service={FRONTEND_SERVICE_UNIT}\n\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
+    )
+
+
+def render_frontend_service(*, current_socket: Path | str) -> str:
+    """Existing systemd proxy primitive; it never retries an HTTP request."""
+    return (
+        "[Unit]\n"
+        "Description=scitex-genai stable gateway frontend proxy\n"
+        f"Requires={FRONTEND_SOCKET_UNIT}\n"
+        f"After={FRONTEND_SOCKET_UNIT}\n\n"
+        "[Service]\n"
+        "Type=notify\n"
+        f"ExecStart={SOCKET_PROXY} {current_socket}\n"
+        "Restart=on-failure\n"
+        "RestartSec=1\n"
+    )
+
+
+def render_backend_unit(
+    *, command: Sequence[str], socket_path: Path | str, generation: str
+) -> str:
+    """A private generation backend whose SIGTERM drains existing ASGI tasks."""
+    socket_path = Path(socket_path)
+    if socket_path.name != f"{generation}.sock":
+        raise ValueError("backend socket basename must match its generation")
+    exec_start = " ".join(shlex.quote(arg) for arg in command)
+    quoted_socket = shlex.quote(str(socket_path))
+    return (
+        "[Unit]\n"
+        f"Description=scitex-genai gateway backend generation {generation}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStartPre=-/usr/bin/rm -f {quoted_socket}\n"
+        f"ExecStart={exec_start}\n"
+        f"ExecStopPost=-/usr/bin/rm -f {quoted_socket}\n"
+        "TimeoutStopSec=infinity\n"
+        "Restart=on-failure\n"
+        "RestartSec=1\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "\n[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def install_rollout_frontend(
+    *,
+    host: str,
+    port: int,
+    current_socket: Path | str,
+    unit_dir: Path | None = None,
+    runner: Runner | None = None,
+) -> tuple[Path, Path]:
+    """Write but deliberately do not start the bootstrap-sensitive frontend."""
+    target_dir = Path(unit_dir) if unit_dir is not None else DEFAULT_UNIT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    socket_unit = target_dir / FRONTEND_SOCKET_UNIT
+    service_unit = target_dir / FRONTEND_SERVICE_UNIT
+    socket_unit.write_text(render_frontend_socket(host=host, port=port))
+    service_unit.write_text(render_frontend_service(current_socket=current_socket))
+    (runner or _systemctl)(["systemctl", "--user", "daemon-reload"])
+    return socket_unit, service_unit
 
 
 def render_unit(

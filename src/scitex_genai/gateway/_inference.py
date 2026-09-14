@@ -93,6 +93,7 @@ from ._request_observability import (
     request_agent_label,
     request_session_label,
 )
+from ._session_state import GatewaySessionState
 from ._sglang_metrics import SGLangSchedulerObservation, probe_sglang_metrics
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
@@ -941,6 +942,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cache_prediction_max_age_s: float = DEFAULT_CACHE_PREDICTION_MAX_AGE_S,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
+        session_state: GatewaySessionState | None = None,
     ) -> None:
         if capacity_per_upstream < 1:
             raise ValueError("capacity_per_upstream must be >= 1")
@@ -1004,6 +1006,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._member_resumes_total = 0
         self._active_sessions: set[str] = set()
         self._closing = False
+        self.session_state = session_state
 
     @property
     def upstreams(self) -> list[InferenceUpstream]:
@@ -1022,6 +1025,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cache_prediction_max_age_s: float = DEFAULT_CACHE_PREDICTION_MAX_AGE_S,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
+        session_state: GatewaySessionState | None = None,
     ) -> "InferenceUpstreamPool":
         """Build a programmatic legacy/external pool from transport URLs."""
         if isinstance(urls, str):
@@ -1036,6 +1040,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             cache_prediction_max_age_s=cache_prediction_max_age_s,
             cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
             cold_prefill_min_tokens=cold_prefill_min_tokens,
+            session_state=session_state,
         )
 
     @classmethod
@@ -1047,6 +1052,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
+        session_state: GatewaySessionState | None = None,
     ) -> "InferenceUpstreamPool":
         """Build named members from validated deployment settings."""
         return cls(
@@ -1063,6 +1069,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             token_capacity_per_upstream=None,
             cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
             cold_prefill_min_tokens=cold_prefill_min_tokens,
+            session_state=session_state,
         )
 
     async def route_alias(
@@ -1078,9 +1085,25 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         async with self._admission:
             if self._closing:
                 raise InferenceAdmissionError("Inference gateway is shutting down")
-            return self._select_for_input_locked(
+            self._restore_route_locked(session_id)
+            selected = self._select_for_input_locked(
                 session_id, set(exclude or ()), input_tokens=input_tokens
-            ).alias
+            )
+            self._remember_route(session_id, selected.alias)
+            return selected.alias
+
+    def _restore_route_locked(self, session_id: str) -> None:
+        if not session_id or session_id in self._sessions or self.session_state is None:
+            return
+        alias = self.session_state.route(
+            session_id, {upstream.alias for upstream in self.upstreams}
+        )
+        if alias is not None:
+            self._sessions[session_id] = alias
+
+    def _remember_route(self, session_id: str, alias: str) -> None:
+        if self.session_state is not None:
+            self.session_state.remember_route(session_id, alias)
 
     def _select_for_input_locked(
         self, session_id: str, excluded: set[str], *, input_tokens: int
@@ -1204,6 +1227,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         async with self._admission:
             if self._closing:
                 raise InferenceAdmissionError("Inference gateway is shutting down")
+            self._restore_route_locked(session_id)
             excluded = exclude or set()
             if selected_alias is None:
                 selected = self._select_for_input_locked(
@@ -1220,6 +1244,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     raise InferenceAdmissionError(
                         "Inference route changed before predicted admission; retry"
                     )
+            self._remember_route(session_id, selected.alias)
             if (
                 selected.token_capacity is not None
                 and input_tokens > selected.token_capacity
@@ -1854,6 +1879,7 @@ class ContinuationQoS:
         enabled: bool = False,
         max_retries: int = 1,
         min_preempt_tokens: int = 0,
+        session_state: GatewaySessionState | None = None,
     ) -> None:
         if max_retries < 0:
             raise ValueError("continuation_qos_max_retries must be >= 0")
@@ -1863,6 +1889,7 @@ class ContinuationQoS:
         self.max_retries = max_retries
         self.min_preempt_tokens = min_preempt_tokens
         self._successful: OrderedDict[str, None] = OrderedDict()
+        self._session_state = session_state
         self._replay_safe: dict[str, deque[_ReplaySafeAttempt]] = {}
         self._counters = {
             "first_turn": 0,
@@ -1886,6 +1913,12 @@ class ContinuationQoS:
     def kind(self, explicit_session: str) -> str:
         if not explicit_session:
             return "unclassified"
+        if (
+            explicit_session not in self._successful
+            and self._session_state is not None
+            and self._session_state.successful(explicit_session)
+        ):
+            self._successful[explicit_session] = None
         return "continuation" if explicit_session in self._successful else "first-turn"
 
     def classify(self, explicit_session: str) -> str:
@@ -1898,6 +1931,8 @@ class ContinuationQoS:
             return
         self._successful.pop(explicit_session, None)
         self._successful[explicit_session] = None
+        if self._session_state is not None:
+            self._session_state.remember_success(explicit_session)
         while len(self._successful) > MAX_ROUTES:
             self._successful.popitem(last=False)
 
@@ -2071,6 +2106,7 @@ class InferenceBackend:
             enabled=continuation_qos_enabled,
             max_retries=continuation_qos_max_retries,
             min_preempt_tokens=continuation_qos_min_preempt_tokens,
+            session_state=pool.session_state,
         )
         self.cache_report_enabled = cache_report_enabled
         self.relay_metrics = RelayMetrics()
