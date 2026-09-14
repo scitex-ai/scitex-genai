@@ -332,7 +332,7 @@ def test_sglang_preserves_operator_metric_labels_but_reserves_generation():
             "extra_sglang_args": (
                 *SGLANG_CONF.extra_sglang_args,
                 "--extra-metric-labels",
-                '{"cluster":"spartan"}',
+                '{"cluster":"hpc"}',
             ),
         }
     )
@@ -342,7 +342,7 @@ def test_sglang_preserves_operator_metric_labels_but_reserves_generation():
 
     # Assert
     assert value == (
-        '{"cluster":"spartan",'
+        '{"cluster":"hpc",'
         '"scitex_engine_generation":"__SCITEX_ENGINE_GENERATION__"}'
     )
 
