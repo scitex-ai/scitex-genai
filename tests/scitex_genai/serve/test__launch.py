@@ -87,8 +87,19 @@ def test_each_step_is_an_overlapping_exact_srun_of_the_serve_command():
     # Assert
     assert (
         step_line.strip()
-        == '"$SRUN" --overlap --ntasks=1 --exact bash -c "$SERVE $key"'
+        == '"$SRUN" --overlap --nodes=1 --ntasks=1 --exact --gres=gpu:1 bash -c "$SERVE $key"'
     )
+
+
+def test_each_engine_step_claims_exactly_one_node_and_one_gpu():
+    # Arrange
+    body = render_hold_body(["engine-a", "engine-b"], _settings())
+
+    # Act
+    step_line = next(line for line in body.splitlines() if "--overlap" in line)
+
+    # Assert
+    assert (step_line.count("--nodes=1"), step_line.count("--gres=gpu:1")) == (1, 1)
 
 
 def test_the_serve_command_is_the_absolute_console_script():

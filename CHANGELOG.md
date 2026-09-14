@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Each supervised engine step now requests exactly one node and one GPU, so
+  multi-engine leases work when Slurm distributes their GPUs across nodes.
 - Gateway drained restarts now cross one admission-locked, server-side empty
   barrier before systemd cutover. Draining health is non-ready, and a bounded
   timeout leaves admission closed with exact remaining ownership counts.
