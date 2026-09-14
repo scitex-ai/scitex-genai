@@ -97,6 +97,7 @@ DEFAULT_CONTINUATION_QOS_MAX_RETRIES = 1
 DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS = 0
 DEFAULT_MAX_ADMISSION_BYPASSES = 4
 DEFAULT_PRIORITY_AGING_S = 30.0
+DEFAULT_CACHE_PREDICTION_MAX_AGE_S = 300.0
 MAX_STATUS_TICKETS = 256
 
 #: Bounded so a long-lived gateway cannot grow without limit; conversations
@@ -784,6 +785,8 @@ class _PoolTicket:
     cold_prefill: bool = False
     admission_class: str = "unclassified"
     cache_classification: str = CacheResidency.UNKNOWN.value
+    predicted_uncached_tokens: int | None = None
+    prediction_expires_at: float | None = None
     block_reason: str = "none"
 
     def status(self, *, state: str, now: float, upstream: str) -> dict[str, Any]:
@@ -806,6 +809,7 @@ class _PoolTicket:
             "priority": self.priority,
             "admission_class": self.admission_class,
             "cache_classification": self.cache_classification,
+            "predicted_uncached_tokens": self.predicted_uncached_tokens,
             "cold_prefill": self.cold_prefill,
             "bypasses": self.bypasses,
             "block_reason": self.block_reason,
@@ -872,6 +876,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
         priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
+        cache_prediction_max_age_s: float = DEFAULT_CACHE_PREDICTION_MAX_AGE_S,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
     ) -> None:
@@ -885,6 +890,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             raise ValueError("max_admission_bypasses must be >= 0")
         if priority_aging_s < 0:
             raise ValueError("priority_aging_s must be >= 0")
+        if cache_prediction_max_age_s < 0:
+            raise ValueError("cache_prediction_max_age_s must be >= 0")
         if (
             cold_prefill_limit_per_upstream is not None
             and cold_prefill_limit_per_upstream < 1
@@ -904,6 +911,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self.max_queue_size = max_queue_size
         self.max_admission_bypasses = max_admission_bypasses
         self.priority_aging_s = priority_aging_s
+        self.cache_prediction_max_age_s = cache_prediction_max_age_s
         self.cold_prefill_limit_per_upstream = cold_prefill_limit_per_upstream
         self.cold_prefill_min_tokens = cold_prefill_min_tokens
         self._next_placement = 0
@@ -942,6 +950,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         token_capacity_per_upstream: int | None = DEFAULT_TOKEN_CAPACITY_PER_UPSTREAM,
         max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
         priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
+        cache_prediction_max_age_s: float = DEFAULT_CACHE_PREDICTION_MAX_AGE_S,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
     ) -> "InferenceUpstreamPool":
@@ -955,6 +964,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             token_capacity_per_upstream=token_capacity_per_upstream,
             max_admission_bypasses=max_admission_bypasses,
             priority_aging_s=priority_aging_s,
+            cache_prediction_max_age_s=cache_prediction_max_age_s,
             cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
             cold_prefill_min_tokens=cold_prefill_min_tokens,
         )
@@ -980,16 +990,31 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cold_prefill: bool = False,
         admission_class: str = "unclassified",
         cache_classification: str = CacheResidency.UNKNOWN.value,
+        predicted_uncached_tokens: int | None = None,
+        selected_alias: str | None = None,
     ) -> InferenceUpstream:
         """Place first for cache locality, then wait for that member's capacity."""
         if input_tokens < 0:
             raise ValueError("input_tokens must be >= 0")
+        if predicted_uncached_tokens is not None and predicted_uncached_tokens < 0:
+            raise ValueError("predicted_uncached_tokens must be >= 0")
         async with self._admission:
             if self._closing:
                 raise InferenceAdmissionError("Inference gateway is shutting down")
-            selected = self._select_locked(
-                session_id, exclude or set(), now=time.time()
-            )
+            excluded = exclude or set()
+            if selected_alias is None:
+                selected = self._select_locked(session_id, excluded, now=time.time())
+            else:
+                selected = self._by_alias(selected_alias)
+                if (
+                    selected is None
+                    or selected.alias in excluded
+                    or selected.cooldown_until > time.time()
+                ):
+                    # Never apply a cache prediction to a different upstream.
+                    raise InferenceAdmissionError(
+                        "Inference route changed before predicted admission; retry"
+                    )
             if (
                 selected.token_capacity is not None
                 and input_tokens > selected.token_capacity
@@ -997,6 +1022,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 raise InferenceAdmissionError(
                     "Estimated request input exceeds this upstream's token capacity "
                     f"({input_tokens}/{selected.token_capacity})"
+                )
+            if predicted_uncached_tokens is not None:
+                cold_prefill = bool(
+                    self.cold_prefill_min_tokens is not None
+                    and predicted_uncached_tokens >= self.cold_prefill_min_tokens
                 )
             ticket = _PoolTicket(
                 priority=priority,
@@ -1013,6 +1043,12 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     cache_classification
                     if cache_classification in {item.value for item in CacheResidency}
                     else CacheResidency.UNKNOWN.value
+                ),
+                predicted_uncached_tokens=predicted_uncached_tokens,
+                prediction_expires_at=(
+                    time.monotonic() + self.cache_prediction_max_age_s
+                    if cache_classification == CacheResidency.HOT.value
+                    else None
                 ),
             )
             if (
@@ -1103,6 +1139,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             return None
 
         now = time.monotonic()
+        for ticket in waiters:
+            self._expire_cache_prediction(ticket, now)
         oldest = waiters[0]
         token_blocked = (
             oldest.session_id not in self._active_sessions
@@ -1135,6 +1173,18 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             (ticket for ticket in fitting if ticket.priority), fitting[0]
         )
         return selected
+
+    def _expire_cache_prediction(self, ticket: _PoolTicket, now: float) -> None:
+        """Turn a queued, stale hot guess back into conservative unknown work."""
+        if ticket.prediction_expires_at is None or now < ticket.prediction_expires_at:
+            return
+        ticket.prediction_expires_at = None
+        ticket.cache_classification = CacheResidency.UNKNOWN.value
+        ticket.predicted_uncached_tokens = ticket.input_tokens
+        ticket.cold_prefill = bool(
+            self.cold_prefill_min_tokens is not None
+            and ticket.input_tokens >= self.cold_prefill_min_tokens
+        )
 
     def _record_bypasses(
         self, member: InferenceUpstream, selected: _PoolTicket
@@ -1209,14 +1259,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 return
             if member.in_flight <= 0:
                 return
-            member.in_flight = max(0, member.in_flight - 1)
-            member.input_tokens_in_flight = max(
-                0, member.input_tokens_in_flight - input_tokens
-            )
-            if cold_prefill:
-                member.cold_prefills_in_flight = max(
-                    0, member.cold_prefills_in_flight - 1
-                )
             running = self._running_tickets[member.alias]
             matched = next(
                 (
@@ -1224,10 +1266,20 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     for ticket in running
                     if ticket.session_id == session_id
                     and ticket.input_tokens == input_tokens
-                    and ticket.cold_prefill == cold_prefill
                 ),
                 running[0] if running else None,
             )
+            actual_cold_prefill = (
+                matched.cold_prefill if matched is not None else cold_prefill
+            )
+            member.in_flight = max(0, member.in_flight - 1)
+            member.input_tokens_in_flight = max(
+                0, member.input_tokens_in_flight - input_tokens
+            )
+            if actual_cold_prefill:
+                member.cold_prefills_in_flight = max(
+                    0, member.cold_prefills_in_flight - 1
+                )
             if matched is not None:
                 running.remove(matched)
             if session_id:
@@ -1884,16 +1936,10 @@ class InferenceBackend:
             body, path, enabled=self.cache_report_enabled
         )
         routing_session = session or ""
-        session_kind = self.continuation_qos.kind(qos_session)
         qos_kind = (
             self.continuation_qos.classify(qos_session)
             if self.continuation_qos.enabled
             else "disabled"
-        )
-        cold_prefill = bool(
-            self.pool.cold_prefill_limit_per_upstream is not None
-            and session_kind == "first-turn"
-            and input_tokens >= (self.pool.cold_prefill_min_tokens or 1)
         )
         self.cache_admission.observe(CacheResidency.UNKNOWN)
         feedback_headers = {
@@ -1926,6 +1972,40 @@ class InferenceBackend:
                     await continuation_handoff.victim_released
             while len(attempted) < len(self.pool.upstreams):
                 try:
+                    predicted_alias = await self.pool.route_alias(
+                        routing_session, exclude=attempted
+                    )
+                    prediction = self.admission_predictions.predict(
+                        session_id=routing_session,
+                        upstream=predicted_alias,
+                        engine_generation=self._engine_generations[predicted_alias],
+                        body=prediction_body,
+                        estimated_input_tokens=input_tokens,
+                    )
+                    cache_classification = CacheResidency.UNKNOWN
+                    if (
+                        self.pool.cold_prefill_min_tokens is not None
+                        and prediction.evidence != "no-compatible-history"
+                    ):
+                        cache_classification = (
+                            CacheResidency.HOT
+                            if prediction.predicted_uncached_tokens
+                            < self.pool.cold_prefill_min_tokens
+                            else CacheResidency.COLD
+                        )
+                    cold_prefill = bool(
+                        self.pool.cold_prefill_limit_per_upstream is not None
+                        and prediction.predicted_uncached_tokens
+                        >= (self.pool.cold_prefill_min_tokens or 1)
+                    )
+                    feedback_headers["x-scitex-admission-mode"] = (
+                        "uncached-prefill"
+                        if self.pool.cold_prefill_limit_per_upstream is not None
+                        else "observe-only"
+                    )
+                    feedback_headers["x-scitex-cache-residency"] = (
+                        cache_classification.value
+                    )
                     upstream = await self._acquire_while_connected(
                         routing_session,
                         exclude=attempted,
@@ -1933,7 +2013,9 @@ class InferenceBackend:
                         priority=qos_kind == "continuation",
                         cold_prefill=cold_prefill,
                         admission_class=qos_kind,
-                        cache_classification=CacheResidency.UNKNOWN.value,
+                        cache_classification=cache_classification.value,
+                        predicted_uncached_tokens=prediction.predicted_uncached_tokens,
+                        selected_alias=predicted_alias,
                         client_disconnected=client_disconnected,
                     )
                 except _ClientDisconnected:
@@ -1978,18 +2060,12 @@ class InferenceBackend:
                     failures.append(str(exc))
                     break
                 attempted.add(upstream.alias)
-                prediction = self.admission_predictions.predict(
-                    session_id=routing_session,
-                    upstream=upstream.alias,
-                    engine_generation=self._engine_generations[upstream.alias],
-                    body=prediction_body,
-                    estimated_input_tokens=input_tokens,
-                )
                 started = time.monotonic()
                 self._note(
                     f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
                     f"{method} {path} bytes={len(body or b'')} "
                     f"estimated_input_tokens={input_tokens} "
+                    f"predicted_uncached_tokens={prediction.predicted_uncached_tokens} "
                     f"admitted_input_tokens={upstream.input_tokens_in_flight} "
                     f"prefix_fingerprint={prefix_fingerprint} "
                     f"cache_report_requested={str(cache_report_requested).lower()} "
@@ -2388,6 +2464,8 @@ class InferenceBackend:
         cold_prefill: bool,
         admission_class: str,
         cache_classification: str,
+        predicted_uncached_tokens: int,
+        selected_alias: str,
         client_disconnected: Callable[[], Awaitable[bool]] | None,
     ) -> InferenceUpstream:
         """Remove a queued admission ticket as soon as its caller disappears."""
@@ -2400,6 +2478,8 @@ class InferenceBackend:
                 cold_prefill=cold_prefill,
                 admission_class=admission_class,
                 cache_classification=cache_classification,
+                predicted_uncached_tokens=predicted_uncached_tokens,
+                selected_alias=selected_alias,
             )
         )
         if client_disconnected is None:

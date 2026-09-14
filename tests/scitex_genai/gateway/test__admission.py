@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -205,3 +206,235 @@ async def test_health_exposes_incremented_observe_only_snapshot(
         {"hot": 0, "cold": 0, "unknown": 0},
         0,
     )
+
+
+@pytest.mark.asyncio
+async def test_actual_partial_cache_report_drives_next_relay_admission(
+    upstream_factory,
+) -> None:
+    report = {
+        "usage": {
+            "prompt_tokens": 243_434,
+            "prompt_tokens_details": {"cached_tokens": 103_296},
+        }
+    }
+    upstream = upstream_factory(chunks=(json.dumps(report).encode(),))
+    pool = InferenceUpstreamPool.from_urls(
+        upstream.url,
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    backend = InferenceBackend(pool)
+    body = b'{"model":"m","messages":[{"role":"user","content":"same"}]}'
+    headers = {"X-SciTeX-Session-ID": "session"}
+    first = await backend.relay(
+        "POST", "/v1/chat/completions", body=body, headers=headers
+    )
+    _ = b"".join([chunk async for chunk in first.body])
+
+    second = await backend.relay(
+        "POST", "/v1/chat/completions", body=body, headers=headers
+    )
+    snapshot = await pool.observability_snapshot()
+    ticket = snapshot["tickets"][0]
+
+    assert (
+        second.feedback_headers["x-scitex-cache-residency"],
+        ticket["predicted_uncached_tokens"],
+        ticket["cold_prefill"],
+    ) == ("cold", 140_138, True)
+    _ = b"".join([chunk async for chunk in second.body])
+
+
+async def _wait_for_pool_queue(pool: InferenceUpstreamPool, size: int) -> None:
+    for _ in range(100):
+        if pool.status()[0]["queued"] == size:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"pool queue did not reach {size}")
+
+
+@pytest.mark.asyncio
+async def test_predicted_hot_and_hot_prefills_coexist() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+
+    first = await pool.acquire(
+        "hot-1",
+        input_tokens=640_000,
+        predicted_uncached_tokens=0,
+        cache_classification="hot",
+    )
+    second = await pool.acquire(
+        "hot-2",
+        input_tokens=640_000,
+        predicted_uncached_tokens=4_000,
+        cache_classification="hot",
+    )
+
+    assert (first.in_flight, first.cold_prefills_in_flight) == (2, 0)
+    await pool.release(first, input_tokens=640_000, session_id="hot-1")
+    await pool.release(second, input_tokens=640_000, session_id="hot-2")
+
+
+@pytest.mark.asyncio
+async def test_predicted_hot_and_large_uncached_prefill_coexist() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+
+    cold = await pool.acquire(
+        "cold",
+        input_tokens=243_434,
+        predicted_uncached_tokens=140_138,
+        cache_classification="cold",
+    )
+    hot = await pool.acquire(
+        "hot",
+        input_tokens=640_000,
+        predicted_uncached_tokens=0,
+        cache_classification="hot",
+    )
+
+    assert (cold.in_flight, cold.cold_prefills_in_flight) == (2, 1)
+    await pool.release(cold, input_tokens=243_434, session_id="cold")
+    await pool.release(hot, input_tokens=640_000, session_id="hot")
+
+
+@pytest.mark.asyncio
+async def test_large_uncached_prefills_serialize_and_unknown_is_conservative() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=3,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    first = await pool.acquire(
+        "cold",
+        input_tokens=677_000,
+        predicted_uncached_tokens=677_000,
+        cache_classification="cold",
+    )
+    unknown = asyncio.create_task(
+        pool.acquire(
+            "unknown",
+            input_tokens=243_434,
+            predicted_uncached_tokens=243_434,
+            cache_classification="unknown",
+        )
+    )
+    await _wait_for_pool_queue(pool, 1)
+
+    hot = await pool.acquire(
+        "hot",
+        input_tokens=640_000,
+        predicted_uncached_tokens=0,
+        cache_classification="hot",
+    )
+    assert unknown.done() is False
+    await pool.release(hot, input_tokens=640_000, session_id="hot")
+    await pool.release(first, input_tokens=677_000, session_id="cold")
+    admitted = await asyncio.wait_for(unknown, 1)
+    await pool.release(admitted, input_tokens=243_434, session_id="unknown")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_uncached_waiter_releases_its_queue_ownership() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=2,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=100,
+    )
+    first = await pool.acquire("first", input_tokens=200, predicted_uncached_tokens=200)
+    waiting = asyncio.create_task(
+        pool.acquire("cancelled", input_tokens=200, predicted_uncached_tokens=200)
+    )
+    await _wait_for_pool_queue(pool, 1)
+
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+
+    assert pool.status()[0]["queued"] == 0
+    await pool.release(first, input_tokens=200, session_id="first")
+
+
+@pytest.mark.asyncio
+async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=2,
+        priority_aging_s=0,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=100,
+    )
+    cold = await pool.acquire("cold", input_tokens=200, predicted_uncached_tokens=200)
+    blocker = await pool.acquire("blocker", input_tokens=1, predicted_uncached_tokens=1)
+    aged = asyncio.create_task(
+        pool.acquire("aged", input_tokens=200, predicted_uncached_tokens=200)
+    )
+    await _wait_for_pool_queue(pool, 1)
+    priority = asyncio.create_task(
+        pool.acquire(
+            "priority", input_tokens=1, predicted_uncached_tokens=1, priority=True
+        )
+    )
+    await _wait_for_pool_queue(pool, 2)
+
+    await pool.release(cold, input_tokens=200, session_id="cold")
+    next_member = await asyncio.wait_for(aged, 1)
+
+    assert priority.done() is False
+    await pool.release(next_member, input_tokens=200, session_id="aged")
+    next_priority = await asyncio.wait_for(priority, 1)
+    await pool.release(blocker, input_tokens=1, session_id="blocker")
+    await pool.release(next_priority, input_tokens=1, session_id="priority")
+
+
+@pytest.mark.asyncio
+async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        capacity_per_upstream=2,
+        cache_prediction_max_age_s=0,
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=128_000,
+    )
+    cold = await pool.acquire(
+        "cold", input_tokens=500_000, predicted_uncached_tokens=500_000
+    )
+    blocker = await pool.acquire("blocker", input_tokens=1, predicted_uncached_tokens=1)
+    stale_hot = asyncio.create_task(
+        pool.acquire(
+            "stale-hot",
+            input_tokens=642_616,
+            predicted_uncached_tokens=0,
+            cache_classification="hot",
+        )
+    )
+    await _wait_for_pool_queue(pool, 1)
+
+    await pool.release(blocker, input_tokens=1, session_id="blocker")
+    await asyncio.sleep(0)
+    snapshot = await pool.observability_snapshot()
+
+    queued = next(
+        ticket for ticket in snapshot["tickets"] if ticket["state"] == "queued"
+    )
+    assert (
+        stale_hot.done(),
+        queued["cache_classification"],
+        queued["predicted_uncached_tokens"],
+        queued["cold_prefill"],
+    ) == (False, "unknown", 642_616, True)
+    stale_hot.cancel()
+    await asyncio.gather(stale_hot, return_exceptions=True)
+    await pool.release(cold, input_tokens=500_000, session_id="cold")

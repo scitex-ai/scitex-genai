@@ -164,9 +164,16 @@ otherwise it waits in the same bounded queue as count-limited work.
 
 Weighted admission happens *after* sticky placement.  A warm conversation
 therefore waits for room on its cache-owning upstream rather than moving to an
-idle replica and paying a cold prefill.  Cache hits reduce prefill work but do
-not make active sequence KV free, so the guard accounts the full estimated
-input instead of discounting a presumed cached prefix.
+idle replica and paying a cold prefill.  The total-token guard continues to
+account the full estimated input because active sequence KV is not free.
+
+When the cold-prefill limit and threshold are configured, that separate guard
+uses predicted **uncached prefill tokens**.  Compatible lineage starts from the
+previous response's actual cached-token report and adds request growth.  Missing
+reports, changed lineage, and changed engine generation are unknown and budget
+the full prompt.  Evidence and queued-hot classifications expire after 300
+seconds so a delayed request cannot assume cache residency indefinitely.  The
+existing request-count and total-token limits still apply independently.
 
 With the token guard enabled, ``/health`` adds
 ``input_tokens_in_flight``, ``input_tokens_queued``, and per-member
