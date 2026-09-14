@@ -24,6 +24,7 @@ from scitex_genai.gateway._settings import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     SCITEX_TIMEOUT_ENV,
+    default_admission_history_path,
     default_config_path,
     load_settings,
 )
@@ -514,6 +515,17 @@ def test_the_default_path_is_under_the_scitex_dir():
 
     # Assert
     assert path == scitex_dir / "genai" / "config.yaml"
+
+
+def test_admission_history_handoff_sits_in_the_genai_runtime_directory():
+    # Arrange
+    scitex_dir = Path(get_scitex_dir())
+
+    # Act
+    path = default_admission_history_path()
+
+    # Assert
+    assert path == scitex_dir / "genai" / "runtime" / "admission-history.json"
 
 
 def test_cold_prefill_guard_requires_an_explicit_limit_and_threshold(tmp_path: Path):
