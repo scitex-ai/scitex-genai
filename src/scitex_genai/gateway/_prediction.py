@@ -164,17 +164,24 @@ class AdmissionPredictionTelemetry:
         *,
         session_id: str,
         upstream: str,
-        engine_generation: str,
+        engine_generation: str | None,
         body: bytes | None,
         estimated_input_tokens: int,
     ) -> AdmissionPrediction:
         lineage = request_lineage(body)
-        key = (session_id, upstream, engine_generation)
-        prior = self._observations.get(key)
+        if engine_generation == "unavailable":
+            engine_generation = None
+        key = (
+            (session_id, upstream, engine_generation)
+            if engine_generation is not None
+            else None
+        )
+        prior = self._observations.get(key) if key is not None else None
         if (
             prior is not None
             and self._clock() - prior.observed_at > self.max_observation_age_s
         ):
+            assert key is not None
             self._observations.pop(key, None)
             prior = None
         predecessor = (
@@ -202,7 +209,7 @@ class AdmissionPredictionTelemetry:
         return AdmissionPrediction(
             session_label=self._label(_SESSION_DOMAIN, session_id or "anonymous"),
             upstream_label=self._label(b"scitex-genai-upstream-v1\0", upstream),
-            engine_generation=engine_generation,
+            engine_generation=engine_generation or "unavailable",
             lineage_digest=lineage.full_digest,
             predecessor_digest=predecessor,
             estimated_input_tokens=estimated_input_tokens,
@@ -231,29 +238,32 @@ class AdmissionPredictionTelemetry:
             else None
         )
         missing = reported_input_tokens is None or cached_tokens is None
+        generation_available = prediction.engine_generation != "unavailable"
         if missing:
             self._counters["missing_cache_reports_total"] += 1
             # Absence is evidence of nothing.  Do not let an older successful
             # report make the next turn look hot after the feedback chain broke.
-            key = (session_id, upstream, prediction.engine_generation)
-            self._observations.pop(key, None)
+            if generation_available:
+                key = (session_id, upstream, prediction.engine_generation)
+                self._observations.pop(key, None)
         else:
             self._counters["cache_reports_total"] += 1
             error = abs(prediction.predicted_uncached_tokens - actual_uncached)
             self._counters["prediction_error_tokens_abs_sum"] += error
             self._counters["prediction_error_samples"] += 1
-            key = (session_id, upstream, prediction.engine_generation)
-            self._observations[key] = _Observation(
-                lineage_digest=prediction.lineage_digest,
-                estimated_input_tokens=prediction.estimated_input_tokens,
-                reported_input_tokens=reported_input_tokens,
-                cached_tokens=cached_tokens,
-                cache_tier=cache_tier,
-                observed_at=self._clock(),
-            )
-            self._observations.move_to_end(key)
-            while len(self._observations) > self.max_sessions:
-                self._observations.popitem(last=False)
+            if generation_available:
+                key = (session_id, upstream, prediction.engine_generation)
+                self._observations[key] = _Observation(
+                    lineage_digest=prediction.lineage_digest,
+                    estimated_input_tokens=prediction.estimated_input_tokens,
+                    reported_input_tokens=reported_input_tokens,
+                    cached_tokens=cached_tokens,
+                    cache_tier=cache_tier,
+                    observed_at=self._clock(),
+                )
+                self._observations.move_to_end(key)
+                while len(self._observations) > self.max_sessions:
+                    self._observations.popitem(last=False)
         row = prediction.as_dict()
         row.update(
             reported_input_tokens=reported_input_tokens,

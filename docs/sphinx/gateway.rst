@@ -175,6 +175,17 @@ the full prompt.  Evidence and queued-hot classifications expire after 300
 seconds so a delayed request cannot assume cache residency indefinitely.  The
 existing request-count and total-token limits still apply independently.
 
+For SGLang processes launched by ``scitex-genai serve``, the supervisor mints
+a new opaque ``scitex_engine_generation`` label for every process start and
+passes it through SGLang's ``--extra-metric-labels`` support.  Before making a
+history-based prediction, the gateway reads that label atomically with
+``sglang:num_running_reqs``, ``sglang:num_queue_reqs``, and
+``sglang:token_usage`` from ``/metrics``.  A missing, timed-out, partial, or
+mixed-generation metrics response makes the engine generation unavailable;
+in that state actual cache reports remain observable but are never retained as
+reusable prediction history.  Existing engines acquire the label at their next
+normal supervised start; no engine restart is required during gateway rollout.
+
 With the token guard enabled, ``/health`` adds
 ``input_tokens_in_flight``, ``input_tokens_queued``, and per-member
 ``token_capacity`` fields.  Each ``[relay] ... ->`` journal line also records

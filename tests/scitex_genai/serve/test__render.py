@@ -312,6 +312,41 @@ def test_sglang_uses_the_pinned_apptainer_image_and_model_bind():
     )
 
 
+def test_sglang_reserves_a_per_process_generation_metrics_label():
+    # Arrange
+    conf = SGLANG_CONF
+
+    # Act
+    launch = render(SETTINGS, conf, BASE_ENV)
+    value = launch.engine_argv[launch.engine_argv.index("--extra-metric-labels") + 1]
+
+    # Assert
+    assert value == '{"scitex_engine_generation":"__SCITEX_ENGINE_GENERATION__"}'
+
+
+def test_sglang_preserves_operator_metric_labels_but_reserves_generation():
+    # Arrange
+    conf = EngineConf(
+        **{
+            **SGLANG_CONF.__dict__,
+            "extra_sglang_args": (
+                *SGLANG_CONF.extra_sglang_args,
+                "--extra-metric-labels",
+                '{"cluster":"hpc"}',
+            ),
+        }
+    )
+    # Act
+    launch = render(SETTINGS, conf, BASE_ENV)
+    value = launch.engine_argv[launch.engine_argv.index("--extra-metric-labels") + 1]
+
+    # Assert
+    assert value == (
+        '{"cluster":"hpc",'
+        '"scitex_engine_generation":"__SCITEX_ENGINE_GENERATION__"}'
+    )
+
+
 def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     # Arrange
     storage = "/scratch/hicache/model-build-tp2"
@@ -354,9 +389,7 @@ def test_file_hicache_storage_is_bound_read_write_into_apptainer():
     }
 
     # Assert
-    cache_paths = tuple(
-        launch.env[name] for name in CACHE_SUBDIRS if name != "HOME"
-    )
+    cache_paths = tuple(launch.env[name] for name in CACHE_SUBDIRS if name != "HOME")
     assert (
         "/weights/model-a:/weights/model-a:ro" in binds,
         f"{storage}:{storage}:rw" in binds,
