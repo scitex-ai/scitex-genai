@@ -285,10 +285,14 @@ async def test_pool_admits_different_conversations_concurrently() -> None:
 
 
 async def _wait_for_queue(pool: InferenceUpstreamPool, size: int) -> None:
-    for _ in range(100):
+    # Relay admission can be preceded by bounded control-plane I/O (for
+    # example the SGLang generation-bearing metrics probe). Zero-duration
+    # event-loop yields do not give the real HTTP server thread a deterministic
+    # amount of time to answer on slower CI interpreters.
+    for _ in range(200):
         if sum(member.queued for member in pool.upstreams) == size:
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     raise AssertionError(f"queue did not reach {size}: {pool.status()}")
 
 
