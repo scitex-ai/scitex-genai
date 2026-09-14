@@ -368,6 +368,56 @@ async def test_cancelled_uncached_waiter_releases_its_queue_ownership() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finished_upstream_releases_when_slow_client_closes_stream() -> None:
+    pool = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=100,
+    )
+    member = await pool.acquire(
+        "session", input_tokens=200, predicted_uncached_tokens=200
+    )
+    backend = InferenceBackend(pool)
+
+    async def finished_stream():
+        if False:
+            yield b""
+
+    class FinishedResponse:
+        async def aclose(self) -> None:
+            return None
+
+    class ClosingClient:
+        async def aclose(self) -> None:
+            return None
+
+    relayed = backend._drain(
+        ClosingClient(),
+        FinishedResponse(),
+        member,
+        stream=finished_stream(),
+        first_chunk=b"already-buffered",
+        input_tokens=200,
+        session_id="session",
+        cold_prefill=True,
+    )
+    assert await anext(relayed) == b"already-buffered"
+    held_while_client_is_slow = member.in_flight
+
+    await relayed.aclose()
+
+    assert (
+        held_while_client_is_slow,
+        member.in_flight,
+        member.cold_prefills_in_flight,
+    ) == (
+        1,
+        0,
+        0,
+    )
+
+
+@pytest.mark.asyncio
 async def test_aged_uncached_work_gets_next_progressing_slot() -> None:
     pool = InferenceUpstreamPool.from_urls(
         "http://only:1",
