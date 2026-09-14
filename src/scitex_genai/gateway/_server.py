@@ -176,7 +176,7 @@ def create_app(
                     "provider": backend.provider,
                     "health_strategy": backend.health_strategy,
                     "upstreams": [
-                        public_upstream_url(upstream.alias)
+                        public_upstream_url(upstream.base_url)
                         for upstream in backend.pool.upstreams
                     ],
                     "members": members,
@@ -232,7 +232,7 @@ def create_app(
                 "provider": backend.provider,
                 "health_strategy": backend.health_strategy,
                 "upstreams": [
-                    public_upstream_url(upstream.alias)
+                    public_upstream_url(upstream.base_url)
                     for upstream in backend.pool.upstreams
                 ],
                 "members": members,

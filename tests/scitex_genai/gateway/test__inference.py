@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,6 +74,111 @@ def test_parse_upstreams_strips_whitespace_and_drops_empties() -> None:
     parsed = parse_upstreams(value)
     # Assert
     assert parsed == ["http://a:1", "http://b:2"]
+
+
+@pytest.mark.asyncio
+async def test_heterogeneous_capacity_filters_and_repins_grown_sessions() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(
+                label="qwen-tp1", url="http://tp1:18773", token_capacity=563_215
+            ),
+            SimpleNamespace(
+                label="qwen-tp2", url="http://tp2:18773", token_capacity=1_600_000
+            ),
+        )
+    )
+
+    # Act
+    initially_small = await pool.route_alias("growing", input_tokens=100_000)
+    repinned_large = await pool.route_alias("growing", input_tokens=700_000)
+    always_large = await pool.route_alias("large", input_tokens=1_000_000)
+    acquired_large = await pool.acquire("direct-large", input_tokens=1_000_000)
+    too_large = await _raised_async(
+        pool.route_alias("impossible", input_tokens=1_600_001)
+    )
+    status = pool.status()
+
+    # Assert
+    assert (
+        initially_small,
+        repinned_large,
+        always_large,
+        acquired_large.alias,
+        type(too_large),
+        "exceeds every configured upstream" in str(too_large),
+        [(row["label"], row["url"], row["token_capacity"]) for row in status],
+    ) == (
+        "qwen-tp1",
+        "qwen-tp2",
+        "qwen-tp2",
+        "qwen-tp2",
+        InferenceAdmissionError,
+        True,
+        [
+            ("qwen-tp1", "http://tp1:18773", 563_215),
+            ("qwen-tp2", "http://tp2:18773", 1_600_000),
+        ],
+    )
+    await pool.release(
+        acquired_large, input_tokens=1_000_000, session_id="direct-large"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_sessions_use_normalized_token_pressure() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(label="small", url="http://small:1", token_capacity=500),
+            SimpleNamespace(label="large", url="http://large:2", token_capacity=2_000),
+        )
+    )
+    small = await pool.acquire("one", input_tokens=400)
+    large = await pool.acquire("two", input_tokens=100)
+
+    # Act
+    selected = await pool.acquire("three", input_tokens=100)
+
+    # Assert
+    assert (small.alias, large.alias, selected.alias) == ("small", "large", "large")
+    await pool.release(small, input_tokens=400, session_id="one")
+    await pool.release(large, input_tokens=100, session_id="two")
+    await pool.release(selected, input_tokens=100, session_id="three")
+
+
+@pytest.mark.asyncio
+async def test_new_session_avoids_request_saturated_low_token_member() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_specs(
+        (
+            SimpleNamespace(label="small", url="http://small:1", token_capacity=1_000),
+            SimpleNamespace(label="large", url="http://large:2", token_capacity=1_000),
+        ),
+        capacity_per_upstream=2,
+    )
+    first = await pool.acquire("one", input_tokens=1)
+    second = await pool.acquire("two", input_tokens=100)
+    third = await pool.acquire("three", input_tokens=1)
+
+    # Act
+    selected = await pool.acquire("four", input_tokens=1)
+
+    # Assert
+    assert (first.alias, second.alias, third.alias, selected.alias) == (
+        "small",
+        "large",
+        "small",
+        "large",
+    )
+    for member, tokens, session in zip(
+        (first, second, third, selected),
+        (1, 100, 1, 1),
+        ("one", "two", "three", "four"),
+        strict=True,
+    ):
+        await pool.release(member, input_tokens=tokens, session_id=session)
 
 
 @pytest.mark.parametrize("size, expected", [(0, 0), (1, 1), (4, 1), (5, 2)])
@@ -601,7 +707,7 @@ async def test_token_capacity_rejects_a_request_that_can_never_fit() -> None:
     # Assert
     assert (
         isinstance(refused, InferenceAdmissionError),
-        "1001/1000" in str(refused),
+        "1001; maximum 1000" in str(refused),
         pool.status()[0]["in_flight"],
     ) == (True, True, 0)
 
@@ -813,7 +919,7 @@ def test_announce_names_every_upstream() -> None:
     # Assert
     assert line == (
         "scitex-genai-gateway: listening 0.0.0.0:18772 -> 2 inference upstream(s): "
-        "http://a:1, http://b:2  [sticky per conversation]"
+        "http://a:1=http://a:1, http://b:2=http://b:2  [sticky per conversation]"
     )
 
 
