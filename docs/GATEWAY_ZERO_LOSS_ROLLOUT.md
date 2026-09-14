@@ -79,11 +79,15 @@ degraded health is HTTP 503:
 
 ```console
 $ curl -sS http://127.0.0.1:18772/health | jq \
-    '{ready,in_flight,queued,held,members}'
+    '{ready,in_flight,queued,held:(if has("held") then .held else 0 end),members}'
 ```
 
 Proceed only after `in_flight`, `queued`, and `held` are zero on two observations
-several seconds apart and the client hold is independently confirmed. Then run:
+several seconds apart and the client hold is independently confirmed. Legacy
+health schemas from before the held queue was introduced omit `held`; the
+bootstrap command treats that omission as zero because those gateways cannot
+hold requests. If the legacy response includes `held`, it must be exactly zero.
+Then run:
 
 ```console
 $ /candidate/venv/bin/scitex-genai-gateway rollout-generation \

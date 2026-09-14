@@ -354,7 +354,12 @@ def rollout(
 
     if bootstrap_coordinated:
         legacy = health_call(public_health_url, min(5.0, health_timeout_s))
-        if any(legacy.get(name) != 0 for name in ("in_flight", "queued", "held")):
+        # Pre-hold gateway schemas have no held queue and omit this counter.
+        legacy_not_empty = (
+            any(legacy.get(name) != 0 for name in ("in_flight", "queued"))
+            or legacy.get("held", 0) != 0
+        )
+        if legacy_not_empty:
             systemctl(["systemctl", "--user", "disable", "--now", unit])
             raise RolloutError(
                 "legacy gateway is not empty; client pause is not complete"
