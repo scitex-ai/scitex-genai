@@ -286,7 +286,10 @@ async def test_admin_status_is_authenticated_and_reports_observed_metrics(
         }
     ).encode()
     upstream = upstream_factory(chunks=(reply,))
-    backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream.url))
+    lines: list[str] = []
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(upstream.url), journal=lines.append
+    )
 
     # Act
     async with _serving(backend) as test_client:
@@ -297,15 +300,19 @@ async def test_admin_status_is_authenticated_and_reports_observed_metrics(
             headers={
                 "x-api-key": "relay-secret",
                 "x-scitex-session-id": "agent/private-session",
+                "x-scitex-agent-id": "scholar-01",
             },
         )
         status = await test_client.get(
             "/admin/status", headers={"x-api-key": "relay-secret"}
         )
+        health = await test_client.get("/health")
 
     # Assert
     payload = status.json()
     cumulative = payload["admission"]["cumulative"]
+    lifecycle = payload["request_lifecycle"]
+    request = lifecycle["requests"][0]
     assert (
         denied.status_code,
         served.status_code,
@@ -322,8 +329,54 @@ async def test_admin_status_is_authenticated_and_reports_observed_metrics(
         cumulative["cache_device_tokens_total"],
         cumulative["cache_host_tokens_total"],
         cumulative["cache_storage_tokens_total"],
+        lifecycle["active"],
+        lifecycle["terminal_total"],
+        request["phase"],
+        request["cache"]["cache_tier"],
+        len(request["agent_label"]),
+        served.headers["x-scitex-agent-label"] == request["agent_label"],
+        served.headers["x-scitex-session-label"] == request["session_label"],
+        health.json()["request_lifecycle"]["terminal_total"],
+        "x-scitex-agent-id" not in upstream.requests[0]["headers"],
+        any("phase=admission_queued" in line for line in lines),
+        any("phase=upstream_inflight" in line for line in lines),
+        any(
+            "phase=completed" in line and "device_cached_tokens=5" in line
+            for line in lines
+        ),
+        "scholar-01" not in "\n".join(lines),
         "private-session" not in json.dumps(payload),
-    ) == (401, 200, 200, 2, "inference-upstream", 0, 0, 1, 1, 1, 3, 8, 5, 2, 1, True)
+    ) == (
+        401,
+        200,
+        200,
+        3,
+        "inference-upstream",
+        0,
+        0,
+        1,
+        1,
+        1,
+        3,
+        8,
+        5,
+        2,
+        1,
+        0,
+        {"completed": 1},
+        "completed",
+        "storage",
+        12,
+        True,
+        True,
+        {"completed": 1},
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    )
 
 
 @pytest.mark.asyncio

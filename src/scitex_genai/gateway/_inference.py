@@ -81,6 +81,13 @@ from ._health import (
 )
 from ._pool import StickyPool
 from ._prediction import AdmissionPrediction, AdmissionPredictionTelemetry
+from ._request_observability import (
+    AGENT_ID_HEADER,
+    RequestLifecycleRegistry,
+    RequestObservation,
+    request_agent_label,
+    request_session_label,
+)
 from ._sglang_metrics import SGLangSchedulerObservation, probe_sglang_metrics
 
 #: The fleet's systemd drop-ins set these; the names are kept so they keep
@@ -135,7 +142,7 @@ WAIT_SLICE_S = 5.0
 _SESSION_ID_HEADERS = ("x-scitex-session-id", "session_id", "x-session-id")
 _HOP_BY_HOP = frozenset(
     {"host", "content-length", "connection", "transfer-encoding"}
-).union(_SESSION_ID_HEADERS)
+).union(_SESSION_ID_HEADERS, {AGENT_ID_HEADER})
 _SESSION_KEY_DOMAIN = b"scitex-genai-session-affinity\0"
 _REQUEST_PREFIX_DOMAIN = b"scitex-genai-request-prefix-v1\0"
 _REQUEST_PREFIX_BYTES = 16_384
@@ -350,6 +357,30 @@ class ResponseTokenReport:
             if value:
                 return name
         return "none" if self.observed_cached_tokens() == 0 else "unknown"
+
+    def cache_observation(self) -> dict[str, Any]:
+        """Structured cache fields for one terminal lifecycle observation."""
+        values = {
+            "reported_input_tokens": self.input_tokens,
+            "reported_output_tokens": self.output_tokens,
+            "cached_tokens": self.observed_cached_tokens(),
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "device_cached_tokens": self.device_cached_tokens,
+            "host_cached_tokens": self.host_cached_tokens,
+            "storage_cached_tokens": self.storage_cached_tokens,
+            "storage_backend": self.storage_backend,
+        }
+        if any(
+            value is not None
+            for value in (
+                self.cached_tokens,
+                self.device_cached_tokens,
+                self.host_cached_tokens,
+                self.storage_cached_tokens,
+            )
+        ):
+            values["cache_tier"] = self.observed_cache_tier()
+        return {key: value for key, value in values.items() if value is not None}
 
 
 @dataclass
@@ -793,13 +824,7 @@ class _PoolTicket:
 
     def status(self, *, state: str, now: float, upstream: str) -> dict[str, Any]:
         """Return bounded, payload-free request metadata for operators."""
-        label = (
-            hashlib.sha256(
-                b"scitex-genai-status-session-v1\0" + self.session_id.encode()
-            ).hexdigest()[:12]
-            if self.session_id
-            else "anonymous"
-        )
+        label = request_session_label(self.session_id)
         return {
             "session_label": label,
             "upstream": public_upstream_url(upstream),
@@ -1729,6 +1754,7 @@ class InferenceBackend:
         )
         self.cache_report_enabled = cache_report_enabled
         self.relay_metrics = RelayMetrics()
+        self.request_lifecycle = RequestLifecycleRegistry()
         self.admission_predictions = AdmissionPredictionTelemetry(
             state_path=admission_history_path
         )
@@ -1852,9 +1878,10 @@ class InferenceBackend:
             )
         )
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "provider": self.provider,
             "draining": self.pool.draining,
+            "request_lifecycle": self.request_lifecycle.snapshot(),
             "admission": admission,
             "admission_prediction": {
                 **self.admission_predictions.snapshot(),
@@ -1866,6 +1893,38 @@ class InferenceBackend:
                 },
             },
         }
+
+    def request_health_snapshot(self) -> dict[str, Any]:
+        """Return labeled active phases for the unauthenticated health API."""
+        return self.request_lifecycle.health_snapshot()
+
+    def _note_request(self, record: RequestObservation) -> None:
+        """Journal one lifecycle transition using labels, never raw identity."""
+        row = record.status(time.monotonic())
+        fields = (
+            f"request={row['request_label']} agent={row['agent_label']} "
+            f"session={row['session_label']} phase={row['phase']} "
+            f"queue_elapsed_s={row['queue_elapsed_s']:.3f} "
+            f"estimated_input_tokens={row['estimated_input_tokens']} "
+            "gateway_capacity_owned="
+            f"{str(row['gateway_capacity_owned']).lower()}"
+        )
+        if row["admitted_input_tokens"] is not None:
+            fields += f" admitted_input_tokens={row['admitted_input_tokens']}"
+        if row["gateway_input_tokens_admitted"] is not None:
+            fields += (
+                f" gateway_input_tokens_admitted={row['gateway_input_tokens_admitted']}"
+            )
+        if row["predicted_uncached_tokens"] is not None:
+            fields += f" predicted_uncached_tokens={row['predicted_uncached_tokens']}"
+        if row["upstream"] is not None:
+            fields += f" upstream={row['upstream']}"
+        if row["outcome"] is not None:
+            fields += f" outcome={row['outcome']}"
+        cache = row.get("cache", {})
+        for name, value in cache.items():
+            fields += f" {name}={value}"
+        self._note(f"[request] {fields}")
 
     async def probe_upstreams(self) -> list[UpstreamReachability]:
         """Return one coalesced, briefly cached local-control-plane observation."""
@@ -2059,6 +2118,15 @@ class InferenceBackend:
             "x-scitex-session-key": (session or "")[:12] or "none",
         }
         request_started = time.monotonic()
+        request_observation = self.request_lifecycle.start(
+            agent_label=request_agent_label(headers),
+            session_label=request_session_label(routing_session),
+            estimated_input_tokens=input_tokens,
+        )
+        feedback_headers["x-scitex-request-label"] = request_observation.request_label
+        feedback_headers["x-scitex-agent-label"] = request_observation.agent_label
+        feedback_headers["x-scitex-session-label"] = request_observation.session_label
+        self._note_request(request_observation)
         forwarded = {
             name: value
             for name, value in headers.items()
@@ -2072,6 +2140,9 @@ class InferenceBackend:
         handed_to_stream = False
         try:
             while len(attempted) < len(self.pool.upstreams):
+                if request_observation.phase != "admission_queued":
+                    self.request_lifecycle.admission_queued(request_observation)
+                    self._note_request(request_observation)
                 try:
                     predicted_alias = await self.pool.route_alias(
                         routing_session, exclude=attempted
@@ -2136,6 +2207,11 @@ class InferenceBackend:
                         client_disconnected=client_disconnected,
                     )
                 except _ClientDisconnected:
+                    self.request_lifecycle.disconnected(
+                        request_observation,
+                        outcome="client_disconnected_before_admission",
+                    )
+                    self._note_request(request_observation)
                     self._note(
                         f"[relay] conv={routing_session[:8] or '-'} <- queue "
                         "client_disconnected_before_admission"
@@ -2178,6 +2254,15 @@ class InferenceBackend:
                     break
                 attempted.add(upstream.alias)
                 started = time.monotonic()
+                self.request_lifecycle.upstream_inflight(
+                    request_observation,
+                    upstream=public_upstream_url(upstream.alias),
+                    admitted_input_tokens=input_tokens,
+                    gateway_input_tokens_admitted=upstream.input_tokens_in_flight,
+                    predicted_uncached_tokens=prediction.predicted_uncached_tokens,
+                    cache_classification=cache_classification.value,
+                )
+                self._note_request(request_observation)
                 self._note(
                     f"[relay] conv={routing_session[:8] or '-'} -> {upstream.alias} "
                     f"{method} {path} bytes={len(body or b'')} "
@@ -2216,6 +2301,7 @@ class InferenceBackend:
                         )
                     )
                     await asyncio.shield(task)
+                    self.request_lifecycle.capacity_released(request_observation)
 
                 send_task: asyncio.Task[Any] | None = None
                 preempt_task: asyncio.Task[Any] | None = None
@@ -2475,6 +2561,7 @@ class InferenceBackend:
                             input_tokens=input_tokens,
                             session_id=routing_session,
                             cold_prefill=cold_prefill,
+                            request_observation=request_observation,
                         )
                     if (
                         replay_attempt is not None
@@ -2488,6 +2575,11 @@ class InferenceBackend:
                             )
                         )
                     if observed_disconnect:
+                        self.request_lifecycle.disconnected(
+                            request_observation,
+                            outcome=outcome,
+                        )
+                        self._note_request(request_observation)
                         return RelayedResponse(
                             status_code=499,
                             content_type="application/json",
@@ -2513,6 +2605,7 @@ class InferenceBackend:
                             input_tokens=input_tokens,
                             session_id=routing_session,
                             cold_prefill=cold_prefill,
+                            request_observation=request_observation,
                         )
                         raise InferenceAdmissionError(
                             "Upstream request state is unknown after transport "
@@ -2576,9 +2669,23 @@ class InferenceBackend:
                         ),
                         cold_prefill=cold_prefill,
                         admission_prediction=prediction,
+                        request_observation=request_observation,
                     ),
                 )
             raise UpstreamUnreachable(self._refusal(failures))
+        except asyncio.CancelledError:
+            self.request_lifecycle.disconnected(
+                request_observation, outcome="relay_cancelled"
+            )
+            self._note_request(request_observation)
+            raise
+        except Exception as exc:
+            self.request_lifecycle.completed(
+                request_observation,
+                outcome=f"error:{type(exc).__name__}",
+            )
+            self._note_request(request_observation)
+            raise
         finally:
             if not handed_to_stream:
                 self.continuation_qos.finish_continuation(continuation_handoff)
@@ -2699,6 +2806,7 @@ class InferenceBackend:
         input_tokens: int,
         session_id: str,
         cold_prefill: bool = False,
+        request_observation: RequestObservation | None = None,
     ) -> None:
         """Retain admission and retry abort until engine cleanup is confirmed."""
         if not request_id:
@@ -2721,6 +2829,10 @@ class InferenceBackend:
                             )
                         )
                         await asyncio.shield(release)
+                        if request_observation is not None:
+                            self.request_lifecycle.capacity_released(
+                                request_observation
+                            )
                         self.continuation_qos.cleanup_recovered()
                         return
                     delay_s = min(5.0, delay_s * 2)
@@ -2762,6 +2874,7 @@ class InferenceBackend:
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
         admission_prediction: AdmissionPrediction | None = None,
+        request_observation: RequestObservation | None = None,
     ) -> AsyncIterator[bytes]:
         sent = 0
         outcome = "complete"
@@ -2854,6 +2967,7 @@ class InferenceBackend:
                     cache_tier=token_report.observed_cache_tier(),
                 )
                 self.admission_predictions.save_state(self._engine_generations)
+            cache = token_report.cache_observation()
             if tag:
                 took = time.monotonic() - started if started is not None else 0.0
                 total = (
@@ -2882,8 +2996,19 @@ class InferenceBackend:
                     release_capacity=release_capacity,
                     request_id=request_id,
                     request_headers=request_headers or {},
+                    request_observation=request_observation,
                 )
             )
+            if request_observation is not None:
+                if outcome == "client_disconnected":
+                    self.request_lifecycle.disconnected(
+                        request_observation, outcome=outcome, cache=cache
+                    )
+                else:
+                    self.request_lifecycle.completed(
+                        request_observation, outcome=outcome, cache=cache
+                    )
+                self._note_request(request_observation)
             self.continuation_qos.finish_continuation(continuation_handoff)
 
     async def _finish(
@@ -2898,6 +3023,7 @@ class InferenceBackend:
         release_capacity: bool = True,
         request_id: str = "",
         request_headers: Mapping[str, str] | None = None,
+        request_observation: RequestObservation | None = None,
     ) -> None:
         # Ownership is settled before socket cleanup. A peer stuck in
         # FIN-WAIT/CLOSE-WAIT must never keep a confirmed-aborted or fully
@@ -2909,6 +3035,8 @@ class InferenceBackend:
                 session_id=session_id,
                 cold_prefill=cold_prefill,
             )
+            if request_observation is not None:
+                self.request_lifecycle.capacity_released(request_observation)
             if not release_capacity:
                 self.continuation_qos.non_addressable_cleanup_released()
                 self._note(
@@ -2923,6 +3051,7 @@ class InferenceBackend:
                 input_tokens=input_tokens,
                 session_id=session_id,
                 cold_prefill=cold_prefill,
+                request_observation=request_observation,
             )
         await response.aclose()
         await client.aclose()

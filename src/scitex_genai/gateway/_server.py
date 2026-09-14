@@ -230,6 +230,7 @@ def create_app(
                     "draining": drain.draining,
                     "cache_admission": backend.cache_admission.snapshot(),
                     "continuation_qos": backend.continuation_qos.snapshot(),
+                    "request_lifecycle": backend.request_health_snapshot(),
                     "cache_report": {
                         "mode": (
                             "sglang-openai-enabled"
@@ -289,6 +290,7 @@ def create_app(
                 "draining": drain.draining,
                 "cache_admission": backend.cache_admission.snapshot(),
                 "continuation_qos": backend.continuation_qos.snapshot(),
+                "request_lifecycle": backend.request_health_snapshot(),
                 "cache_report": {
                     "mode": (
                         "sglang-openai-enabled"
