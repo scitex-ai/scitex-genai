@@ -228,13 +228,15 @@ async def test_non_model_get_remains_in_generation_admission(upstream_factory) -
     _ = b"".join([chunk async for chunk in reply.body])
 
     # Assert
-    assert reply.feedback_headers["x-scitex-admission-mode"] == "observe-only"
-    assert "x-scitex-request-label" in reply.feedback_headers
-    assert backend.cache_admission.snapshot()["observed"] == {
-        "hot": 0,
-        "cold": 0,
-        "unknown": 1,
-    }
+    assert (
+        reply.feedback_headers["x-scitex-admission-mode"],
+        "x-scitex-request-label" in reply.feedback_headers,
+        backend.cache_admission.snapshot()["observed"],
+    ) == (
+        "observe-only",
+        True,
+        {"hot": 0, "cold": 0, "unknown": 1},
+    )
 
 
 @pytest.mark.parametrize(
@@ -251,7 +253,14 @@ async def test_non_model_get_remains_in_generation_admission(upstream_factory) -
 def test_only_model_discovery_is_read_only_control_plane(
     method: str, path: str, expected: bool
 ) -> None:
-    assert is_read_only_control_route(method, path) is expected
+    # Arrange
+    route = (method, path)
+
+    # Act
+    actual = is_read_only_control_route(*route)
+
+    # Assert
+    assert actual is expected
 
 
 def _body_with_estimated_tokens(tokens: int) -> bytes:
@@ -349,7 +358,7 @@ async def test_hung_metadata_cannot_block_sticky_224793_token_continuation(
     metadata = asyncio.create_task(
         backend.relay("GET", "/v1/models", body=None, headers={})
     )
-    assert await asyncio.to_thread(tp1.request_started.wait, 1.0)
+    metadata_started = await asyncio.to_thread(tp1.request_started.wait, 1.0)
     body = _body_with_estimated_tokens(224_793)
 
     # Act
@@ -367,9 +376,10 @@ async def test_hung_metadata_cannot_block_sticky_224793_token_continuation(
         snapshot["admitted"],
         snapshot["queued"],
         pool.upstreams[1].in_flight,
+        metadata_started,
         metadata.done(),
         tp1.requests[-1]["path"],
-    ) == (224_793 * 4, 0, 0, 0, False, "/v1/chat/completions")
+    ) == (224_793 * 4, 0, 0, 0, True, False, "/v1/chat/completions")
 
     metadata_release.set()
     metadata_reply = await asyncio.wait_for(metadata, timeout=1.0)
@@ -391,20 +401,24 @@ async def test_metadata_absolute_deadline_never_consumes_generation_slot(
     started = time.monotonic()
 
     # Act
-    with pytest.raises(UpstreamUnreachable):
+    error = None
+    try:
         await backend.relay("GET", "/v1/models", body=None, headers={})
+    except UpstreamUnreachable as exc:
+        error = exc
     elapsed = time.monotonic() - started
     snapshot = await pool.observability_snapshot()
 
     # Assert: the independent wall-clock deadline wins over the generation
     # timeout and cannot leave an admitted or queued ticket behind.
-    assert elapsed < 1.0
     assert (
+        isinstance(error, UpstreamUnreachable),
+        elapsed < 1.0,
         snapshot["admitted"],
         snapshot["queued"],
         pool.status()[0]["in_flight"],
         backend.request_health_snapshot()["active"],
-    ) == (0, 0, 0, 0)
+    ) == (True, True, 0, 0, 0, 0)
     metadata_release.set()
 
 
@@ -427,21 +441,26 @@ async def test_legacy_non_addressable_ticket_is_reaped_on_caller_deadline(
             headers={},
         )
     )
-    assert await asyncio.to_thread(upstream.request_started.wait, 1.0)
+    request_started = await asyncio.to_thread(upstream.request_started.wait, 1.0)
 
     # Act: this is the client's 900-second deadline, compressed for the test.
     request.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    cancelled = None
+    try:
         await asyncio.wait_for(request, timeout=0.5)
+    except asyncio.CancelledError as exc:
+        cancelled = exc
     snapshot = await pool.observability_snapshot()
 
     # Assert: cleanup is bounded and no stale zero-token admission survives.
     assert (
+        request_started,
+        isinstance(cancelled, asyncio.CancelledError),
         snapshot["admitted"],
         snapshot["queued"],
         pool.status()[0]["in_flight"],
         backend.request_health_snapshot()["active"],
-    ) == (0, 0, 0, 0)
+    ) == (True, True, 0, 0, 0, 0)
     release.set()
 
 
