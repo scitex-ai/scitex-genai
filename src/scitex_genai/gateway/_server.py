@@ -110,6 +110,34 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
     return estimate_input_tokens(serialized.encode("utf-8"))
 
 
+def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize public Responses shorthand for the Codex transport."""
+    value = body.get("input")
+    if isinstance(value, str):
+        value = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": value}],
+            }
+        ]
+    elif isinstance(value, list):
+        normalized = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("content"), str):
+                content_type = (
+                    "output_text"
+                    if item.get("role") == "assistant"
+                    else "input_text"
+                )
+                item = {
+                    **item,
+                    "content": [{"type": content_type, "text": item["content"]}],
+                }
+            normalized.append(item)
+        value = normalized
+    return {**body, "input": value, "stream": True, "store": False}
+
+
 def create_app(
     backend: CodexBackend | InferenceBackend,
     *,
@@ -483,6 +511,63 @@ def create_app(
             return await relay(request)
 
         return app
+
+    @app.post("/v1/responses")
+    async def responses(request: Request) -> Any:
+        if not authorized(request):
+            return JSONResponse(
+                _openai_error("Invalid API key", "authentication_error", 401),
+                401,
+            )
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise GatewayError("Request body must be a JSON object")
+            if not isinstance(body.get("model"), str) or not body["model"]:
+                raise GatewayError("Responses request requires a model")
+            if "input" not in body:
+                raise GatewayError("Responses request requires input")
+            requested_stream = body.get("stream") is True
+            payload = _codex_responses_payload(body)
+            session_id = _session_id(request, body)
+        except (ValueError, GatewayError) as exc:
+            return JSONResponse(
+                _openai_error(str(exc), "invalid_request_error", 400), 400
+            )
+
+        if requested_stream:
+
+            async def stream_response() -> AsyncIterator[str]:
+                try:
+                    async for event in backend.stream(
+                        payload, session_id=session_id
+                    ):
+                        event_type = str(event.get("type", "message"))
+                        data = json.dumps(event, separators=(",", ":"))
+                        yield f"event: {event_type}\ndata: {data}\n\n"
+                except GatewayError as exc:
+                    error = _openai_error(str(exc), "api_error", 503)
+                    yield f"event: error\ndata: {json.dumps(error)}\n\n"
+
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
+
+        try:
+            completed = None
+            async for event in backend.stream(payload, session_id=session_id):
+                if event.get("type") == "response.completed":
+                    candidate = event.get("response")
+                    if isinstance(candidate, dict):
+                        completed = candidate
+            if completed is None:
+                raise GatewayError("Codex response ended without response.completed")
+            return completed
+        except UpstreamError as exc:
+            return JSONResponse(
+                _openai_error(str(exc), exc.error_type, exc.status_code),
+                exc.status_code,
+            )
+        except GatewayError as exc:
+            return JSONResponse(_openai_error(str(exc), "api_error", 503), 503)
 
     @app.post("/v1/messages")
     async def messages(request: Request) -> Any:
