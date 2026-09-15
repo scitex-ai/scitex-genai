@@ -20,7 +20,29 @@ from scitex_genai.gateway._errors import InferenceAdmissionError
 from scitex_genai.gateway._health import UpstreamReachability
 from scitex_genai.gateway._identity import GatewayIdentity
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
-from scitex_genai.gateway._server import _build_uvicorn_server, create_app
+from scitex_genai.gateway._server import (
+    _build_uvicorn_server,
+    _codex_responses_payload,
+    create_app,
+)
+
+
+def test_codex_responses_payload_expands_string_input() -> None:
+    body = {"model": "gpt-5.6-sol", "input": "Hello"}
+
+    payload = _codex_responses_payload(body)
+
+    assert payload == {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            }
+        ],
+        "stream": True,
+        "store": False,
+    }
 
 
 class _Pool:
@@ -51,7 +73,19 @@ class _Backend:
         }
         yield {
             "type": "response.completed",
-            "response": {"usage": {"input_tokens": 3, "output_tokens": 1}},
+            "response": {
+                "id": "resp-1",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.6-sol",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Hello"}],
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            },
         }
 
 
@@ -128,6 +162,53 @@ async def test_stream_messages_returns_anthropic_sse(client) -> None:
         "event: message_start" in response.text,
         "event: content_block_delta" in response.text,
         "event: message_stop" in response.text,
+    ) == (200, True, True, True, True)
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_missing_api_key_in_openai_shape(client) -> None:
+    response = await client.post(
+        "/v1/responses", json={"model": "gpt-5.6-sol", "input": "Hello"}
+    )
+
+    assert (response.status_code, response.json()["error"]["type"]) == (
+        401,
+        "authentication_error",
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonstream_responses_returns_openai_shape(client) -> None:
+    response = await client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
+        headers={"Authorization": "Bearer relay-secret"},
+    )
+
+    assert (
+        response.status_code,
+        response.json()["id"],
+        response.json()["output"][0]["content"][0]["text"],
+    ) == (200, "resp-1", "Hello")
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_returns_native_sse(client) -> None:
+    response = await client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+        headers={
+            "x-api-key": "relay-secret",
+            "x-session-id": "sac:scitex-hub:gpt-sol",
+        },
+    )
+
+    assert (
+        response.status_code,
+        response.headers["content-type"].startswith("text/event-stream"),
+        "event: response.created" in response.text,
+        "event: response.output_text.delta" in response.text,
+        "event: response.completed" in response.text,
     ) == (200, True, True, True, True)
 
 
