@@ -112,7 +112,7 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
 
 
 def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
-    """Normalize public Responses shorthand into Codex transport input items."""
+    """Normalize public Responses shorthand for the Codex transport."""
     value = body.get("input")
     if isinstance(value, str):
         value = [
@@ -126,7 +126,9 @@ def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
         for item in value:
             if isinstance(item, dict) and isinstance(item.get("content"), str):
                 content_type = (
-                    "output_text" if item.get("role") == "assistant" else "input_text"
+                    "output_text"
+                    if item.get("role") == "assistant"
+                    else "input_text"
                 )
                 item = {
                     **item,
@@ -593,7 +595,6 @@ def create_app(
 
     @app.post("/v1/responses")
     async def responses(request: Request) -> Any:
-        """Expose the native Codex Responses transport to OpenAI clients."""
         if not authorized(request):
             return JSONResponse(
                 _openai_error("Invalid API key", "authentication_error", 401),
@@ -629,9 +630,7 @@ def create_app(
                     error = _openai_error(str(exc), "api_error", 503)
                     yield f"event: error\ndata: {json.dumps(error)}\n\n"
 
-            return StreamingResponse(
-                stream_response(), media_type="text/event-stream"
-            )
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
 
         try:
             completed = None
