@@ -148,7 +148,7 @@ def test_active_classification_fails_fast_without_authoritative_cache_evidence(
     settings = CacheAdmissionSettings(mode="active")
 
     # Act
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="active cache admission"):
         classify_cache_prediction(
             settings=settings,
             engine_generation=generation,
@@ -158,7 +158,6 @@ def test_active_classification_fails_fast_without_authoritative_cache_evidence(
         )
 
     # Assert
-    assert "active cache admission" in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -183,23 +182,26 @@ async def test_active_relay_fails_before_dispatch_when_engine_evidence_is_missin
     )
 
     # Act
-    with pytest.raises(InferenceAdmissionError) as raised:
+    raised = None
+    try:
         await backend.relay(
             "POST",
             "/v1/chat/completions",
             body=b'{"model":"m","messages":[{"role":"user","content":"hello"}]}',
             headers={"X-SciTeX-Session-ID": "session"},
         )
+    except InferenceAdmissionError as exc:
+        raised = exc
 
     # Assert
     assert (
-        "lacks an engine generation" in str(raised.value),
+        "lacks an engine generation" in str(raised),
         len(upstream.requests),
         backend.pool.status()[0]["in_flight"],
     ) == (True, 0, 0)
 
 
-def test_active_backend_rejects_missing_reports_and_unvalidated_pool_policy() -> None:
+def test_active_backend_rejects_missing_cache_reports() -> None:
     # Arrange
     settings = CacheAdmissionSettings(mode="active")
     matching = InferenceUpstreamPool.from_urls(
@@ -210,21 +212,31 @@ def test_active_backend_rejects_missing_reports_and_unvalidated_pool_policy() ->
         cold_prefill_limit_per_upstream=settings.cold_prefill_limit_per_upstream,
         cold_prefill_min_tokens=settings.hot_max_uncached_tokens,
     )
+    # Act
+    with pytest.raises(ValueError, match="requires cache_report_enabled"):
+        InferenceBackend(matching, cache_admission_settings=settings)
+
+    # Assert
+
+
+def test_active_backend_rejects_unvalidated_pool_policy() -> None:
+    # Arrange
+    settings = CacheAdmissionSettings(mode="active")
     mismatched = InferenceUpstreamPool.from_urls(
         "http://only:1",
         cold_prefill_limit_per_upstream=1,
         cold_prefill_min_tokens=64_000,
     )
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="requires cache_report_enabled"):
-        InferenceBackend(matching, cache_admission_settings=settings)
+    # Act
     with pytest.raises(ValueError, match="pool policy does not match"):
         InferenceBackend(
             mismatched,
             cache_report_enabled=True,
             cache_admission_settings=settings,
         )
+
+    # Assert
 
 
 @pytest.mark.asyncio
