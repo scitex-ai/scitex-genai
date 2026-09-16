@@ -148,6 +148,7 @@ def test_active_classification_fails_fast_without_authoritative_cache_evidence(
     settings = CacheAdmissionSettings(mode="active")
 
     # Act
+    # Assert
     with pytest.raises(ValueError, match="active cache admission"):
         classify_cache_prediction(
             settings=settings,
@@ -156,8 +157,6 @@ def test_active_classification_fails_fast_without_authoritative_cache_evidence(
             prior_cache_tier=tier,
             predicted_uncached_tokens=1,
         )
-
-    # Assert
 
 
 @pytest.mark.asyncio
@@ -213,10 +212,9 @@ def test_active_backend_rejects_missing_cache_reports() -> None:
         cold_prefill_min_tokens=settings.hot_max_uncached_tokens,
     )
     # Act
+    # Assert
     with pytest.raises(ValueError, match="requires cache_report_enabled"):
         InferenceBackend(matching, cache_admission_settings=settings)
-
-    # Assert
 
 
 def test_active_backend_rejects_unvalidated_pool_policy() -> None:
@@ -229,14 +227,13 @@ def test_active_backend_rejects_unvalidated_pool_policy() -> None:
     )
 
     # Act
+    # Assert
     with pytest.raises(ValueError, match="pool policy does not match"):
         InferenceBackend(
             mismatched,
             cache_report_enabled=True,
             cache_admission_settings=settings,
         )
-
-    # Assert
 
 
 @pytest.mark.asyncio
