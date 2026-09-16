@@ -1,14 +1,14 @@
 # Gateway cold-aware admission foundation
 
-Status: observe-only, 2026-09-12. This change is not a production rollout.
+Status: active implementation proposed, 2026-09-17. This document does not
+authorize a production rollout.
 
-SAC's Hermes compiler selects OpenAI Chat Completions or Responses. Inspection
-of the compiler found no configured inference-session header and no exact
-pre-admission HBM, host, or storage cache-residency result. A stable session ID
-would preserve routing identity, but even it and a previous hit would not prove
-that pages remain resident in the selected SGLang process. Prompt length does
-not prove a miss. The gateway therefore reports residency as `unknown` and
-does not enable cache-priority scheduling.
+The gateway now combines a stable session ID, sticky upstream identity, an
+authoritative SGLang engine generation, request-lineage digests, and the prior
+response's cache report. Prompt length alone never proves a hit. A compatible
+lineage on the same engine generation is hot only when its predicted uncached
+suffix is within the configured boundary; a new or incompatible lineage is
+conservatively cold.
 
 The required future SAC/Hermes client contract is one opaque
 `X-SciTeX-Session-ID` value that remains stable for the conversation lifetime.
@@ -21,24 +21,23 @@ request content or raw session identity is added to admission metrics.
 Successful relayed responses expose the deterministic state:
 
 ```text
-X-SciTeX-Admission-Mode: observe-only
-X-SciTeX-Cache-Residency: unknown
+X-SciTeX-Admission-Mode: active
+X-SciTeX-Cache-Residency: hot|cold
 X-SciTeX-Session-Key: <12-character opaque key, or none>
 ```
 
-`AdmissionController` is disabled by default. Its future enabled mode accepts
-only an authoritative `hot`, `cold`, or `unknown` classification. Known-hot
-work may pass queued cold/unknown work at an available-slot boundary. Once the
-oldest cold/unknown waiter reaches `max_cold_wait_s`, it receives the next
-progressing slot. The controller exposes content-free queue, wait, class, and
-overtake counters through `snapshot()`.
+Active mode remains opt-in. Known-hot work may pass queued cold work at an
+available-slot boundary. Bypasses are counted, and aged ordinary work receives
+the next fitting slot, preventing an endless hot stream from starving cold
+work. Session affinity remains authoritative: cache priority never migrates a
+conversation to another engine.
 
-Activation requires an engine-owned lookup against the exact upstream and
-cache generation selected by sticky routing. With multiple upstreams, each
-must have independent admission/residency state because their L1/L2/L3 pages
-differ. With one upstream, a gateway can reorder queued work but cannot
-preempt a cold prefill already admitted to SGLang; that requires engine
-preemption/time slicing or separate capacity.
+Activation requires generation-bearing engine metrics and cache reporting on
+the exact sticky upstream. Missing generation or malformed historical cache
+evidence fails before dispatch. No compatible history is a safe cold result,
+not a guessed hit. With multiple upstreams, each retains independent evidence
+because their L1/L2/L3 pages differ. The gateway can reorder work waiting at
+its boundary but cannot preempt a cold prefill already admitted to SGLang.
 
 L1 remains the HBM radix/KV cache, L2 is bounded host HiCache, and any L3
 storage cache remains engine-owned. A future signal must report the actual

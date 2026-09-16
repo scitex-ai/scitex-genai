@@ -599,13 +599,19 @@ def test_admission_history_handoff_sits_in_the_genai_runtime_directory():
     assert path == scitex_dir / "genai" / "runtime" / "admission-history.json"
 
 
-def test_cold_prefill_guard_requires_an_explicit_limit_and_threshold(tmp_path: Path):
+def test_active_cache_admission_is_strictly_validated(tmp_path: Path):
     # Arrange
     path = _write(
         tmp_path / "config.yaml",
         "gateway:\n"
-        "  inference_cold_prefill_limit_per_upstream: 1\n"
-        "  inference_cold_prefill_min_tokens: 256000\n",
+        "  inference_cache_report_enabled: true\n"
+        "  cache_admission:\n"
+        "    mode: active\n"
+        "    hot_max_uncached_tokens: 32768\n"
+        "    cold_prefill_limit_per_upstream: 1\n"
+        "    max_hot_bypasses: 2\n"
+        "    starvation_age_s: 15.0\n"
+        "    evidence_max_age_s: 120.0\n",
     )
 
     # Act
@@ -613,23 +619,63 @@ def test_cold_prefill_guard_requires_an_explicit_limit_and_threshold(tmp_path: P
 
     # Assert
     assert (
-        settings.inference_cold_prefill_limit_per_upstream,
-        settings.inference_cold_prefill_min_tokens,
-    ) == (1, 256000)
+        settings.cache_admission.mode,
+        settings.cache_admission.hot_max_uncached_tokens,
+        settings.cache_admission.max_hot_bypasses,
+        settings.cache_admission.starvation_age_s,
+    ) == ("active", 32768, 2, 15.0)
 
 
-def test_cold_prefill_guard_rejects_an_incomplete_pair(tmp_path: Path):
+@pytest.mark.parametrize(
+    "body",
+    [
+        "gateway:\n  inference_cache_report_enabled: true\n  cache_admission:\n    mode: true\n",
+        "gateway:\n  inference_cache_report_enabled: true\n  cache_admission:\n    mode: active\n    unexpected: 1\n",
+        "gateway:\n  inference_cache_report_enabled: true\n  cache_admission:\n    mode: active\n    max_hot_bypasses: -1\n",
+    ],
+)
+def test_active_cache_admission_rejects_wrong_types_unknown_keys_and_bounds(
+    tmp_path: Path, body: str
+):
     # Arrange
     incomplete = _write(
         tmp_path / "incomplete.yaml",
-        "gateway:\n  inference_cold_prefill_limit_per_upstream: 1\n",
+        body,
     )
 
     # Act
     raised = _raised(lambda: load_settings(incomplete))
 
     # Assert
-    assert (
-        str(raised)
-        == "cold prefill limit and minimum tokens must be configured together"
+    assert isinstance(raised, ValueError)
+
+
+def test_active_cache_admission_requires_cache_reports(tmp_path: Path):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  cache_admission:\n    mode: active\n",
     )
+
+    # Act
+    raised = _raised(lambda: load_settings(path))
+
+    # Assert
+    assert str(raised) == (
+        "active gateway.cache_admission requires "
+        "gateway.inference_cache_report_enabled: true"
+    )
+
+
+def test_retired_flat_cold_prefill_settings_fail_loudly(tmp_path: Path):
+    # Arrange
+    path = _write(
+        tmp_path / "config.yaml",
+        "gateway:\n  inference_cold_prefill_limit_per_upstream: 1\n",
+    )
+
+    # Act
+    raised = _raised(lambda: load_settings(path))
+
+    # Assert
+    assert "retired local inference configuration" in str(raised)
