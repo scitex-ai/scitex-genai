@@ -71,6 +71,15 @@ class InferenceAdmissionError(UpstreamError):
         super().__init__(message, status_code=503)
 
 
+class InferenceMemberUnavailable(GatewayError):
+    """A queued ticket's selected inference member became unreachable."""
+
+    def __init__(self, alias: str, reason: str) -> None:
+        self.alias = alias
+        self.reason = reason
+        super().__init__(f"inference member {alias} is unreachable: {reason}")
+
+
 class ModelPolicyError(UpstreamError):
     """A requested model is outside the gateway's outbound allowlist."""
 

@@ -387,7 +387,7 @@ async def test_drain_barrier_refuses_racing_request_and_drains_owned_work(
 ) -> None:
     # Arrange
     release_upstream = threading.Event()
-    upstream = upstream_factory(block_until=release_upstream)
+    upstream = upstream_factory(block_until=release_upstream, block_path="/v1/messages")
     pool = InferenceUpstreamPool.from_urls(
         upstream.url, capacity_per_upstream=1, max_queue_size=1
     )
@@ -658,14 +658,14 @@ async def test_relay_health_degrades_after_consecutive_unreachable_observations(
         payload["members"][0]["reachability"]["reason"],
     ) == (
         503,
-        200,
+        503,
         False,
         True,
         1,
         "degraded",
         "no_inference_upstream_reachable",
         1,
-        1,
+        0,
         0,
         0,
         "connection_refused",

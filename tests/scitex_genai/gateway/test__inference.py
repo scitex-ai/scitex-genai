@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import re
+import threading
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
@@ -13,10 +14,11 @@ import pytest
 
 from scitex_genai.gateway._errors import (
     InferenceAdmissionError,
+    InferenceMemberUnavailable,
     NoAccountAvailable,
-    UpstreamReloading,
     UpstreamUnreachable,
 )
+from scitex_genai.gateway._health import UpstreamReachability
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
@@ -514,6 +516,108 @@ async def test_pool_admits_different_conversations_concurrently() -> None:
     await pool.release(second, session_id="s2")
     # Assert
     assert observed == (2, 0)
+
+
+@pytest.mark.asyncio
+async def test_unreachable_member_wakes_queued_ticket_and_drops_sticky_route() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls(
+        "http://a:1,http://b:2", capacity_per_upstream=1
+    )
+    admitted = await pool.acquire("sticky")
+    waiting = asyncio.create_task(pool.acquire("sticky"))
+    await _wait_for_queue(pool, 1)
+    snapshot = await pool.cooldown_snapshot()
+
+    # Act
+    await pool.reconcile_reachability(
+        snapshot,
+        [
+            UpstreamReachability(False, "connection_refused", 1.0, "now"),
+            UpstreamReachability(True, "responded", 1.0, "now", 200),
+        ],
+    )
+    waiting_error = await _raised_async(waiting)
+    rerouted = await pool.acquire("sticky")
+    state = pool.status()
+    await pool.release(admitted, session_id="sticky")
+    await pool.release(rerouted, session_id="sticky")
+
+    # Assert
+    assert (
+        isinstance(waiting_error, InferenceMemberUnavailable),
+        waiting_error.alias,
+        rerouted.alias,
+        state[0]["active"],
+        state[1]["active"],
+    ) == (True, "http://a:1", "http://b:2", False, True)
+
+
+@pytest.mark.asyncio
+async def test_reachability_watcher_closes_post_admission_fence_race() -> None:
+    # Arrange
+    pool = InferenceUpstreamPool.from_urls("http://a:1")
+    member = pool.upstreams[0]
+    await pool.mark_unreachable(member, reason="connection_refused")
+    generation = member.reachability_generation
+
+    # Act
+    reason = await asyncio.wait_for(
+        pool.wait_until_unreachable(member.alias, generation), timeout=0.1
+    )
+
+    # Assert
+    assert reason == "connection_refused"
+
+
+@pytest.mark.asyncio
+async def test_inflight_request_fails_fast_then_retry_uses_reachable_member(
+    upstream_factory,
+) -> None:
+    # Arrange
+    release = threading.Event()
+    failed = upstream_factory(block_until=release, block_path="/v1/messages")
+    live = upstream_factory()
+
+    async def reachability(url: str, _timeout_s: float) -> UpstreamReachability:
+        if url == failed.url:
+            return UpstreamReachability(False, "connection_refused", 1.0, "now")
+        return UpstreamReachability(True, "responded", 1.0, "now", 200)
+
+    pool = InferenceUpstreamPool.from_urls([failed.url, live.url])
+    backend = InferenceBackend(pool, health_probe=reachability, health_cache_ttl_s=0)
+    headers = {"X-SciTeX-Session-ID": "scitex-ui"}
+    first = asyncio.create_task(
+        backend.relay(
+            "POST",
+            "/v1/messages",
+            body=json.dumps(_request()).encode(),
+            headers=headers,
+        )
+    )
+    started = await asyncio.to_thread(failed.request_started.wait, 1)
+
+    # Act
+    await backend.probe_upstreams()
+    try:
+        first_error = await asyncio.wait_for(_raised_async(first), timeout=1)
+    finally:
+        # Never leave the real HTTP fixture blocked when the assertion above
+        # fails; otherwise fixture teardown obscures the relay failure.
+        release.set()
+    retry = await backend.relay(
+        "POST", "/v1/messages", body=json.dumps(_request()).encode(), headers=headers
+    )
+    await _collect(retry.body)
+
+    # Assert
+    assert (
+        isinstance(first_error, InferenceAdmissionError),
+        started,
+        pool.status()[0]["active"],
+        pool.status()[0]["in_flight"],
+        len(live.requests),
+    ) == (True, True, False, 0, 1)
 
 
 async def _wait_for_queue(pool: InferenceUpstreamPool, size: int) -> None:
@@ -2236,13 +2340,12 @@ async def test_relay_refuses_naming_inference_upstreams_when_none_answers(
 
 
 @pytest.mark.asyncio
-async def test_relay_holds_a_conversation_whose_home_just_died(
+async def test_relay_fences_a_conversation_whose_home_just_died(
     dead_url_factory,
 ) -> None:
     # Arrange -- the conversation was placed on the one upstream, which then
-    # produced no response. Measured 2026-09-05: re-placing it elsewhere is how
-    # the request that killed one replica killed the other. The home stays
-    # pinned and the caller is told to retry.
+    # produced no response. An observed-dead home must be fenced instead of
+    # retaining a sticky mapping that can admit more work to a dead member.
     backend = InferenceBackend(
         InferenceUpstreamPool.from_urls(dead_url_factory()), wait_for_home_s=0.0
     )
@@ -2255,7 +2358,7 @@ async def test_relay_holds_a_conversation_whose_home_just_died(
         await backend.relay("POST", "/v1/messages", body=body, headers={})
 
     # Assert
-    with pytest.raises(UpstreamReloading, match="stays pinned to its home upstream"):
+    with pytest.raises(UpstreamUnreachable, match="All inference upstreams"):
         await relay()
 
 
