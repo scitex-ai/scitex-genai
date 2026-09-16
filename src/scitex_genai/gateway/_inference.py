@@ -68,6 +68,7 @@ from ._admission import AdmissionController, CacheResidency
 from ._errors import (
     HomeMemberReloading,
     InferenceAdmissionError,
+    InferenceMemberUnavailable,
     NoAccountAvailable,
     UpstreamReloading,
     UpstreamUnreachable,
@@ -797,6 +798,10 @@ class InferenceUpstream:
     quiesced: bool = False
     held: int = 0
     input_tokens_held: int = 0
+    #: ``None`` before the first control-plane probe, then authoritative.
+    reachable: bool | None = None
+    unreachable_reason: str = "unobserved"
+    reachability_generation: int = 0
 
     @property
     def base_url(self) -> str:
@@ -822,7 +827,10 @@ class InferenceUpstream:
         status = {
             "url": self.base_url,
             "active": (
-                not closing and not self.quiesced and self.cooldown_until <= time.time()
+                not closing
+                and not self.quiesced
+                and self.reachable is not False
+                and self.cooldown_until <= time.time()
             ),
             "in_flight": self.in_flight,
             "queued": self.queued,
@@ -1004,7 +1012,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         self._held_total = 0
         self._member_quiesces_total = 0
         self._member_resumes_total = 0
-        self._active_sessions: set[str] = set()
         self._closing = False
         self.session_state = session_state
 
@@ -1110,6 +1117,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
     ) -> InferenceUpstream:
         """Select only a member on which this request can ever be resident."""
         now = time.time()
+        unreachable = {
+            upstream.alias for upstream in self.upstreams if upstream.reachable is False
+        }
         incapable = {
             upstream.alias
             for upstream in self.upstreams
@@ -1133,7 +1143,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             self._sessions.pop(session_id, None)
             sticky_alias = None
 
-        hard_excluded = excluded | incapable
+        hard_excluded = excluded | incapable | unreachable
         if (
             sticky_alias is not None
             and sticky_alias not in hard_excluded
@@ -1238,6 +1248,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 if (
                     selected is None
                     or selected.alias in excluded
+                    or selected.reachable is False
                     or (not selected.quiesced and selected.cooldown_until > time.time())
                 ):
                     # Never apply a cache prediction to a different upstream.
@@ -1295,8 +1306,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 selected.cold_prefills_in_flight += int(cold_prefill)
                 self._running_tickets[selected.alias].append(ticket)
                 self._admissions_total += 1
-                if session_id:
-                    self._active_sessions.add(session_id)
                 return selected
             waiters = self._waiters[selected.alias]
             if not was_held:
@@ -1321,6 +1330,10 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                         raise InferenceAdmissionError(
                             "Inference gateway is shutting down"
                         )
+                    if selected.reachable is False:
+                        raise InferenceMemberUnavailable(
+                            selected.alias, selected.unreachable_reason
+                        )
                     now = time.time()
                     if (
                         self._next_admissible_ticket(selected) is ticket
@@ -1340,8 +1353,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                             0.0, time.monotonic() - ticket.queued_at
                         )
                         self._queue_time_samples += 1
-                        if session_id:
-                            self._active_sessions.add(session_id)
                         return selected
                     cooldown_s = max(0.0, selected.cooldown_until - now)
                     try:
@@ -1394,7 +1405,11 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         stream of continuations from monopolizing the upstream.
         """
         waiters = self._waiters[member.alias]
-        if not waiters or member.in_flight >= member.capacity:
+        if (
+            not waiters
+            or member.reachable is False
+            or member.in_flight >= member.capacity
+        ):
             return None
 
         now = time.monotonic()
@@ -1452,7 +1467,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         waiters = self._waiters[member.alias]
         selected_index = waiters.index(selected)
         for bypassed in list(waiters)[:selected_index]:
-            if bypassed.session_id not in self._active_sessions and not self._fits(
+            if not self._session_has_reachable_active(
+                bypassed.session_id
+            ) and not self._fits(
                 member,
                 bypassed.input_tokens,
                 bypassed.session_id,
@@ -1470,7 +1487,8 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         token_capacity = member.token_capacity
         running = self._running_tickets[member.alias]
         return (
-            session_id not in self._active_sessions
+            not self._session_has_reachable_active(session_id)
+            and member.reachable is not False
             and member.in_flight < member.capacity
             and (not cold_prefill or all(ticket.cold_prefill for ticket in running))
             and (
@@ -1484,9 +1502,20 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             )
         )
 
+    def _session_has_reachable_active(self, session_id: str) -> bool:
+        """Serialize a session unless its prior owner is authoritatively fenced."""
+        if not session_id:
+            return False
+        return any(
+            member.reachable is not False
+            and any(ticket.session_id == session_id for ticket in running)
+            for member in self.upstreams
+            for running in (self._running_tickets[member.alias],)
+        )
+
     def _block_reason(self, member: InferenceUpstream, ticket: _PoolTicket) -> str:
         """Explain the first deterministic gateway condition blocking a ticket."""
-        if ticket.session_id in self._active_sessions:
+        if self._session_has_reachable_active(ticket.session_id):
             return "session-serialization"
         if member.in_flight >= member.capacity:
             return "request-capacity"
@@ -1517,11 +1546,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         cold_prefill: bool = False,
     ) -> None:
         async with self._admission:
-            # Explicit sessions are serialized, so the active-session entry is
-            # the admission ownership receipt. A duplicated or late cleanup
-            # must not decrement another request that has since been admitted.
-            if session_id and session_id not in self._active_sessions:
-                return
             if member.in_flight <= 0:
                 return
             running = self._running_tickets[member.alias]
@@ -1532,8 +1556,17 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                     if ticket.session_id == session_id
                     and ticket.input_tokens == input_tokens
                 ),
-                running[0] if running else None,
+                None,
             )
+            if matched is None and not session_id and running:
+                matched = running[0]
+            # Member + session + token count is unique while the member is
+            # reachable because session serialization is enforced there. It
+            # remains unique on a fenced member while a retry runs elsewhere.
+            # A duplicate or late cleanup therefore cannot consume a newer
+            # ticket from another member.
+            if matched is None:
+                return
             actual_cold_prefill = (
                 matched.cold_prefill if matched is not None else cold_prefill
             )
@@ -1547,8 +1580,6 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 )
             if matched is not None:
                 running.remove(matched)
-            if session_id:
-                self._active_sessions.discard(session_id)
             self._admission.notify_all()
 
     async def cool_down(self, member: InferenceUpstream, seconds: float) -> None:
@@ -1567,17 +1598,61 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 (upstream, upstream.cooldown_generation) for upstream in self.upstreams
             ]
 
-    async def reconcile_recovered(
+    def _set_reachability_locked(
+        self, member: InferenceUpstream, *, reachable: bool, reason: str
+    ) -> None:
+        """Apply authoritative control-plane reachability under admission lock."""
+        was_reachable = member.reachable
+        member.reachable = reachable
+        member.unreachable_reason = "responded" if reachable else reason
+        if not reachable and was_reachable is not False:
+            member.reachability_generation += 1
+            stale = [
+                session
+                for session, alias in self._sessions.items()
+                if alias == member.alias
+            ]
+            for session in stale:
+                self._sessions.pop(session, None)
+
+    async def mark_unreachable(self, member: InferenceUpstream, *, reason: str) -> None:
+        """Fence a failed member and wake every ticket pinned to it."""
+        async with self._admission:
+            self._set_reachability_locked(member, reachable=False, reason=reason)
+            self._admission.notify_all()
+
+    async def wait_until_unreachable(self, alias: str, generation: int) -> str:
+        """Wait until a request's member crosses an unreachable boundary."""
+        async with self._admission:
+            member = self._by_alias(alias)
+            if member is None:
+                raise KeyError(alias)
+            # Close the acquire-to-watcher race: health may fence the member
+            # after its ticket was admitted but before this coroutine starts.
+            if member.reachable is False:
+                return member.unreachable_reason
+            while member.reachability_generation <= generation:
+                await self._admission.wait()
+            return member.unreachable_reason
+
+    async def reconcile_reachability(
         self,
         snapshot: list[tuple[InferenceUpstream, int]],
         observations: list[UpstreamReachability],
     ) -> None:
-        """Clear only a stale cooldown proven recovered by a current probe."""
+        """Fence failures and clear stale cooldown only after observed recovery."""
         async with self._admission:
             changed = False
             for (upstream, generation), observed in zip(
                 snapshot, observations, strict=True
             ):
+                previous = upstream.reachable
+                self._set_reachability_locked(
+                    upstream,
+                    reachable=observed.reachable,
+                    reason=observed.reason,
+                )
+                changed = changed or previous is not observed.reachable
                 if (
                     observed.reachable
                     and upstream.cooldown_generation == generation
@@ -1823,6 +1898,10 @@ class RelayedResponse:
 
 class _ClientDisconnected(Exception):
     """Internal control flow for an observed downstream close before headers."""
+
+
+class _UpstreamBecameUnreachable(Exception):
+    """Internal control flow for a fenced member before response commitment."""
 
 
 async def _empty_body() -> AsyncIterator[bytes]:
@@ -2387,7 +2466,7 @@ class InferenceBackend:
                 *(run(upstream.base_url) for upstream in self.pool.upstreams)
             )
         )
-        await self.pool.reconcile_recovered(snapshot, raw_observations)
+        await self.pool.reconcile_reachability(snapshot, raw_observations)
         observations = []
         for upstream, observed in zip(
             self.pool.upstreams, raw_observations, strict=True
@@ -2687,6 +2766,14 @@ class InferenceBackend:
                         body=_empty_body(),
                         feedback_headers=feedback_headers,
                     )
+                except InferenceMemberUnavailable as exc:
+                    attempted.add(exc.alias)
+                    failures.append(str(exc))
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} rerouting "
+                        f"before dispatch: {exc}"
+                    )
+                    continue
                 except HomeMemberReloading as exc:
                     if waited < self.wait_for_home_s:
                         # Wait it out here rather than hand the caller a 503: the
@@ -2772,6 +2859,7 @@ class InferenceBackend:
                 preempt_task: asyncio.Task[Any] | None = None
                 disconnect_task: asyncio.Task[None] | None = None
                 disconnect_stop: asyncio.Event | None = None
+                unreachable_task: asyncio.Task[str] | None = None
                 first_chunk_task: asyncio.Task[bytes] | None = None
                 stream: AsyncIterator[bytes] | None = None
                 replay_attempt = None
@@ -2806,7 +2894,7 @@ class InferenceBackend:
                         replay_attempt = None
                         preempt_task = None
                         return False
-                    for task in (send_task, first_chunk_task):
+                    for task in (send_task, first_chunk_task, unreachable_task):
                         if task is not None and not task.done():
                             task.cancel()
                     await asyncio.gather(
@@ -2845,10 +2933,10 @@ class InferenceBackend:
                         content=dispatch_body,
                         headers=forwarded,
                     )
-                    if self.continuation_qos.enabled:
-                        send_task = asyncio.create_task(
-                            client.send(request, stream=True)
-                        )
+                    # The reachability watcher requires the transport send to
+                    # be an independently cancellable waiter regardless of
+                    # whether continuation QoS is enabled.
+                    send_task = asyncio.create_task(client.send(request, stream=True))
                     if rid_confirmed and client_disconnected is not None:
                         disconnect_stop = asyncio.Event()
                         disconnect_task = asyncio.create_task(
@@ -2856,13 +2944,23 @@ class InferenceBackend:
                                 client_disconnected, stop=disconnect_stop
                             )
                         )
+                    unreachable_task = asyncio.create_task(
+                        self.pool.wait_until_unreachable(
+                            upstream.alias, upstream.reachability_generation
+                        )
+                    )
                     if replay_attempt is not None:
                         preempt_task = asyncio.create_task(
                             replay_attempt.preempt.wait()
                         )
                     waiters = tuple(
                         task
-                        for task in (send_task, preempt_task, disconnect_task)
+                        for task in (
+                            send_task,
+                            preempt_task,
+                            disconnect_task,
+                            unreachable_task,
+                        )
                         if task is not None
                     )
                     if waiters:
@@ -2874,6 +2972,8 @@ class InferenceBackend:
                             response = await send_task
                         elif disconnect_task is not None and disconnect_task in done:
                             raise _ClientDisconnected
+                        elif unreachable_task is not None and unreachable_task in done:
+                            raise _UpstreamBecameUnreachable(await unreachable_task)
                         else:
                             if await preempt_for_continuation():
                                 replay_count += 1
@@ -2898,6 +2998,7 @@ class InferenceBackend:
                             first_chunk_task,
                             preempt_task,
                             disconnect_task,
+                            unreachable_task,
                         )
                         if task is not None
                     )
@@ -2914,6 +3015,8 @@ class InferenceBackend:
                                 )
                         elif disconnect_task is not None and disconnect_task in done:
                             raise _ClientDisconnected
+                        elif unreachable_task is not None and unreachable_task in done:
+                            raise _UpstreamBecameUnreachable(await unreachable_task)
                         else:
                             if await preempt_for_continuation():
                                 replay_count += 1
@@ -2923,13 +3026,24 @@ class InferenceBackend:
                                 continue
                             remaining = tuple(
                                 task
-                                for task in (first_chunk_task, disconnect_task)
+                                for task in (
+                                    first_chunk_task,
+                                    disconnect_task,
+                                    unreachable_task,
+                                )
                                 if task is not None
                             )
                             done, _ = await asyncio.wait(
                                 remaining, return_when=asyncio.FIRST_COMPLETED
                             )
                             if first_chunk_task not in done:
+                                if (
+                                    unreachable_task is not None
+                                    and unreachable_task in done
+                                ):
+                                    raise _UpstreamBecameUnreachable(
+                                        await unreachable_task
+                                    )
                                 raise _ClientDisconnected
                         if disconnect_task is not None and first_chunk_task in done:
                             disconnect_stop.set()
@@ -2979,6 +3093,8 @@ class InferenceBackend:
                     if disconnect_task is not None and not disconnect_task.done():
                         disconnect_stop.set()
                         disconnect_task.cancel()
+                    if unreachable_task is not None and not unreachable_task.done():
+                        unreachable_task.cancel()
                     if (
                         abort_ok
                         and first_chunk_task is not None
@@ -2992,6 +3108,7 @@ class InferenceBackend:
                             preempt_task,
                             disconnect_task,
                             first_chunk_task,
+                            unreachable_task,
                         )
                         if task is not None
                     ]
@@ -3035,8 +3152,61 @@ class InferenceBackend:
                             feedback_headers=feedback_headers,
                         )
                     raise
+                except _UpstreamBecameUnreachable as exc:
+                    for task in (
+                        send_task,
+                        first_chunk_task,
+                        preempt_task,
+                        disconnect_task,
+                    ):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(
+                            task
+                            for task in (
+                                send_task,
+                                first_chunk_task,
+                                preempt_task,
+                                disconnect_task,
+                            )
+                            if task is not None
+                        ),
+                        return_exceptions=True,
+                    )
+                    await asyncio.shield(client.aclose())
+                    safe_to_release = not rid_confirmed
+                    if rid_confirmed:
+                        safe_to_release = await self._abort_request(
+                            upstream, dispatch_request_id, headers=forwarded
+                        )
+                    if safe_to_release:
+                        await release_slot()
+                    else:
+                        slot_owned = False
+                        self._schedule_cleanup_reaper(
+                            upstream,
+                            dispatch_request_id,
+                            headers=forwarded,
+                            input_tokens=input_tokens,
+                            session_id=routing_session,
+                            cold_prefill=cold_prefill,
+                            request_observation=request_observation,
+                        )
+                    self._note(
+                        f"[relay] conv={routing_session[:8] or '-'} <- "
+                        f"{upstream.alias} failed fast after authoritative "
+                        f"unreachable observation: {exc}"
+                    )
+                    raise InferenceAdmissionError(
+                        f"Inference member {upstream.alias} became unreachable "
+                        "before a response; retry may use another reachable member"
+                    ) from exc
                 except httpx.TransportError as exc:
                     await client.aclose()
+                    await self.pool.mark_unreachable(
+                        upstream, reason=exc.__class__.__name__
+                    )
                     safe_to_release = not rid_confirmed
                     if rid_confirmed:
                         safe_to_release = await self._abort_request(
@@ -3077,6 +3247,10 @@ class InferenceBackend:
                             disconnect_stop.set()
                             disconnect_task.cancel()
                         await asyncio.gather(disconnect_task, return_exceptions=True)
+                    if unreachable_task is not None and not unreachable_task.done():
+                        unreachable_task.cancel()
+                    if unreachable_task is not None:
+                        await asyncio.gather(unreachable_task, return_exceptions=True)
                     if replay_attempt is not None:
                         if (
                             replay_attempt.preempt.is_set()
