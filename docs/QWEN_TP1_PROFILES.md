@@ -67,9 +67,23 @@ gateway:
       url: http://127.0.0.1:18775
       token_capacity: 250000
   inference_cache_report_enabled: true
-  inference_cold_prefill_limit_per_upstream: 1
-  inference_cold_prefill_min_tokens: 128000
+  cache_admission:
+    mode: active
+    hot_max_uncached_tokens: 32768
+    cold_prefill_limit_per_upstream: 1
+    max_hot_bypasses: 4
+    starvation_age_s: 30.0
+    evidence_max_age_s: 300.0
 ```
+
+The 32k boundary is on predicted **uncached** tokens. Live feedback after the
+two-TP1 rollout observed cache-backed continuations with about 0.3k--15.6k
+uncached tokens and a cold lineage break with about 100.3k uncached tokens.
+Active mode requires generation-bearing SGLang metrics and cache reports; it
+fails before dispatch if that evidence is unavailable. New or incompatible
+lineages are conservatively cold, while compatible device/host/storage-backed
+lineages may receive hot priority. Four bypasses and 30-second aging bound
+starvation without moving a session away from its sticky home.
 
 Configuration files do not restart services. Use the gateway's documented
 drained rollout only in a separate, deliberate deployment after checking the

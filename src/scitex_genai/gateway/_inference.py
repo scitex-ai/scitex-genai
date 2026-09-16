@@ -64,7 +64,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from ._admission import AdmissionController, CacheResidency
+from ._admission import (
+    AdmissionController,
+    CacheAdmissionSettings,
+    CacheResidency,
+    classify_cache_prediction,
+)
 from ._errors import (
     HomeMemberReloading,
     InferenceAdmissionError,
@@ -854,6 +859,7 @@ class InferenceUpstream:
 @dataclass
 class _PoolTicket:
     priority: bool = False
+    cache_priority: bool = False
     input_tokens: int = 0
     session_id: str = ""
     queued_at: float = 0.0
@@ -876,7 +882,8 @@ class _PoolTicket:
             "queue_age_s": (
                 max(0.0, now - self.queued_at) if state in {"queued", "held"} else 0.0
             ),
-            "priority": self.priority,
+            "priority": self.priority or self.cache_priority,
+            "cache_priority": self.cache_priority,
             "admission_class": self.admission_class,
             "cache_classification": self.cache_classification,
             "predicted_uncached_tokens": self.predicted_uncached_tokens,
@@ -1057,6 +1064,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         *,
         capacity_per_upstream: int = DEFAULT_CAPACITY_PER_UPSTREAM,
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+        max_admission_bypasses: int = DEFAULT_MAX_ADMISSION_BYPASSES,
+        priority_aging_s: float = DEFAULT_PRIORITY_AGING_S,
+        cache_prediction_max_age_s: float = DEFAULT_CACHE_PREDICTION_MAX_AGE_S,
         cold_prefill_limit_per_upstream: int | None = None,
         cold_prefill_min_tokens: int | None = None,
         session_state: GatewaySessionState | None = None,
@@ -1074,6 +1084,9 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             capacity_per_upstream=capacity_per_upstream,
             max_queue_size=max_queue_size,
             token_capacity_per_upstream=None,
+            max_admission_bypasses=max_admission_bypasses,
+            priority_aging_s=priority_aging_s,
+            cache_prediction_max_age_s=cache_prediction_max_age_s,
             cold_prefill_limit_per_upstream=cold_prefill_limit_per_upstream,
             cold_prefill_min_tokens=cold_prefill_min_tokens,
             session_state=session_state,
@@ -1223,6 +1236,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
         exclude: set[str] | None = None,
         input_tokens: int = 0,
         priority: bool = False,
+        cache_priority: bool = False,
         cold_prefill: bool = False,
         admission_class: str = "unclassified",
         cache_classification: str = CacheResidency.UNKNOWN.value,
@@ -1271,6 +1285,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
                 )
             ticket = _PoolTicket(
                 priority=priority,
+                cache_priority=cache_priority,
                 input_tokens=input_tokens,
                 session_id=session_id,
                 cold_prefill=cold_prefill,
@@ -1438,13 +1453,14 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             (
                 ticket
                 for ticket in fitting
-                if not ticket.priority
+                if not (ticket.priority or ticket.cache_priority)
                 and now - ticket.queued_at >= self.priority_aging_s
             ),
             None,
         )
         selected = aged or next(
-            (ticket for ticket in fitting if ticket.priority), fitting[0]
+            (ticket for ticket in fitting if ticket.priority or ticket.cache_priority),
+            fitting[0],
         )
         return selected
 
@@ -1454,6 +1470,7 @@ class InferenceUpstreamPool(StickyPool[InferenceUpstream]):
             return
         ticket.prediction_expires_at = None
         ticket.cache_classification = CacheResidency.UNKNOWN.value
+        ticket.cache_priority = False
         ticket.predicted_uncached_tokens = ticket.input_tokens
         ticket.cold_prefill = bool(
             self.cold_prefill_min_tokens is not None
@@ -2140,6 +2157,7 @@ class InferenceBackend:
             DEFAULT_CONTINUATION_QOS_MIN_PREEMPT_TOKENS
         ),
         cache_report_enabled: bool = False,
+        cache_admission_settings: CacheAdmissionSettings | None = None,
         scheduler_probe: Callable[[str, float], Awaitable[SGLangSchedulerObservation]]
         | None = None,
         admission_history_path: Path | str | None = None,
@@ -2177,10 +2195,36 @@ class InferenceBackend:
             str, asyncio.Task[SGLangSchedulerObservation]
         ] = {}
         self._health_failures = {upstream.alias: 0 for upstream in self.pool.upstreams}
-        # SAC/Hermes currently supplies stable identity but no authoritative
-        # pre-admission cache-residency result. Record UNKNOWN observations;
-        # do not activate cache-priority scheduling from prompt size or history.
-        self.cache_admission = AdmissionController()
+        self.cache_admission_settings = (
+            cache_admission_settings or CacheAdmissionSettings()
+        )
+        if self.cache_admission_settings.active:
+            expected = self.cache_admission_settings
+            if not cache_report_enabled:
+                raise ValueError("active cache admission requires cache_report_enabled")
+            actual_policy = (
+                pool.cold_prefill_limit_per_upstream,
+                pool.cold_prefill_min_tokens,
+                pool.max_admission_bypasses,
+                pool.priority_aging_s,
+                pool.cache_prediction_max_age_s,
+            )
+            expected_policy = (
+                expected.cold_prefill_limit_per_upstream,
+                expected.hot_max_uncached_tokens,
+                expected.max_hot_bypasses,
+                expected.starvation_age_s,
+                expected.evidence_max_age_s,
+            )
+            if actual_policy != expected_policy:
+                raise ValueError(
+                    "active cache admission pool policy does not match its "
+                    "validated settings"
+                )
+        self.cache_admission = AdmissionController(
+            enabled=self.cache_admission_settings.active,
+            max_cold_wait_s=self.cache_admission_settings.starvation_age_s,
+        )
         self.continuation_qos = ContinuationQoS(
             enabled=continuation_qos_enabled,
             max_retries=continuation_qos_max_retries,
@@ -2191,7 +2235,8 @@ class InferenceBackend:
         self.relay_metrics = RelayMetrics()
         self.request_lifecycle = RequestLifecycleRegistry()
         self.admission_predictions = AdmissionPredictionTelemetry(
-            state_path=admission_history_path
+            max_observation_age_s=self.cache_admission_settings.evidence_max_age_s,
+            state_path=admission_history_path,
         )
         self._engine_generations: dict[str, str | None] = {
             upstream.alias: None for upstream in self.pool.upstreams
@@ -2318,6 +2363,10 @@ class InferenceBackend:
                 else "none"
             )
         )
+        prediction_snapshot = self.admission_predictions.snapshot()
+        prediction_snapshot["authoritative_for_admission"] = (
+            self.cache_admission_settings.active
+        )
         return {
             "schema_version": 3,
             "provider": self.provider,
@@ -2325,7 +2374,7 @@ class InferenceBackend:
             "request_lifecycle": self.request_lifecycle.snapshot(),
             "admission": admission,
             "admission_prediction": {
-                **self.admission_predictions.snapshot(),
+                **prediction_snapshot,
                 "gateway_backend_comparison": {
                     "gateway_admitted": admission["admitted"],
                     "gateway_queued": admission["queued"],
@@ -2495,6 +2544,43 @@ class InferenceBackend:
         except Exception:  # noqa: BLE001
             pass
 
+    def _cache_residency(self, prediction: AdmissionPrediction) -> CacheResidency:
+        """Turn feedback into an admission class or fail closed in active mode."""
+        if self.cache_admission_settings.active:
+            try:
+                return classify_cache_prediction(
+                    settings=self.cache_admission_settings,
+                    engine_generation=prediction.engine_generation,
+                    evidence=prediction.evidence,
+                    prior_cache_tier=prediction.prior_cache_tier,
+                    predicted_uncached_tokens=prediction.predicted_uncached_tokens,
+                )
+            except ValueError as exc:
+                raise InferenceAdmissionError(str(exc)) from exc
+        if (
+            self.pool.cold_prefill_min_tokens is not None
+            and prediction.evidence != "no-compatible-history"
+        ):
+            return (
+                CacheResidency.HOT
+                if prediction.predicted_uncached_tokens
+                < self.pool.cold_prefill_min_tokens
+                else CacheResidency.COLD
+            )
+        return CacheResidency.UNKNOWN
+
+    def _is_cold_prefill(self, prediction: AdmissionPrediction) -> bool:
+        """Apply the measured uncached-token boundary, never full prompt size."""
+        threshold = (
+            self.cache_admission_settings.hot_max_uncached_tokens
+            if self.cache_admission_settings.active
+            else (self.pool.cold_prefill_min_tokens or 0)
+        )
+        return bool(
+            self.pool.cold_prefill_limit_per_upstream is not None
+            and prediction.predicted_uncached_tokens >= max(1, threshold)
+        )
+
     def prepare(
         self,
         body: bytes | None,
@@ -2617,9 +2703,10 @@ class InferenceBackend:
             if self.continuation_qos.enabled
             else "disabled"
         )
-        self.cache_admission.observe(CacheResidency.UNKNOWN)
         feedback_headers = {
-            "x-scitex-admission-mode": "observe-only",
+            "x-scitex-admission-mode": self.cache_admission_settings.mode.replace(
+                "_", "-"
+            ),
             "x-scitex-cache-residency": CacheResidency.UNKNOWN.value,
             "x-scitex-session-key": (session or "")[:12] or "none",
         }
@@ -2661,22 +2748,9 @@ class InferenceBackend:
                         body=prediction_body,
                         estimated_input_tokens=input_tokens,
                     )
-                    cache_classification = CacheResidency.UNKNOWN
-                    if (
-                        self.pool.cold_prefill_min_tokens is not None
-                        and prediction.evidence != "no-compatible-history"
-                    ):
-                        cache_classification = (
-                            CacheResidency.HOT
-                            if prediction.predicted_uncached_tokens
-                            < self.pool.cold_prefill_min_tokens
-                            else CacheResidency.COLD
-                        )
-                    cold_prefill = bool(
-                        self.pool.cold_prefill_limit_per_upstream is not None
-                        and prediction.predicted_uncached_tokens
-                        >= (self.pool.cold_prefill_min_tokens or 1)
-                    )
+                    cache_classification = self._cache_residency(prediction)
+                    self.cache_admission.observe(cache_classification)
+                    cold_prefill = self._is_cold_prefill(prediction)
                     replay_safe = _replay_safe_for_preemption(
                         admission_class=qos_kind,
                         cold_prefill=cold_prefill,
@@ -2684,9 +2758,7 @@ class InferenceBackend:
                     )
                     latency_sensitive = qos_kind == "continuation" and not replay_safe
                     feedback_headers["x-scitex-admission-mode"] = (
-                        "uncached-prefill"
-                        if self.pool.cold_prefill_limit_per_upstream is not None
-                        else "observe-only"
+                        self.cache_admission_settings.mode.replace("_", "-")
                     )
                     feedback_headers["x-scitex-cache-residency"] = (
                         cache_classification.value
@@ -2705,6 +2777,7 @@ class InferenceBackend:
                         exclude=attempted,
                         input_tokens=input_tokens,
                         priority=latency_sensitive,
+                        cache_priority=(cache_classification is CacheResidency.HOT),
                         cold_prefill=cold_prefill,
                         admission_class=qos_kind,
                         cache_classification=cache_classification.value,
@@ -2716,6 +2789,17 @@ class InferenceBackend:
                         self._engine_generations[upstream.alias] or "unavailable"
                     )
                     if prediction.engine_generation != current_generation:
+                        if self.cache_admission_settings.active:
+                            await self.pool.release(
+                                upstream,
+                                input_tokens=input_tokens,
+                                session_id=routing_session,
+                                cold_prefill=cold_prefill,
+                            )
+                            raise InferenceAdmissionError(
+                                "active cache admission engine generation changed "
+                                "while queued; retry with fresh cache evidence"
+                            )
                         # A member-quiesce hold may span an engine replacement.
                         # Never dispatch or record that request with cache evidence
                         # from the incarnation observed before it entered the hold.
@@ -2726,22 +2810,8 @@ class InferenceBackend:
                             body=prediction_body,
                             estimated_input_tokens=input_tokens,
                         )
-                        cache_classification = CacheResidency.UNKNOWN
-                        if (
-                            self.pool.cold_prefill_min_tokens is not None
-                            and prediction.evidence != "no-compatible-history"
-                        ):
-                            cache_classification = (
-                                CacheResidency.HOT
-                                if prediction.predicted_uncached_tokens
-                                < self.pool.cold_prefill_min_tokens
-                                else CacheResidency.COLD
-                            )
-                        cold_prefill = bool(
-                            self.pool.cold_prefill_limit_per_upstream is not None
-                            and prediction.predicted_uncached_tokens
-                            >= (self.pool.cold_prefill_min_tokens or 1)
-                        )
+                        cache_classification = self._cache_residency(prediction)
+                        cold_prefill = self._is_cold_prefill(prediction)
                         replay_safe = _replay_safe_for_preemption(
                             admission_class=qos_kind,
                             cold_prefill=cold_prefill,
@@ -3429,6 +3499,7 @@ class InferenceBackend:
         exclude: set[str],
         input_tokens: int,
         priority: bool,
+        cache_priority: bool = False,
         cold_prefill: bool,
         admission_class: str,
         cache_classification: str,
@@ -3443,6 +3514,7 @@ class InferenceBackend:
                 exclude=exclude,
                 input_tokens=input_tokens,
                 priority=priority,
+                cache_priority=cache_priority,
                 cold_prefill=cold_prefill,
                 admission_class=admission_class,
                 cache_classification=cache_classification,

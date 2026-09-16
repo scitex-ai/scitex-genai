@@ -48,6 +48,7 @@ dependencies = [
     "markdown2",
     "matplotlib",
     "Pillow",
+    "pydantic>=2.0",
     "tqdm",
     # SciTeX standalone deps (only those actually imported by src/)
     "scitex-config>=0.3.6",

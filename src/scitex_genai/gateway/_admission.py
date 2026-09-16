@@ -1,10 +1,9 @@
-"""Cold-aware admission primitive, inert until residency is authoritative.
+"""Cold-aware admission from generation-bound cache feedback.
 
-Current SAC/Hermes HTTP requests do not expose an exact pre-admission cache
-lookup. The controller therefore defaults to observe-only mode. Its enabled
-mode is reserved for a future engine-owned residency signal: known-hot work
-may pass queued cold work at a slot boundary, while aged cold work receives
-the next progressing slot.
+The policy defaults to observe-only. Active mode uses the prior response's
+engine-owned cache report only for an extension of the same prompt lineage on
+the same engine generation. Known-hot work may pass queued cold work at a slot
+boundary, while aged cold work receives the next progressing slot.
 
 This cannot preempt a prefill already admitted by an upstream.
 """
@@ -16,7 +15,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CacheResidency(str, Enum):
@@ -25,6 +26,64 @@ class CacheResidency(str, Enum):
     HOT = "hot"
     COLD = "cold"
     UNKNOWN = "unknown"
+
+
+class CacheAdmissionSettings(BaseModel):
+    """Strict, file-backed policy for cache-aware generation admission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    mode: Literal["observe_only", "active"] = "observe_only"
+    hot_max_uncached_tokens: Annotated[int, Field(ge=0)] = 32_768
+    cold_prefill_limit_per_upstream: Annotated[int, Field(ge=1)] = 1
+    max_hot_bypasses: Annotated[int, Field(ge=0)] = 4
+    starvation_age_s: Annotated[float, Field(ge=0)] = 30.0
+    evidence_max_age_s: Annotated[float, Field(gt=0)] = 300.0
+
+    @model_validator(mode="after")
+    def active_requires_a_nonzero_hot_boundary(self) -> "CacheAdmissionSettings":
+        if self.mode == "active" and self.hot_max_uncached_tokens < 1:
+            raise ValueError(
+                "active cache admission requires hot_max_uncached_tokens >= 1"
+            )
+        return self
+
+    @property
+    def active(self) -> bool:
+        return self.mode == "active"
+
+
+def classify_cache_prediction(
+    *,
+    settings: CacheAdmissionSettings,
+    engine_generation: str,
+    evidence: str,
+    prior_cache_tier: str,
+    predicted_uncached_tokens: int,
+) -> CacheResidency:
+    """Classify only generation-bound feedback; reject missing active evidence."""
+    if not settings.active:
+        return CacheResidency.UNKNOWN
+    if not engine_generation or engine_generation == "unavailable":
+        raise ValueError("active cache admission lacks an engine generation")
+    if evidence == "no-compatible-history":
+        # No compatible lineage is a conservative cold classification. It is
+        # never promoted from prompt size or an unrelated session.
+        return CacheResidency.COLD
+    if evidence != "historical-lineage-extension":
+        raise ValueError(f"active cache admission lacks cache evidence: {evidence}")
+    if prior_cache_tier not in {"device", "host", "storage", "none"}:
+        raise ValueError(
+            "active cache admission has an invalid prior cache tier: "
+            f"{prior_cache_tier}"
+        )
+    if prior_cache_tier == "none":
+        return CacheResidency.COLD
+    return (
+        CacheResidency.HOT
+        if predicted_uncached_tokens <= settings.hot_max_uncached_tokens
+        else CacheResidency.COLD
+    )
 
 
 @dataclass
@@ -159,7 +218,7 @@ class AdmissionController:
             default=0.0,
         )
         return {
-            "mode": "enabled" if self.enabled else "observe-only",
+            "mode": "active" if self.enabled else "observe-only",
             "admitted": self._running,
             "queued": len(self._waiters),
             "oldest_wait_s": oldest_wait_s,
@@ -171,4 +230,10 @@ class AdmissionController:
         }
 
 
-__all__ = ["AdmissionController", "AdmissionPermit", "CacheResidency"]
+__all__ = [
+    "AdmissionController",
+    "AdmissionPermit",
+    "CacheAdmissionSettings",
+    "CacheResidency",
+    "classify_cache_prediction",
+]

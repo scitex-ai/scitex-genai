@@ -465,10 +465,6 @@ def main(
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
             token_capacity_per_upstream=None,
-            cold_prefill_limit_per_upstream=(
-                settings.inference_cold_prefill_limit_per_upstream
-            ),
-            cold_prefill_min_tokens=settings.inference_cold_prefill_min_tokens,
         )
         backend = ExternalProviderBackend(
             pool,
@@ -501,10 +497,19 @@ def main(
             settings.inference_upstreams,
             capacity_per_upstream=settings.inference_capacity_per_upstream,
             max_queue_size=settings.inference_max_queue_size,
+            max_admission_bypasses=settings.cache_admission.max_hot_bypasses,
+            priority_aging_s=settings.cache_admission.starvation_age_s,
+            cache_prediction_max_age_s=settings.cache_admission.evidence_max_age_s,
             cold_prefill_limit_per_upstream=(
-                settings.inference_cold_prefill_limit_per_upstream
+                settings.cache_admission.cold_prefill_limit_per_upstream
+                if settings.cache_admission.active
+                else None
             ),
-            cold_prefill_min_tokens=settings.inference_cold_prefill_min_tokens,
+            cold_prefill_min_tokens=(
+                settings.cache_admission.hot_max_uncached_tokens
+                if settings.cache_admission.active
+                else None
+            ),
             session_state=GatewaySessionState(default_gateway_session_state_path()),
         )
         backend = InferenceBackend(
@@ -520,6 +525,7 @@ def main(
                 settings.inference_continuation_qos_min_preempt_tokens
             ),
             cache_report_enabled=settings.inference_cache_report_enabled,
+            cache_admission_settings=settings.cache_admission,
             admission_history_path=default_admission_history_path(),
         )
         print(announce(settings.host, settings.port, pool), flush=True)
