@@ -8,8 +8,13 @@ import time
 import httpx
 import pytest
 
-from scitex_genai.gateway._admission import AdmissionController, CacheResidency
-from scitex_genai.gateway._errors import UpstreamUnreachable
+from scitex_genai.gateway._admission import (
+    AdmissionController,
+    CacheAdmissionSettings,
+    CacheResidency,
+    classify_cache_prediction,
+)
+from scitex_genai.gateway._errors import InferenceAdmissionError, UpstreamUnreachable
 from scitex_genai.gateway._inference import (
     InferenceBackend,
     InferenceUpstreamPool,
@@ -17,6 +22,7 @@ from scitex_genai.gateway._inference import (
     request_session_key,
 )
 from scitex_genai.gateway._server import create_app
+from scitex_genai.gateway._sglang_metrics import SGLangSchedulerObservation
 
 
 @pytest.mark.asyncio
@@ -96,6 +102,183 @@ async def test_aged_cold_work_receives_the_next_progressing_slot() -> None:
 
     # Assert
     assert hot_was_waiting is True
+
+
+@pytest.mark.parametrize(
+    ("evidence", "tier", "uncached", "expected"),
+    [
+        ("no-compatible-history", "unknown", 400_000, CacheResidency.COLD),
+        ("historical-lineage-extension", "device", 2_000, CacheResidency.HOT),
+        ("historical-lineage-extension", "host", 40_000, CacheResidency.COLD),
+        ("historical-lineage-extension", "storage", 32_768, CacheResidency.HOT),
+        ("historical-lineage-extension", "none", 1, CacheResidency.COLD),
+    ],
+)
+def test_active_classification_uses_generation_bound_cache_feedback(
+    evidence: str, tier: str, uncached: int, expected: CacheResidency
+) -> None:
+    # Arrange
+    settings = CacheAdmissionSettings(mode="active")
+
+    # Act
+    actual = classify_cache_prediction(
+        settings=settings,
+        engine_generation="engine-1",
+        evidence=evidence,
+        prior_cache_tier=tier,
+        predicted_uncached_tokens=uncached,
+    )
+
+    # Assert
+    assert actual is expected
+
+
+@pytest.mark.parametrize(
+    ("generation", "evidence", "tier"),
+    [
+        ("unavailable", "historical-lineage-extension", "device"),
+        ("engine-1", "missing-prior-cache-report", "device"),
+        ("engine-1", "historical-lineage-extension", "unknown"),
+    ],
+)
+def test_active_classification_fails_fast_without_authoritative_cache_evidence(
+    generation: str, evidence: str, tier: str
+) -> None:
+    # Arrange
+    settings = CacheAdmissionSettings(mode="active")
+
+    # Act
+    with pytest.raises(ValueError) as raised:
+        classify_cache_prediction(
+            settings=settings,
+            engine_generation=generation,
+            evidence=evidence,
+            prior_cache_tier=tier,
+            predicted_uncached_tokens=1,
+        )
+
+    # Assert
+    assert "active cache admission" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_active_relay_fails_before_dispatch_when_engine_evidence_is_missing(
+    upstream_factory,
+) -> None:
+    # Arrange
+    upstream = upstream_factory()
+
+    async def unavailable(_url: str, _timeout_s: float):
+        raise RuntimeError("metrics unavailable")
+
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(
+            upstream.url,
+            cold_prefill_limit_per_upstream=1,
+            cold_prefill_min_tokens=32_768,
+        ),
+        scheduler_probe=unavailable,
+        cache_report_enabled=True,
+        cache_admission_settings=CacheAdmissionSettings(mode="active"),
+    )
+
+    # Act
+    with pytest.raises(InferenceAdmissionError) as raised:
+        await backend.relay(
+            "POST",
+            "/v1/chat/completions",
+            body=b'{"model":"m","messages":[{"role":"user","content":"hello"}]}',
+            headers={"X-SciTeX-Session-ID": "session"},
+        )
+
+    # Assert
+    assert (
+        "lacks an engine generation" in str(raised.value),
+        len(upstream.requests),
+        backend.pool.status()[0]["in_flight"],
+    ) == (True, 0, 0)
+
+
+def test_active_backend_rejects_missing_reports_and_unvalidated_pool_policy() -> None:
+    # Arrange
+    settings = CacheAdmissionSettings(mode="active")
+    matching = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        max_admission_bypasses=settings.max_hot_bypasses,
+        priority_aging_s=settings.starvation_age_s,
+        cache_prediction_max_age_s=settings.evidence_max_age_s,
+        cold_prefill_limit_per_upstream=settings.cold_prefill_limit_per_upstream,
+        cold_prefill_min_tokens=settings.hot_max_uncached_tokens,
+    )
+    mismatched = InferenceUpstreamPool.from_urls(
+        "http://only:1",
+        cold_prefill_limit_per_upstream=1,
+        cold_prefill_min_tokens=64_000,
+    )
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="requires cache_report_enabled"):
+        InferenceBackend(matching, cache_admission_settings=settings)
+    with pytest.raises(ValueError, match="pool policy does not match"):
+        InferenceBackend(
+            mismatched,
+            cache_report_enabled=True,
+            cache_admission_settings=settings,
+        )
+
+
+@pytest.mark.asyncio
+async def test_active_relay_promotes_only_feedback_backed_lineage_to_hot(
+    upstream_factory,
+) -> None:
+    # Arrange
+    report = {
+        "usage": {
+            "prompt_tokens": 1_000,
+            "prompt_tokens_details": {"cached_tokens": 990},
+        },
+        "sglext": {"cached_tokens_details": {"device": 990, "host": 0}},
+    }
+    upstream = upstream_factory(chunks=(json.dumps(report).encode(),))
+
+    async def scheduler_probe(
+        _url: str, _timeout_s: float
+    ) -> SGLangSchedulerObservation:
+        return SGLangSchedulerObservation("1" * 32, 0, 0, 0.0)
+
+    settings = CacheAdmissionSettings(mode="active")
+    backend = InferenceBackend(
+        InferenceUpstreamPool.from_urls(
+            upstream.url,
+            cold_prefill_limit_per_upstream=1,
+            cold_prefill_min_tokens=settings.hot_max_uncached_tokens,
+        ),
+        scheduler_probe=scheduler_probe,
+        cache_report_enabled=True,
+        cache_admission_settings=settings,
+    )
+    body = b'{"model":"m","messages":[{"role":"user","content":"same"}]}'
+    headers = {"X-SciTeX-Session-ID": "session"}
+    first = await backend.relay(
+        "POST", "/v1/chat/completions", body=body, headers=headers
+    )
+    _ = b"".join([chunk async for chunk in first.body])
+
+    # Act
+    second = await backend.relay(
+        "POST", "/v1/chat/completions", body=body, headers=headers
+    )
+    _ = b"".join([chunk async for chunk in second.body])
+    status = await backend.observability_snapshot()
+
+    # Assert
+    assert (
+        first.feedback_headers["x-scitex-admission-mode"],
+        first.feedback_headers["x-scitex-cache-residency"],
+        second.feedback_headers["x-scitex-cache-residency"],
+        status["admission_prediction"]["authoritative_for_admission"],
+        backend.cache_admission.snapshot()["mode"],
+    ) == ("active", "cold", "hot", True, "active")
 
 
 @pytest.mark.asyncio
@@ -752,6 +935,7 @@ async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
             input_tokens=642_616,
             predicted_uncached_tokens=0,
             cache_classification="hot",
+            cache_priority=True,
         )
     )
     await _wait_for_pool_queue(pool, 1)
@@ -767,6 +951,8 @@ async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
     observed = (
         stale_hot.done(),
         queued["cache_classification"],
+        queued["priority"],
+        queued["cache_priority"],
         queued["predicted_uncached_tokens"],
         queued["cold_prefill"],
     )
@@ -775,7 +961,7 @@ async def test_queued_hot_prediction_expires_to_unknown_full_prefill() -> None:
     await pool.release(cold, input_tokens=500_000, session_id="cold")
 
     # Assert
-    assert observed == (False, "unknown", 642_616, True)
+    assert observed == (False, "unknown", False, False, 642_616, True)
 
 
 @pytest.mark.asyncio

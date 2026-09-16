@@ -30,6 +30,22 @@ The request-phase and SAC identity contract is documented in
      inference_continuation_qos_min_preempt_tokens: 400000
      # Opt in only when the OpenAI upstream implements SGLang's extension.
      inference_cache_report_enabled: true
+     cache_admission:
+       mode: active
+       hot_max_uncached_tokens: 32768
+       cold_prefill_limit_per_upstream: 1
+       max_hot_bypasses: 4
+       starvation_age_s: 30.0
+       evidence_max_age_s: 300.0
+
+``cache_admission`` is a strict schema: unknown keys, stringified numbers,
+invalid bounds, and unsupported modes prevent startup. ``active`` also
+requires ``inference_cache_report_enabled``. It preserves sticky routing,
+classifies a compatible generation-bound lineage from its prior cache report,
+and treats a new/incompatible lineage as cold. Missing engine identity or
+malformed cache evidence fails before dispatch instead of silently guessing.
+Hot queue priority is bounded by ``max_hot_bypasses`` and
+``starvation_age_s``.
 
 ``inference_timeout_s`` must be a finite number greater than zero. It
 defaults to 600 seconds for backward compatibility. The legacy
