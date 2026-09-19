@@ -28,10 +28,13 @@ from scitex_genai.gateway._server import (
 
 
 def test_codex_responses_payload_expands_string_input() -> None:
+    # Arrange
     body = {"model": "gpt-5.6-sol", "input": "Hello"}
 
+    # Act
     payload = _codex_responses_payload(body)
 
+    # Assert
     assert payload == {
         "model": "gpt-5.6-sol",
         "input": [
@@ -167,10 +170,11 @@ async def test_stream_messages_returns_anthropic_sse(client) -> None:
 
 @pytest.mark.asyncio
 async def test_responses_rejects_missing_api_key_in_openai_shape(client) -> None:
-    response = await client.post(
-        "/v1/responses", json={"model": "gpt-5.6-sol", "input": "Hello"}
-    )
-
+    # Arrange
+    body = {"model": "gpt-5.6-sol", "input": "Hello"}
+    # Act
+    response = await client.post("/v1/responses", json=body)
+    # Assert
     assert (response.status_code, response.json()["error"]["type"]) == (
         401,
         "authentication_error",
@@ -179,12 +183,15 @@ async def test_responses_rejects_missing_api_key_in_openai_shape(client) -> None
 
 @pytest.mark.asyncio
 async def test_nonstream_responses_returns_openai_shape(client) -> None:
+    # Arrange
+    headers = {"Authorization": "Bearer relay-secret"}
+    # Act
     response = await client.post(
         "/v1/responses",
         json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
-        headers={"Authorization": "Bearer relay-secret"},
+        headers=headers,
     )
-
+    # Assert
     assert (
         response.status_code,
         response.json()["id"],
@@ -194,15 +201,18 @@ async def test_nonstream_responses_returns_openai_shape(client) -> None:
 
 @pytest.mark.asyncio
 async def test_stream_responses_returns_native_sse(client) -> None:
+    # Arrange
+    headers = {
+        "x-api-key": "relay-secret",
+        "x-session-id": "sac:scitex-hub:gpt-sol",
+    }
+    # Act
     response = await client.post(
         "/v1/responses",
         json={"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
-        headers={
-            "x-api-key": "relay-secret",
-            "x-session-id": "sac:scitex-hub:gpt-sol",
-        },
+        headers=headers,
     )
-
+    # Assert
     assert (
         response.status_code,
         response.headers["content-type"].startswith("text/event-stream"),
