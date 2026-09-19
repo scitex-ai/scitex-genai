@@ -138,6 +138,39 @@ def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
     return {**body, "input": value, "stream": True, "store": False}
 
 
+def _codex_failure_message(event: dict[str, Any]) -> str:
+    """The upstream wording carried by a Codex failure event.
+
+    ``error`` events put the message at the top level, ``response.failed``
+    events nest it under ``response.error`` — the same two shapes
+    :meth:`~._anthropic.AnthropicStreamTranslator.translate` reads before it
+    raises, so a non-streaming Responses client hears the upstream's refusal
+    instead of a generic gateway failure.
+    """
+    message = event.get("message")
+    if not message:
+        response = event.get("response")
+        if isinstance(response, dict):
+            error = response.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+    return str(message or "Codex response failed")
+
+
+def _openai_sse_error(exc: GatewayError) -> str:
+    """The ``error`` frame an OpenAI-protocol stream carries for a failure.
+
+    An :class:`UpstreamError` knows its own status and error type, and the
+    non-streaming branch of the same route relays both, so a stream that
+    fails on 401 or 429 must not reach the client as a generic 503.
+    """
+    if isinstance(exc, UpstreamError):
+        error = _openai_error(str(exc), exc.error_type, exc.status_code)
+    else:
+        error = _openai_error(str(exc), "api_error", 503)
+    return f"event: error\ndata: {json.dumps(error, separators=(',', ':'))}\n\n"
+
+
 def create_app(
     backend: CodexBackend | InferenceBackend,
     *,
@@ -147,8 +180,12 @@ def create_app(
     """Create the FastAPI app without importing server dependencies at import time.
 
     Two kinds of backend, one surface. A :class:`CodexBackend` has
-    ``/v1/messages`` translated to the Codex Responses protocol; an
-    :class:`InferenceBackend` has it relayed verbatim (after the system hoist)
+    ``/v1/messages`` translated to the Codex Responses protocol and exposes
+    ``/v1/responses`` for a client that already speaks it — the public
+    Responses shorthand is normalized and the Codex transport's
+    ``store=false``, streaming-only requirement is applied, and the body is
+    otherwise passed through. An :class:`InferenceBackend` has
+    ``/v1/messages`` relayed verbatim (after the system hoist)
     to a pool of inference upstreams that speak BOTH protocols, and
     additionally relays ``POST /v1/chat/completions`` and ``POST
     /v1/responses`` untouched (the OpenAI protocol, for Codex — no hoist, no
@@ -546,18 +583,20 @@ def create_app(
                         data = json.dumps(event, separators=(",", ":"))
                         yield f"event: {event_type}\ndata: {data}\n\n"
                 except GatewayError as exc:
-                    error = _openai_error(str(exc), "api_error", 503)
-                    yield f"event: error\ndata: {json.dumps(error)}\n\n"
+                    yield _openai_sse_error(exc)
 
             return StreamingResponse(stream_response(), media_type="text/event-stream")
 
         try:
             completed = None
             async for event in backend.stream(payload, session_id=session_id):
-                if event.get("type") == "response.completed":
+                event_type = event.get("type")
+                if event_type == "response.completed":
                     candidate = event.get("response")
                     if isinstance(candidate, dict):
                         completed = candidate
+                elif event_type in {"response.failed", "error"}:
+                    raise GatewayError(_codex_failure_message(event))
             if completed is None:
                 raise GatewayError("Codex response ended without response.completed")
             return completed
