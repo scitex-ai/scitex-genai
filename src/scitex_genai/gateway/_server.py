@@ -110,6 +110,67 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
     return estimate_input_tokens(serialized.encode("utf-8"))
 
 
+def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize public Responses shorthand for the Codex transport."""
+    value = body.get("input")
+    if isinstance(value, str):
+        value = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": value}],
+            }
+        ]
+    elif isinstance(value, list):
+        normalized = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("content"), str):
+                content_type = (
+                    "output_text"
+                    if item.get("role") == "assistant"
+                    else "input_text"
+                )
+                item = {
+                    **item,
+                    "content": [{"type": content_type, "text": item["content"]}],
+                }
+            normalized.append(item)
+        value = normalized
+    return {**body, "input": value, "stream": True, "store": False}
+
+
+def _codex_failure_message(event: dict[str, Any]) -> str:
+    """The upstream wording carried by a Codex failure event.
+
+    ``error`` events put the message at the top level, ``response.failed``
+    events nest it under ``response.error`` — the same two shapes
+    :meth:`~._anthropic.AnthropicStreamTranslator.translate` reads before it
+    raises, so a non-streaming Responses client hears the upstream's refusal
+    instead of a generic gateway failure.
+    """
+    message = event.get("message")
+    if not message:
+        response = event.get("response")
+        if isinstance(response, dict):
+            error = response.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+    return str(message or "Codex response failed")
+
+
+def _openai_sse_error(exc: GatewayError) -> str:
+    """The ``error`` frame an OpenAI-protocol stream carries for a failure.
+
+    An :class:`UpstreamError` knows its own status and error type, and the
+    non-streaming branch of the same route relays both, so a stream that
+    fails on 401 or 429 must not reach the client as a generic 503.
+    """
+    if isinstance(exc, UpstreamError):
+        error = _openai_error(str(exc), exc.error_type, exc.status_code)
+    else:
+        error = _openai_error(str(exc), "api_error", 503)
+    return f"event: error\ndata: {json.dumps(error, separators=(',', ':'))}\n\n"
+
+
 def create_app(
     backend: CodexBackend | InferenceBackend,
     *,
@@ -119,8 +180,12 @@ def create_app(
     """Create the FastAPI app without importing server dependencies at import time.
 
     Two kinds of backend, one surface. A :class:`CodexBackend` has
-    ``/v1/messages`` translated to the Codex Responses protocol; an
-    :class:`InferenceBackend` has it relayed verbatim (after the system hoist)
+    ``/v1/messages`` translated to the Codex Responses protocol and exposes
+    ``/v1/responses`` for a client that already speaks it — the public
+    Responses shorthand is normalized and the Codex transport's
+    ``store=false``, streaming-only requirement is applied, and the body is
+    otherwise passed through. An :class:`InferenceBackend` has
+    ``/v1/messages`` relayed verbatim (after the system hoist)
     to a pool of inference upstreams that speak BOTH protocols, and
     additionally relays ``POST /v1/chat/completions`` and ``POST
     /v1/responses`` untouched (the OpenAI protocol, for Codex — no hoist, no
@@ -483,6 +548,65 @@ def create_app(
             return await relay(request)
 
         return app
+
+    @app.post("/v1/responses")
+    async def responses(request: Request) -> Any:
+        if not authorized(request):
+            return JSONResponse(
+                _openai_error("Invalid API key", "authentication_error", 401),
+                401,
+            )
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise GatewayError("Request body must be a JSON object")
+            if not isinstance(body.get("model"), str) or not body["model"]:
+                raise GatewayError("Responses request requires a model")
+            if "input" not in body:
+                raise GatewayError("Responses request requires input")
+            requested_stream = body.get("stream") is True
+            payload = _codex_responses_payload(body)
+            session_id = _session_id(request, body)
+        except (ValueError, GatewayError) as exc:
+            return JSONResponse(
+                _openai_error(str(exc), "invalid_request_error", 400), 400
+            )
+
+        if requested_stream:
+
+            async def stream_response() -> AsyncIterator[str]:
+                try:
+                    async for event in backend.stream(
+                        payload, session_id=session_id
+                    ):
+                        event_type = str(event.get("type", "message"))
+                        data = json.dumps(event, separators=(",", ":"))
+                        yield f"event: {event_type}\ndata: {data}\n\n"
+                except GatewayError as exc:
+                    yield _openai_sse_error(exc)
+
+            return StreamingResponse(stream_response(), media_type="text/event-stream")
+
+        try:
+            completed = None
+            async for event in backend.stream(payload, session_id=session_id):
+                event_type = event.get("type")
+                if event_type == "response.completed":
+                    candidate = event.get("response")
+                    if isinstance(candidate, dict):
+                        completed = candidate
+                elif event_type in {"response.failed", "error"}:
+                    raise GatewayError(_codex_failure_message(event))
+            if completed is None:
+                raise GatewayError("Codex response ended without response.completed")
+            return completed
+        except UpstreamError as exc:
+            return JSONResponse(
+                _openai_error(str(exc), exc.error_type, exc.status_code),
+                exc.status_code,
+            )
+        except GatewayError as exc:
+            return JSONResponse(_openai_error(str(exc), "api_error", 503), 503)
 
     @app.post("/v1/messages")
     async def messages(request: Request) -> Any:

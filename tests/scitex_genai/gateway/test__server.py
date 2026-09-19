@@ -16,11 +16,36 @@ import pytest_asyncio
 # skip cleanly on installs without the [gateway] extra.
 pytest.importorskip("fastapi")
 
-from scitex_genai.gateway._errors import InferenceAdmissionError
+from scitex_genai.gateway._errors import InferenceAdmissionError, RateLimitError
 from scitex_genai.gateway._health import UpstreamReachability
 from scitex_genai.gateway._identity import GatewayIdentity
 from scitex_genai.gateway._inference import InferenceBackend, InferenceUpstreamPool
-from scitex_genai.gateway._server import _build_uvicorn_server, create_app
+from scitex_genai.gateway._server import (
+    _build_uvicorn_server,
+    _codex_responses_payload,
+    create_app,
+)
+
+
+def test_codex_responses_payload_expands_string_input() -> None:
+    # Arrange
+    body = {"model": "gpt-5.6-sol", "input": "Hello"}
+
+    # Act
+    payload = _codex_responses_payload(body)
+
+    # Assert
+    assert payload == {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            }
+        ],
+        "stream": True,
+        "store": False,
+    }
 
 
 class _Pool:
@@ -51,7 +76,19 @@ class _Backend:
         }
         yield {
             "type": "response.completed",
-            "response": {"usage": {"input_tokens": 3, "output_tokens": 1}},
+            "response": {
+                "id": "resp-1",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.6-sol",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Hello"}],
+                    }
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            },
         }
 
 
@@ -129,6 +166,291 @@ async def test_stream_messages_returns_anthropic_sse(client) -> None:
         "event: content_block_delta" in response.text,
         "event: message_stop" in response.text,
     ) == (200, True, True, True, True)
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_missing_api_key_in_openai_shape(client) -> None:
+    # Arrange
+    body = {"model": "gpt-5.6-sol", "input": "Hello"}
+    # Act
+    response = await client.post("/v1/responses", json=body)
+    # Assert
+    assert (response.status_code, response.json()["error"]["type"]) == (
+        401,
+        "authentication_error",
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonstream_responses_returns_openai_shape(client) -> None:
+    # Arrange
+    headers = {"Authorization": "Bearer relay-secret"}
+    # Act
+    response = await client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
+        headers=headers,
+    )
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["id"],
+        response.json()["output"][0]["content"][0]["text"],
+    ) == (200, "resp-1", "Hello")
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_returns_native_sse(client) -> None:
+    # Arrange
+    headers = {
+        "x-api-key": "relay-secret",
+        "x-session-id": "sac:scitex-hub:gpt-sol",
+    }
+    # Act
+    response = await client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+        headers=headers,
+    )
+    # Assert
+    assert (
+        response.status_code,
+        response.headers["content-type"].startswith("text/event-stream"),
+        "event: response.created" in response.text,
+        "event: response.output_text.delta" in response.text,
+        "event: response.completed" in response.text,
+    ) == (200, True, True, True, True)
+
+
+def test_codex_responses_payload_normalizes_list_items() -> None:
+    # Arrange: the Responses shorthand Codex clients actually send — message
+    # items with shorthand (string) content, plus an already-typed part and a
+    # non-message item that must travel untouched.
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": [{"type": "input_text", "text": "kept"}]},
+            {"type": "function_call_output", "call_id": "call-1", "output": "{}"},
+        ],
+        "stream": False,
+    }
+
+    # Act
+    payload = _codex_responses_payload(body)
+
+    # Assert
+    assert (
+        payload["input"][0],
+        payload["input"][1],
+        payload["input"][2],
+        payload["input"][3],
+        payload["stream"],
+        payload["store"],
+    ) == (
+        {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "Hello"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "kept"}]},
+        {"type": "function_call_output", "call_id": "call-1", "output": "{}"},
+        True,
+        False,
+    )
+
+
+class _RecordingBackend(_Backend):
+    """A Codex backend that records the payload and session the route built."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    async def stream(self, payload, *, session_id=""):
+        self.requests.append({"payload": payload, "session_id": session_id})
+        async for event in super().stream(payload, session_id=session_id):
+            yield event
+
+
+class _FailingBackend(_Backend):
+    """A Codex backend whose transport refuses before it yields an event."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def stream(self, payload, *, session_id=""):
+        raise self.error
+        yield {}  # pragma: no cover - keeps this an async generator
+
+
+class _FailureEventBackend(_Backend):
+    """A Codex backend whose turn ends in an upstream failure event."""
+
+    def __init__(self, event: dict) -> None:
+        self.event = event
+
+    async def stream(self, payload, *, session_id=""):
+        yield {"type": "response.created", "response": {"id": "resp-1"}}
+        yield self.event
+
+
+@asynccontextmanager
+async def _serving_codex(backend):
+    """Serve an arbitrary Codex-style backend through the real gateway app."""
+    app = create_app(backend, api_key="relay-secret")
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gateway.test"
+        ) as test_client:
+            yield test_client
+
+
+def _sse_error_payload(text: str) -> dict:
+    """The JSON of the last ``data:`` frame in an OpenAI-protocol SSE body."""
+    frame = [line for line in text.splitlines() if line.startswith("data: ")][-1]
+    return json.loads(frame.removeprefix("data: "))
+
+
+@pytest.mark.asyncio
+async def test_responses_requires_a_model_and_an_input(client) -> None:
+    # Arrange
+    headers = {"Authorization": "Bearer relay-secret"}
+    # Act
+    missing_model = await client.post(
+        "/v1/responses", json={"input": "Hello"}, headers=headers
+    )
+    missing_input = await client.post(
+        "/v1/responses", json={"model": "gpt-5.6-sol"}, headers=headers
+    )
+    # Assert
+    assert (
+        missing_model.status_code,
+        missing_input.status_code,
+        missing_model.json()["error"]["type"],
+        missing_input.json()["error"]["type"],
+        "model" in missing_model.json()["error"]["message"],
+        "input" in missing_input.json()["error"]["message"],
+    ) == (400, 400, "invalid_request_error", "invalid_request_error", True, True)
+
+
+@pytest.mark.asyncio
+async def test_responses_payload_forces_codex_transport_and_forwards_session() -> None:
+    # Arrange
+    backend = _RecordingBackend()
+    # Act
+    async with _serving_codex(backend) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
+            headers={
+                "x-api-key": "relay-secret",
+                "x-session-id": "sac:scitex-hub:gpt-sol",
+            },
+        )
+    # Assert: the Codex transport is streaming-only and store-free, the
+    # shorthand input is expanded, and the session reaches the transport.
+    sent = backend.requests[0]
+    assert (
+        response.status_code,
+        sent["payload"]["stream"],
+        sent["payload"]["store"],
+        sent["payload"]["input"],
+        sent["session_id"],
+    ) == (
+        200,
+        True,
+        False,
+        [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "sac:scitex-hub:gpt-sol",
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonstream_responses_relays_the_upstream_status() -> None:
+    # Arrange
+    backend = _FailingBackend(RateLimitError("Codex account is rate limited"))
+    # Act
+    async with _serving_codex(backend) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["message"],
+        response.json()["error"]["code"],
+    ) == (429, "Codex account is rate limited", 429)
+
+
+@pytest.mark.asyncio
+async def test_nonstream_responses_reports_a_failed_event() -> None:
+    # Arrange: the upstream turn dies after it started — the client must hear
+    # the upstream's wording, not "ended without response.completed".
+    backend = _FailureEventBackend(
+        {
+            "type": "response.failed",
+            "response": {"error": {"message": "upstream quota exhausted"}},
+        }
+    )
+    # Act
+    async with _serving_codex(backend) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hello", "stream": False},
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        response.json()["error"]["type"],
+        response.json()["error"]["message"],
+    ) == (503, "api_error", "upstream quota exhausted")
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_keeps_the_upstream_status_in_the_error_frame() -> None:
+    # Arrange
+    backend = _FailingBackend(RateLimitError("Codex account is rate limited"))
+    # Act
+    async with _serving_codex(backend) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    # Assert: a stream that fails upstream carries the real status, exactly as
+    # the non-streaming branch of the same route does.
+    payload = _sse_error_payload(response.text)
+    assert (
+        response.status_code,
+        "event: error" in response.text,
+        payload["error"]["message"],
+        payload["error"]["code"],
+    ) == (200, True, "Codex account is rate limited", 429)
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_forwards_a_failed_event_verbatim() -> None:
+    # Arrange: a native Responses client sees the upstream's own failure frame.
+    event = {
+        "type": "response.failed",
+        "response": {"error": {"message": "upstream quota exhausted"}},
+    }
+    backend = _FailureEventBackend(event)
+    # Act
+    async with _serving_codex(backend) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+            headers={"Authorization": "Bearer relay-secret"},
+        )
+    # Assert
+    assert (
+        response.status_code,
+        "event: response.failed" in response.text,
+        _sse_error_payload(response.text) == event,
+    ) == (200, True, True)
 
 
 @pytest.mark.asyncio
