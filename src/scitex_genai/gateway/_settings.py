@@ -62,8 +62,10 @@ KEY_CONTINUATION_RETRIES = "gateway.inference_continuation_qos_max_retries"
 KEY_CONTINUATION_MIN_TOKENS = "gateway.inference_continuation_qos_min_preempt_tokens"
 KEY_CACHE_REPORT = "gateway.inference_cache_report_enabled"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
+KEY_OPENCODE_SERVE_URL = "gateway.opencode_serve_url"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
+OPENCODE_SERVE_ENV = "SCITEX_GENAI_OPENCODE_SERVE_URL"
 RETIRED_UPSTREAM_ENVS = ("HOIST_UPSTREAM", "SCITEX_GATEWAY_INFERENCE_UPSTREAMS")
 _MISSING = object()
 
@@ -289,6 +291,7 @@ class GatewaySettings:
     inference_cache_report_enabled: bool = False
     cache_admission: CacheAdmissionSettings = CacheAdmissionSettings()
     external_provider: ExternalGatewaySettings | None = None
+    opencode_serve_url: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", check_host(self.host))
@@ -311,6 +314,19 @@ class GatewaySettings:
         if self.external_provider is not None and self.inference_upstreams:
             raise ValueError(
                 "gateway.external_provider and gateway.inference_upstreams are mutually exclusive"
+            )
+        object.__setattr__(
+            self,
+            "opencode_serve_url",
+            str(self.opencode_serve_url or "").strip(),
+        )
+        opencode = bool(self.opencode_serve_url)
+        if opencode and (
+            self.external_provider is not None or self.inference_upstreams
+        ):
+            raise ValueError(
+                "gateway.opencode_serve_url is mutually exclusive with "
+                "gateway.external_provider and gateway.inference_upstreams"
             )
         object.__setattr__(
             self,
@@ -372,6 +388,7 @@ def load_settings(
     inference_continuation_qos_max_retries: int | None = None,
     inference_continuation_qos_min_preempt_tokens: int | None = None,
     inference_cache_report_enabled: bool | None = None,
+    opencode_serve_url: str | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -463,4 +480,26 @@ def load_settings(
         ),
         cache_admission=CacheAdmissionSettings.model_validate(cache_admission_mapping),
         external_provider=ExternalGatewaySettings.from_mapping(external_mapping),
+        opencode_serve_url=_resolve_serve_url(
+            direct_val=opencode_serve_url, raw_gateway=raw_gateway
+        ),
     )
+
+
+def _resolve_serve_url(*, direct_val: str | None, raw_gateway: Any) -> str:
+    """The opencode harness address: direct -> config file -> env -> off.
+
+    Spell the cascade out by hand: ``ScitexConfig.resolve`` derives
+    ``SCITEX_GATEWAY_OPENCODE_SERVE_URL`` from the key, but the documented
+    flag contract is ``SCITEX_GENAI_OPENCODE_SERVE_URL``. An empty value at
+    every level means the backend stays off.
+    """
+    if direct_val is not None:
+        return direct_val
+    leaf = KEY_OPENCODE_SERVE_URL.rpartition(".")[2]
+    raw_value = (
+        raw_gateway.get(leaf) if isinstance(raw_gateway, dict) else None
+    )
+    if raw_value is not None:
+        return raw_value
+    return os.getenv(OPENCODE_SERVE_ENV, "")
