@@ -305,7 +305,7 @@ def test_main_install_unit_reports_the_path_and_the_state(
     main(argv)
 
     # Assert
-    assert (str(tmp_path / UNIT_NAME) in capsys.readouterr().out, "written only") == (
+    assert (str(tmp_path / UNIT_NAME) in capsys.readouterr().err, "written only") == (
         True,
         "written only",
     )
@@ -577,4 +577,4 @@ def test_install_unit_reports_where_the_key_was_stored(
     main(argv)
 
     # Assert
-    assert str(default_secrets_path()) in capsys.readouterr().out
+    assert str(default_secrets_path()) in capsys.readouterr().err

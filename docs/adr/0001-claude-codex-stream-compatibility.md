@@ -1,6 +1,8 @@
 # ADR 0001: Claude Code to Codex streaming compatibility
 
-Status: accepted
+## Status
+
+Accepted on 2026-07-19.
 
 ## Context
 

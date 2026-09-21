@@ -22,9 +22,12 @@ import sys
 from typing import Dict, Generator, List, Optional
 
 import requests
+import scitex_logging as slogging
 
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Warnings"""
 # scitex.pd.ignore_SettingWithCopyWarning()
@@ -165,7 +168,7 @@ if __name__ == "__main__":
         client = DeepSeek()
         prompt = "Hello, how can I help you?"
         response = client.complete(prompt)
-        print(response)
+        log.info(response)
         return 0
 
     exit_status = main()

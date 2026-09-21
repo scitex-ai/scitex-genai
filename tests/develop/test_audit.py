@@ -15,17 +15,23 @@ import shutil
 
 import pytest
 
+scitex_dev = pytest.importorskip("scitex_dev")
+
+if shutil.which("scitex-dev") is None:
+    pytest.skip(
+        "scitex-dev not installed — add `scitex-dev[cli-audit]` "
+        "to [project.optional-dependencies.dev]",
+        allow_module_level=True,
+    )
+
+from scitex_dev.testing import audit_all_for_package
+
 
 def test_audit_all_clean():
     # Arrange
     # Act
     # Assert
-    if shutil.which("scitex-dev") is None:
-        pytest.skip(
-            "scitex-dev not installed — add `scitex-dev[cli-audit]` "
-            "to [project.optional-dependencies.dev]"
-        )
-    pytest.importorskip("scitex_dev")
-    from scitex_dev.testing import audit_all_for_package
-
-    audit_all_for_package('scitex-genai')
+    # audit_all_for_package returns None and raises/asserts non-zero exit
+    # internally — asserting the None return keeps this gate a real
+    # behavioural test (PS-206b) rather than an import smoke.
+    assert audit_all_for_package("scitex-genai") is None

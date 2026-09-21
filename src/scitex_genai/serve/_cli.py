@@ -35,6 +35,10 @@ from ._render import Launch, render
 from ._run import EngineRunner
 from ._settings import load_serve_settings
 
+import scitex_logging as slogging
+
+log = slogging.getLogger(__name__)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -129,18 +133,17 @@ def _launch_main(argv: list[str]) -> int:
             args.keys, settings, models_dir=models_dir, config_path=args.config
         )
     except (FileNotFoundError, ValueError) as exc:
-        print(f"scitex-genai-serve launch: {exc}", file=sys.stderr)
+        log.error(f"scitex-genai-serve launch: {exc}")
         return 2
     if args.dry_run:
-        print(body, end="")
+        sys.stdout.write(body + "\n")
         return 0
     canary_keys = [key for key in args.keys if load_engine(key, models_dir).canary_only]
     if canary_keys:
         joined = ", ".join(canary_keys)
-        print(
+        log.error(
             "scitex-genai-serve launch: canary-only profiles require a separately "
-            f"held matching lease ({joined}); enter it with srun --overlap",
-            file=sys.stderr,
+            f"held matching lease ({joined}); enter it with srun --overlap"
         )
         return 2
     lease = book_serve_lease(
@@ -155,7 +158,7 @@ def _launch_main(argv: list[str]) -> int:
         models_dir=models_dir,
         config_path=args.config,
     )
-    print(
+    log.info(
         f"scitex-genai-serve: booked persistent lease {args.lease} on {args.host}: {lease}"
     )
     return 0
@@ -169,19 +172,16 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list:
         for key in list_engines(args.models_dir):
-            print(key)
+            sys.stdout.write(key + "\n")
         return 0
     if not args.key:
-        print(
-            "scitex-genai-serve: an engine key is required (see --list)",
-            file=sys.stderr,
-        )
+        log.error("scitex-genai-serve: an engine key is required (see --list)")
         return 2
     try:
         settings = load_serve_settings(args.config)
         conf = load_engine(args.key, args.models_dir)
     except (FileNotFoundError, ValueError) as exc:
-        print(f"scitex-genai-serve: {exc}", file=sys.stderr)
+        log.error(f"scitex-genai-serve: {exc}")
         return 2
     runtime_env = dict(os.environ)
     manifest = None
@@ -189,22 +189,21 @@ def main(argv: list[str] | None = None) -> int:
         try:
             manifest = validate_runtime(conf, runtime_env)
         except ValueError as exc:
-            print(f"scitex-genai-serve: {exc}", file=sys.stderr)
+            log.error(f"scitex-genai-serve: {exc}")
             return 2
     launch = render(settings, conf, runtime_env)
     if args.dry_run:
-        print(describe(launch))
+        sys.stdout.write(describe(launch) + "\n")
         return 0
     if manifest is not None:
         try:
             destination = publish_runtime_manifest(manifest)
         except StoreError as exc:
-            print(
-                f"scitex-genai-serve: cannot publish canary incarnation: {exc}",
-                file=sys.stderr,
+            log.error(
+                f"scitex-genai-serve: cannot publish canary incarnation: {exc}"
             )
             return 2
-        print(f"scitex-genai-serve: canary incarnation -> {destination}")
+        log.info(f"scitex-genai-serve: canary incarnation -> {destination}")
     EngineRunner(launch).run_forever()
     return 0
 

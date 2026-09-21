@@ -10,6 +10,7 @@ import sys
 from typing import List, Optional
 
 import matplotlib.pyplot as plt
+import scitex_logging as slogging
 
 from scitex_dev import try_import_optional
 
@@ -20,6 +21,8 @@ Dialog = try_import_optional("llama", "Dialog")
 _Llama = try_import_optional("llama", "Llama")
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Functions & Classes"""
 
@@ -32,10 +35,10 @@ def print_envs():
         "RANK": os.getenv("RANK", "0"),
     }
 
-    print("Environment Variable Settings:")
+    log.info("Environment Variable Settings:")
     for key, value in settings.items():
-        print(f"{key}: {value}")
-    print()
+        log.info(f"{key}: {value}")
+    log.info("")
 
 
 class Llama(BaseGenAI):

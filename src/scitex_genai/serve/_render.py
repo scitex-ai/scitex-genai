@@ -8,7 +8,7 @@ against without a GPU.
 
 THREE THINGS CARRIED OVER FROM THE SCRIPT, EACH PAID FOR:
 - ``ControlMaster=no`` / ``ControlPath=none`` on the tunnel: without them
-  ``ssh -R`` attaches to an existing mux master, exits 0 in two seconds, and
+  ``ssh -R`` attaches to an existing mux primary, exits 0 in two seconds, and
   the forward's lifetime belongs to something other than this launch.
 - The tunnel forwards to vLLM's OWN port, not LiteLLM's: vLLM speaks the
   Anthropic ``/v1/messages`` shape natively, and the gateway on the other end

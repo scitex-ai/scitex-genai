@@ -47,18 +47,29 @@ dependencies = [
     "litellm",
     "markdown2",
     "matplotlib",
-    "Pillow",
+    # PS-149: Pillow is imported lazily in exactly one feature helper
+    # (llm/_BaseGenAI._ensure_base64_encoding) -- keep it out of the
+    # minimal install; image features ride on `scitex-genai[image]`.
     "pydantic>=2.0",
+    # PS-233: unguarded runtime imports on default paths (gateway relay,
+    # llm providers, benchmark runner) -- minimal installs must include these.
+    "httpx>=0.27",
+    "numpy",
+    "pandas",
+    "requests",
     "tqdm",
     # SciTeX standalone deps (only those actually imported by src/)
     "scitex-config>=0.3.6",
     "scitex-dev>=0.59.0",
     "scitex-io>=0.2.0",
+    "scitex-logging>=0.1.0",
     "scitex-str>=0.1.0",
 ]
 
 [project.optional-dependencies]
-# Forward-looking extras — wire up as modality submodules land.
+# Optional dependency groups. Still-reserved modality namespaces (audio,
+# video, embed, multimodal) declare no extras until real deps land —
+# install `scitex-genai[all]` for everything available today.
 agent = [
     "claude-agent-sdk",
 ]
@@ -79,11 +90,12 @@ gateway = [
 benchmark = [
     "httpx>=0.27",
 ]
-image = []
-audio = []
-video = []
-embed = []
-multimodal = []
+image = [
+    # PS-149: Pillow is imported lazily in exactly one feature helper
+    # (llm/_BaseGenAI._ensure_base64_encoding) -- image features ride
+    # on `scitex-genai[image]`, not on the minimal install.
+    "Pillow",
+]
 dev = [
     "scitex-hpc>=0.8.1",
     "fastapi>=0.110",
@@ -116,11 +128,14 @@ docs = [
 ]
 all = [
     "scitex-genai[agent]",
+    "scitex-genai[benchmark]",
     "scitex-genai[dev]",
     "scitex-genai[docs]",
     "scitex-genai[gateway]",
+    "scitex-genai[image]",
     "scitex-genai[litellm]",
     "scitex-genai[ollama]",
+    "scitex-genai[serve]",
 ]
 
 [project.scripts]
@@ -147,6 +162,10 @@ packages = ["src/scitex_genai"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+markers = [
+    "smoke: fast CLI happy-path tests (<60s, runs on every PR)",
+    "e2e: end-to-end workflows against real subsystems (runs on every PR)",
+]
 
 [tool.coverage.run]
 parallel = true
