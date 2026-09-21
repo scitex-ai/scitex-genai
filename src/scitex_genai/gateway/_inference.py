@@ -3555,7 +3555,14 @@ class InferenceBackend:
             return False
         try:
             import httpx
-
+        except ImportError as exc:  # PS-233: abort transport is optional
+            self.continuation_qos.abort_failed()
+            self._note(
+                f"[relay] rid abort failed on {upstream.alias}: httpx is not "
+                f"installed ({exc}); continuation not dispatched"
+            )
+            return False
+        try:
             async with httpx.AsyncClient(timeout=min(self.timeout_s, 5.0)) as client:
                 response = await client.post(
                     upstream.base_url + "/abort_request",

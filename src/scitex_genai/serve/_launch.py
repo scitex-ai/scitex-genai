@@ -147,7 +147,14 @@ def book_serve_lease(
         extra_sbatch_args=["--nodes=1", f"--gpus-per-node={gpus}"],
     )
     if book is None:
-        from scitex_hpc._reservation import Reservation
+        try:
+            from scitex_hpc._reservation import Reservation
+        except (
+            ImportError
+        ) as exc:  # pragma: no cover - depends on the extra being installed
+            raise RuntimeError(
+                "serve launch needs scitex-hpc (install scitex-genai[serve])"
+            ) from exc
 
         book = Reservation.book
     return book(config, persistent=True, hold_body=body)
