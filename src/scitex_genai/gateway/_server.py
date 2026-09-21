@@ -18,6 +18,7 @@ from ._drain import DEFAULT_DRAIN_TIMEOUT_S
 from ._errors import GatewayError, UpstreamError
 from ._health import public_upstream_url
 from ._identity import GatewayIdentity, gateway_identity
+from ._opencode import OpenCodeBackend
 from ._inference import (
     InferenceBackend,
     InferenceDrainTimeout,
@@ -359,6 +360,15 @@ def create_app(
                     member["input_tokens_queued"] for member in members
                 )
             return status if status["ready"] else JSONResponse(status, status_code=503)
+        if opencode:
+            assert isinstance(backend, OpenCodeBackend)
+            return {
+                "status": "ok",
+                "provider": "opencode-serve",
+                "serve_url": backend.serve_url,
+                "model": backend.model,
+                "gateway": process_identity.as_dict(),
+            }
         return {
             "status": "ok",
             "provider": "openai-codex",
