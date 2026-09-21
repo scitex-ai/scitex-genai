@@ -14,7 +14,6 @@ Verified 2026-09-21 on scitex-compute-04: ``SERVE_API_OK`` round-trip
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from collections.abc import AsyncIterator
