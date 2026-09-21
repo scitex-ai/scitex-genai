@@ -185,8 +185,7 @@ def _streaming_app() -> Any:
     return create_app(backend, api_key="k")
 
 
-def test_chat_completions_route_stream_returns_sse_frames() -> None:
-    # Arrange
+def _stream_response_parts() -> tuple[int, str, list[str], list[dict], list[dict]]:
     import json as _json
 
     from fastapi.testclient import TestClient
@@ -202,28 +201,87 @@ def test_chat_completions_route_stream_returns_sse_frames() -> None:
             "stream": True,
         },
     )
-    # Assert
-    assert response.status_code == 200
-    assert "text/event-stream" in response.headers["content-type"]
-    frames = [
-        frame for frame in response.text.split("\n\n") if frame.strip()
-    ]
-    assert frames[-1].strip() == "data: [DONE]"
+    frames = [frame for frame in response.text.split("\n\n") if frame.strip()]
     payloads = [
         _json.loads(frame.split("data:", 1)[1])
         for frame in frames[:-1]
         if frame.strip().startswith("data:")
     ]
-    assert payloads, "expected at least one SSE data frame"
-    assert all(p["object"] == "chat.completion.chunk" for p in payloads)
     deltas = [p["choices"][0]["delta"] for p in payloads]
+    return (
+        response.status_code,
+        response.headers["content-type"],
+        frames,
+        payloads,
+        deltas,
+    )
+
+
+def test_stream_completions_report_success_status() -> None:
+    # Arrange
+    # Act
+    status, _content_type, _frames, _payloads, _deltas = _stream_response_parts()
+    # Assert
+    assert status == 200
+
+
+def test_stream_completions_use_event_stream_content_type() -> None:
+    # Arrange
+    # Act
+    _status, content_type, _frames, _payloads, _deltas = _stream_response_parts()
+    # Assert
+    assert "text/event-stream" in content_type
+
+
+def test_stream_completions_end_with_done_frame() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, frames, _payloads, _deltas = _stream_response_parts()
+    # Assert
+    assert frames[-1].strip() == "data: [DONE]"
+
+
+def test_stream_completions_emit_sse_data_frames() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, _frames, payloads, _deltas = _stream_response_parts()
+    # Assert
+    assert payloads, "expected at least one SSE data frame"
+
+
+def test_stream_completions_send_completion_chunk_objects() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, _frames, payloads, _deltas = _stream_response_parts()
+    # Assert
+    assert all(p["object"] == "chat.completion.chunk" for p in payloads)
+
+
+def test_stream_completions_open_with_assistant_role() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, _frames, _payloads, deltas = _stream_response_parts()
+    # Assert
     assert deltas[0] == {"role": "assistant"}
+
+
+def test_stream_completions_deliver_reply_text_delta() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, _frames, _payloads, deltas = _stream_response_parts()
+    # Assert
     assert {"content": "GW_OK"} in deltas
+
+
+def test_stream_completions_mark_final_chunk_stop() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, _frames, payloads, _deltas = _stream_response_parts()
+    # Assert
     assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
 
 
-def test_chat_completions_route_without_stream_returns_json() -> None:
-    # Arrange
+def _nonstream_response_parts() -> tuple[int, str, dict]:
     from fastapi.testclient import TestClient
 
     client = TestClient(_streaming_app())
@@ -233,9 +291,40 @@ def test_chat_completions_route_without_stream_returns_json() -> None:
         headers={"Authorization": "Bearer k"},
         json={"model": "muse-spark-1.3-contributor-free", "messages": []},
     )
+    return (
+        response.status_code,
+        response.headers.get("content-type", ""),
+        response.json(),
+    )
+
+
+def test_nonstream_completions_report_success_status() -> None:
+    # Arrange
+    # Act
+    status, _content_type, _payload = _nonstream_response_parts()
     # Assert
-    assert response.status_code == 200
-    assert "text/event-stream" not in response.headers.get("content-type", "")
-    payload = response.json()
+    assert status == 200
+
+
+def test_nonstream_completions_avoid_event_stream_content() -> None:
+    # Arrange
+    # Act
+    _status, content_type, _payload = _nonstream_response_parts()
+    # Assert
+    assert "text/event-stream" not in content_type
+
+
+def test_nonstream_completions_return_completion_object() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, payload = _nonstream_response_parts()
+    # Assert
     assert payload["object"] == "chat.completion"
+
+
+def test_nonstream_completions_return_reply_text() -> None:
+    # Arrange
+    # Act
+    _status, _content_type, payload = _nonstream_response_parts()
+    # Assert
     assert payload["choices"][0]["message"]["content"] == "GW_OK"

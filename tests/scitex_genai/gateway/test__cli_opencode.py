@@ -64,56 +64,85 @@ def test_flag_parses_the_serve_url(isolated_serve_env) -> None:
     assert args.opencode_serve_url == "http://127.0.0.1:4096"
 
 
-def test_main_selects_opencode_backend_from_flag(
+def _write_gateway_config(tmp_path: Path, body: str) -> str:
+    config = tmp_path / "config.yaml"
+    config.write_text(body)
+    return str(config)
+
+
+def test_main_selects_opencode_backend_type_from_flag(
     tmp_path: Path, gateway_key_env, isolated_serve_env
 ) -> None:
     # Arrange
-    config = tmp_path / "config.yaml"
-    config.write_text("gateway:\n  port: 8765\n")
-    argv = [
-        "--config",
-        str(config),
-        "--opencode-serve-url",
-        "http://127.0.0.1:4096",
-    ]
+    config = _write_gateway_config(tmp_path, "gateway:\n  port: 8765\n")
+    argv = ["--config", config, "--opencode-serve-url", "http://127.0.0.1:4096"]
     # Act
-    app, _kwargs = _collect(argv, gateway_key_env)
+    backend = _collect(argv, gateway_key_env)[0].state.scitex_backend
     # Assert
-    backend = app.state.scitex_backend
     assert isinstance(backend, OpenCodeBackend)
+
+
+def test_main_selects_opencode_serve_url_from_flag(
+    tmp_path: Path, gateway_key_env, isolated_serve_env
+) -> None:
+    # Arrange
+    config = _write_gateway_config(tmp_path, "gateway:\n  port: 8765\n")
+    argv = ["--config", config, "--opencode-serve-url", "http://127.0.0.1:4096"]
+    # Act
+    backend = _collect(argv, gateway_key_env)[0].state.scitex_backend
+    # Assert
     assert backend.serve_url == "http://127.0.0.1:4096"
 
 
-def test_main_selects_opencode_backend_from_settings_file(
+def test_main_selects_opencode_backend_type_from_settings_file(
     tmp_path: Path, gateway_key_env, isolated_serve_env
 ) -> None:
     # Arrange
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        "gateway:\n  port: 8765\n  opencode_serve_url: http://127.0.0.1:4097\n"
+    config = _write_gateway_config(
+        tmp_path,
+        "gateway:\n  port: 8765\n  opencode_serve_url: http://127.0.0.1:4097\n",
     )
-    argv = ["--config", str(config)]
     # Act
-    app, _kwargs = _collect(argv, gateway_key_env)
+    backend = _collect(["--config", config], gateway_key_env)[0].state.scitex_backend
     # Assert
-    backend = app.state.scitex_backend
     assert isinstance(backend, OpenCodeBackend)
+
+
+def test_main_selects_opencode_serve_url_from_settings_file(
+    tmp_path: Path, gateway_key_env, isolated_serve_env
+) -> None:
+    # Arrange
+    config = _write_gateway_config(
+        tmp_path,
+        "gateway:\n  port: 8765\n  opencode_serve_url: http://127.0.0.1:4097\n",
+    )
+    # Act
+    backend = _collect(["--config", config], gateway_key_env)[0].state.scitex_backend
+    # Assert
     assert backend.serve_url == "http://127.0.0.1:4097"
 
 
-def test_main_selects_opencode_backend_from_environment(
+def test_main_selects_opencode_backend_type_from_environment(
     tmp_path: Path, gateway_key_env, isolated_serve_env
 ) -> None:
     # Arrange
-    config = tmp_path / "config.yaml"
-    config.write_text("gateway:\n  port: 8765\n")
+    config = _write_gateway_config(tmp_path, "gateway:\n  port: 8765\n")
     os.environ[SERVE_ENV] = "http://127.0.0.1:4098"
-    argv = ["--config", str(config)]
     # Act
-    app, _kwargs = _collect(argv, gateway_key_env)
+    backend = _collect(["--config", config], gateway_key_env)[0].state.scitex_backend
     # Assert
-    backend = app.state.scitex_backend
     assert isinstance(backend, OpenCodeBackend)
+
+
+def test_main_selects_opencode_serve_url_from_environment(
+    tmp_path: Path, gateway_key_env, isolated_serve_env
+) -> None:
+    # Arrange
+    config = _write_gateway_config(tmp_path, "gateway:\n  port: 8765\n")
+    os.environ[SERVE_ENV] = "http://127.0.0.1:4098"
+    # Act
+    backend = _collect(["--config", config], gateway_key_env)[0].state.scitex_backend
+    # Assert
     assert backend.serve_url == "http://127.0.0.1:4098"
 
 
@@ -173,20 +202,31 @@ def test_opencode_and_inference_upstreams_are_mutually_exclusive(
         _collect(["--config", str(config)], gateway_key_env)
 
 
-def test_gateway_serves_models_with_opencode_backend(
-    gateway_key_env, isolated_serve_env
-) -> None:
-    # Arrange
+def _models_response(gateway_key_env):
     gateway_key_env("test-key")
     app = create_app(OpenCodeBackend(), api_key="test-key")
     client = TestClient(app)
+    return client.get("/v1/models", headers={"Authorization": "Bearer test-key"})
+
+
+def test_gateway_models_reports_success_status(
+    gateway_key_env, isolated_serve_env
+) -> None:
+    # Arrange
     # Act
-    response = client.get(
-        "/v1/models", headers={"Authorization": "Bearer test-key"}
-    )
+    response = _models_response(gateway_key_env)
     # Assert
     assert response.status_code == 200
-    assert response.json() == {
+
+
+def test_gateway_models_lists_opencode_model_entry(
+    gateway_key_env, isolated_serve_env
+) -> None:
+    # Arrange
+    # Act
+    payload = _models_response(gateway_key_env).json()
+    # Assert
+    assert payload == {
         "object": "list",
         "data": [
             {
@@ -198,8 +238,7 @@ def test_gateway_serves_models_with_opencode_backend(
     }
 
 
-def test_gateway_completions_drive_mock_serve_http(gateway_key_env) -> None:
-    # Arrange
+def _run_mock_serve_completion(gateway_key_env) -> tuple[int, str, list[str]]:
     import http.server
     import threading
 
@@ -252,10 +291,34 @@ def test_gateway_completions_drive_mock_serve_http(gateway_key_env) -> None:
     finally:
         server.shutdown()
         server.server_close()
+    return (
+        response.status_code,
+        response.json()["choices"][0]["message"]["content"],
+        [entry["path"] for entry in seen],
+    )
+
+
+def test_gateway_completions_reports_success_status(gateway_key_env) -> None:
+    # Arrange
+    # Act
+    status, _text, _paths = _run_mock_serve_completion(gateway_key_env)
     # Assert
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "SERVE_SMOKE"
-    assert [entry["path"] for entry in seen] == [
-        "/session",
-        "/session/ses_smoke/message",
-    ]
+    assert status == 200
+
+
+def test_gateway_completions_returns_serve_text(gateway_key_env) -> None:
+    # Arrange
+    # Act
+    _status, text, _paths = _run_mock_serve_completion(gateway_key_env)
+    # Assert
+    assert text == "SERVE_SMOKE"
+
+
+def test_gateway_completions_creates_session_before_messaging(
+    gateway_key_env,
+) -> None:
+    # Arrange
+    # Act
+    _status, _text, paths = _run_mock_serve_completion(gateway_key_env)
+    # Assert
+    assert paths == ["/session", "/session/ses_smoke/message"]
