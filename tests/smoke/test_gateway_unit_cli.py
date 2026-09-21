@@ -20,8 +20,8 @@ from scitex_genai.gateway._unit import UNIT_NAME
 pytestmark = pytest.mark.smoke
 
 
-def test_install_unit_writes_the_unit_file(tmp_path: Path) -> None:
-    # Arrange
+@pytest.fixture
+def installed_unit(tmp_path: Path) -> tuple[subprocess.CompletedProcess, Path]:
     unit_dir = tmp_path / "systemd"
     argv = [
         sys.executable,
@@ -36,16 +36,48 @@ def test_install_unit_writes_the_unit_file(tmp_path: Path) -> None:
         str(unit_dir),
         "--no-enable",
     ]
-
-    # Act
     completed = subprocess.run(
         argv, capture_output=True, text=True, timeout=30, env=dict(os.environ)
     )
+    return completed, unit_dir / UNIT_NAME
+
+
+def test_install_unit_command_exits_successfully(
+    installed_unit: tuple[subprocess.CompletedProcess, Path],
+) -> None:
+    # Arrange
+    completed, _unit = installed_unit
+
+    # Act
+    code = completed.returncode
 
     # Assert
-    unit = unit_dir / UNIT_NAME
-    assert (completed.returncode, unit.is_file()) == (0, True)
+    assert code == 0
+
+
+def test_install_unit_writes_the_unit_file(
+    installed_unit: tuple[subprocess.CompletedProcess, Path],
+) -> None:
+    # Arrange
+    _completed, unit = installed_unit
+
+    # Act
+    written = unit.is_file()
+
+    # Assert
+    assert written is True
+
+
+def test_installed_unit_embeds_exec_start_with_port(
+    installed_unit: tuple[subprocess.CompletedProcess, Path],
+) -> None:
+    # Arrange
+    _completed, unit = installed_unit
+
+    # Act
     text = unit.read_text()
+
+    # Assert
     assert ("ExecStart=" in text, "--port" in text, "18772" in text) == (
         True,
         True,
@@ -53,9 +85,10 @@ def test_install_unit_writes_the_unit_file(tmp_path: Path) -> None:
     )
 
 
-def test_install_unit_refuses_a_second_key_without_a_resolving_shell(
+@pytest.fixture
+def second_install_attempt(
     tmp_path: Path,
-) -> None:
+) -> tuple[subprocess.CompletedProcess, subprocess.CompletedProcess]:
     # Arrange — a first install mints the key into the fake home; pointing
     # the second install at a FRESH home with no resolving key exercises the
     # replace-guard: minting there would rotate every client's key (401s).
@@ -77,20 +110,42 @@ def test_install_unit_refuses_a_second_key_without_a_resolving_shell(
     first = subprocess.run(
         install, capture_output=True, text=True, timeout=30, env=env
     )
-
-    # Act
     fresh_home = tmp_path / "fresh-home"
     env["SCITEX_DIR"] = str(fresh_home)
     second = subprocess.run(
         install, capture_output=True, text=True, timeout=30, env=env
     )
+    return first, second
+
+
+def test_install_unit_first_install_exits_successfully(
+    second_install_attempt: tuple[
+        subprocess.CompletedProcess, subprocess.CompletedProcess
+    ],
+) -> None:
+    # Arrange
+    first, _second = second_install_attempt
+
+    # Act
+    code = first.returncode
 
     # Assert
-    assert first.returncode == 0
-    assert (second.returncode != 0, "401" in (second.stdout + second.stderr)) == (
-        True,
-        True,
-    )
+    assert code == 0
+
+
+def test_install_unit_second_install_refuses_without_resolving_shell(
+    second_install_attempt: tuple[
+        subprocess.CompletedProcess, subprocess.CompletedProcess
+    ],
+) -> None:
+    # Arrange
+    _first, second = second_install_attempt
+
+    # Act
+    outcome = (second.returncode != 0, "401" in (second.stdout + second.stderr))
+
+    # Assert
+    assert outcome == (True, True)
 
 
 def test_sglang_ab_refuses_load_without_the_canary_ack() -> None:

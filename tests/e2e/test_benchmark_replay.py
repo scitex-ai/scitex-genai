@@ -89,16 +89,12 @@ def canary_url() -> Iterator[str]:
     server.server_close()
 
 
-def test_replay_compares_usage_and_cache_telemetry(
-    tmp_path, canary_url: str
-) -> None:
-    # Arrange
+@pytest.fixture
+def replay_rows(tmp_path, canary_url: str) -> list:
     path = tmp_path / "scenario.json"
     path.write_text(json.dumps(SCENARIO))
     scenario = load_scenario(path)
-
-    # Act
-    rows = asyncio.run(
+    return asyncio.run(
         run_scenario(
             scenario,
             endpoint=canary_url,
@@ -107,18 +103,64 @@ def test_replay_compares_usage_and_cache_telemetry(
         )
     )
 
+
+def test_replay_labels_requests_cold_then_warm(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    labels = [row["request_label"] for row in rows]
     # Assert
-    assert [row["request_label"] for row in rows] == ["cold", "warm"]
-    assert [row["prompt_tokens_match"] for row in rows] == [True, True]
-    assert [row["error"] for row in rows] == [None, None]
-    assert rows[0]["cache"] == {
+    assert labels == ["cold", "warm"]
+
+
+def test_replay_matches_expected_prompt_tokens(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    matches = [row["prompt_tokens_match"] for row in rows]
+    # Assert
+    assert matches == [True, True]
+
+
+def test_replay_reports_no_row_errors(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    errors = [row["error"] for row in rows]
+    # Assert
+    assert errors == [None, None]
+
+
+def test_replay_reports_cache_telemetry_for_cold(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    cache = rows[0]["cache"]
+    # Assert
+    assert cache == {
         "cached_tokens": 8,
         "device_hit_tokens": 8,
         "host_hit_tokens": 1,
         "newly_computed_tokens": 1,
     }
-    assert rows[0]["scheduler"] == {"queue_time_s": 0.25}
-    assert rows[0]["request_id"] == "sglang-ab-e2e-r1-00-cold"
+
+
+def test_replay_reports_scheduler_telemetry_for_cold(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    scheduler = rows[0]["scheduler"]
+    # Assert
+    assert scheduler == {"queue_time_s": 0.25}
+
+
+def test_replay_names_cold_request_with_run_id(replay_rows: list) -> None:
+    # Arrange
+    rows = replay_rows
+    # Act
+    request_id = rows[0]["request_id"]
+    # Assert
+    assert request_id == "sglang-ab-e2e-r1-00-cold"
 
 
 def test_replay_without_acknowledgement_sends_nothing(
@@ -129,7 +171,7 @@ def test_replay_without_acknowledgement_sends_nothing(
     path.write_text(json.dumps(SCENARIO))
 
     # Act
-    with pytest.raises(PermissionError, match="isolated-canary"):
+    def act() -> None:
         asyncio.run(
             run_scenario(
                 load_scenario(path),
@@ -139,5 +181,6 @@ def test_replay_without_acknowledgement_sends_nothing(
             )
         )
 
-    # Assert — nothing to assert on the wire (the refusal happens before
-    # any request is built); the raises above IS the assertion.
+    # Assert
+    with pytest.raises(PermissionError, match="isolated-canary"):
+        act()

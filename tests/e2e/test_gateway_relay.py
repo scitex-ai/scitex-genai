@@ -70,7 +70,7 @@ def upstream_url() -> Iterator[str]:
     server.server_close()
 
 
-def test_unit_text_names_the_configured_port(tmp_path) -> None:
+def test_unit_text_embeds_exec_start_with_configured_port(tmp_path) -> None:
     # Arrange — the unit is what the gateway actually execs, so the port
     # baked in here is the port the deployment serves.
     config = tmp_path / "config.yaml"
@@ -85,7 +85,17 @@ def test_unit_text_names_the_configured_port(tmp_path) -> None:
         True,
         True,
     )
-    assert UNIT_NAME == "scitex-genai-gateway.service"
+
+
+def test_unit_name_identifies_the_gateway_service() -> None:
+    # Arrange
+    expected = "scitex-genai-gateway.service"
+
+    # Act
+    actual = UNIT_NAME
+
+    # Assert
+    assert actual == expected
 
 
 async def _post(client: httpx.AsyncClient, headers: dict) -> httpx.Response:
@@ -96,8 +106,8 @@ async def _post(client: httpx.AsyncClient, headers: dict) -> httpx.Response:
     )
 
 
-def test_relay_returns_the_upstream_bytes(upstream_url: str) -> None:
-    # Arrange
+@pytest.fixture
+def relay_pair(upstream_url: str) -> tuple[httpx.Response, httpx.Response]:
     backend = InferenceBackend(InferenceUpstreamPool.from_urls(upstream_url))
     app = create_app(backend, api_key=API_KEY)
 
@@ -111,12 +121,33 @@ def test_relay_returns_the_upstream_bytes(upstream_url: str) -> None:
                 denied = await _post(client, {})
                 return ok, denied
 
+    return asyncio.run(run())
+
+
+def test_relay_returns_upstream_bytes_with_success_status(
+    relay_pair: tuple[httpx.Response, httpx.Response],
+) -> None:
+    # Arrange
+    ok, _denied = relay_pair
+
     # Act
-    ok, denied = asyncio.run(run())
+    outcome = (ok.status_code, "hello-e2e" in ok.text)
 
     # Assert
-    assert (ok.status_code, "hello-e2e" in ok.text) == (200, True)
-    assert denied.status_code == 401
+    assert outcome == (200, True)
+
+
+def test_relay_rejects_requests_without_bearer_key(
+    relay_pair: tuple[httpx.Response, httpx.Response],
+) -> None:
+    # Arrange
+    _ok, denied = relay_pair
+
+    # Act
+    status = denied.status_code
+
+    # Assert
+    assert status == 401
 
 
 def test_health_reports_the_real_upstream(upstream_url: str) -> None:
