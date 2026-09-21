@@ -25,6 +25,7 @@ from ._inference import (
     InferenceMemberResumeError,
     estimate_input_tokens,
 )
+from ._opencode import OpenCodeBackend
 from ._secrets import resolve_gateway_key
 
 
@@ -171,15 +172,41 @@ def _openai_sse_error(exc: GatewayError) -> str:
     return f"event: error\ndata: {json.dumps(error, separators=(',', ':'))}\n\n"
 
 
+def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize public Responses shorthand into Codex transport input items."""
+    value = body.get("input")
+    if isinstance(value, str):
+        value = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": value}],
+            }
+        ]
+    elif isinstance(value, list):
+        normalized = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("content"), str):
+                content_type = (
+                    "output_text" if item.get("role") == "assistant" else "input_text"
+                )
+                item = {
+                    **item,
+                    "content": [{"type": content_type, "text": item["content"]}],
+                }
+            normalized.append(item)
+        value = normalized
+    return {**body, "input": value, "stream": True, "store": False}
+
+
 def create_app(
-    backend: CodexBackend | InferenceBackend,
+    backend: CodexBackend | InferenceBackend | OpenCodeBackend,
     *,
     api_key: str | None = None,
     identity: GatewayIdentity | None = None,
 ) -> Any:
     """Create the FastAPI app without importing server dependencies at import time.
 
-    Two kinds of backend, one surface. A :class:`CodexBackend` has
+    Three kinds of backend, one surface. A :class:`CodexBackend` has
     ``/v1/messages`` translated to the Codex Responses protocol and exposes
     ``/v1/responses`` for a client that already speaks it — the public
     Responses shorthand is normalized and the Codex transport's
@@ -190,8 +217,11 @@ def create_app(
     additionally relays ``POST /v1/chat/completions`` and ``POST
     /v1/responses`` untouched (the OpenAI protocol, for Codex — no hoist, no
     translation) plus ``GET /v1/*`` so ``/v1/models`` and the like reach the
-    upstream as they did through the hoist proxy. Authentication, ``/health``
-    and ``/v1/messages/count_tokens`` are the same for both.
+    upstream as they did through the hoist proxy. An :class:`OpenCodeBackend`
+    serves ``POST /v1/chat/completions`` by driving a local ``opencode
+    serve`` harness (the app identity Zen free SKUs demand) and answering in
+    the OpenAI envelope. Authentication, ``/health`` and
+    ``/v1/messages/count_tokens`` are the same for all three.
     """
     try:
         from fastapi import FastAPI, Request
@@ -203,6 +233,7 @@ def create_app(
     process_identity = identity or gateway_identity()
 
     relaying = isinstance(backend, InferenceBackend)
+    opencode = isinstance(backend, OpenCodeBackend)
 
     @asynccontextmanager
     async def lifespan(app: Any) -> AsyncIterator[None]:
@@ -242,6 +273,13 @@ def create_app(
 
     @app.get("/health")
     async def health() -> Any:
+        if opencode:
+            assert isinstance(backend, OpenCodeBackend)
+            return {
+                "status": "ok",
+                "provider": "opencode-serve",
+                "serve_url": backend.serve_url,
+            }
         if relaying:
             members = backend.pool.status()
             if not backend.active_health_probe:
@@ -366,6 +404,75 @@ def create_app(
             )
         body = await request.json()
         return {"input_tokens": _estimate_tokens(body)}
+
+    if opencode:
+        assert isinstance(backend, OpenCodeBackend)
+
+        @app.post("/v1/chat/completions")
+        async def opencode_chat_completions(request: Request) -> Any:
+            """OpenAI chat completions through the local opencode harness."""
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    raise GatewayError("Request body must be a JSON object")
+                if not isinstance(body.get("model"), str) or not body["model"]:
+                    raise GatewayError("Chat completions request requires a model")
+            except (ValueError, GatewayError) as exc:
+                return JSONResponse(
+                    _openai_error(str(exc), "invalid_request_error", 400), 400
+                )
+            try:
+                result = await backend.complete(body)
+            except UpstreamError as exc:
+                return JSONResponse(
+                    _openai_error(str(exc), exc.error_type, exc.status_code),
+                    exc.status_code,
+                )
+            except GatewayError as exc:
+                return JSONResponse(_openai_error(str(exc), "api_error", 503), 503)
+            import time as _time
+            import uuid as _uuid
+
+            completion_id = _uuid.uuid4().hex[:12]
+            return {
+                "id": f"chatcmpl-{completion_id}",
+                "object": "chat.completion",
+                "created": int(_time.time()),
+                "model": result["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result["text"]},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+
+        @app.get("/v1/models")
+        async def opencode_models(request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "muse-spark-1.3-contributor-free",
+                        "object": "model",
+                        "owned_by": "opencode",
+                    }
+                ],
+            }
+
+        return app
 
     if relaying:
 

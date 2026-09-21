@@ -16,6 +16,7 @@ from ._inference import (
     InferenceUpstreamPool,
     hoist_system,
 )
+from ._opencode import OpenCodeBackend, openai_messages_to_text
 from ._server import create_app
 from ._usage import CodexUsageClient
 
@@ -34,8 +35,10 @@ __all__ = [
     "InferenceBackend",
     "InferenceUpstream",
     "InferenceUpstreamPool",
+    "OpenCodeBackend",
     "anthropic_to_codex",
     "codex_events_to_anthropic",
     "create_app",
     "hoist_system",
+    "openai_messages_to_text",
 ]
