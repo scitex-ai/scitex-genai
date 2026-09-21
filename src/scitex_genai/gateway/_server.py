@@ -17,6 +17,7 @@ from ._anthropic import (
 from ._codex import CodexBackend
 from ._errors import GatewayError, UpstreamError
 from ._inference import InferenceBackend
+from ._opencode import OpenCodeBackend
 from ._secrets import resolve_gateway_key
 
 
@@ -70,20 +71,51 @@ def _estimate_tokens(body: dict[str, Any]) -> int:
     return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
 
 
+def _codex_responses_payload(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize public Responses shorthand into Codex transport input items."""
+    value = body.get("input")
+    if isinstance(value, str):
+        value = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": value}],
+            }
+        ]
+    elif isinstance(value, list):
+        normalized = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("content"), str):
+                content_type = (
+                    "output_text" if item.get("role") == "assistant" else "input_text"
+                )
+                item = {
+                    **item,
+                    "content": [{"type": content_type, "text": item["content"]}],
+                }
+            normalized.append(item)
+        value = normalized
+    return {**body, "input": value, "stream": True, "store": False}
+
+
 def create_app(
-    backend: CodexBackend | InferenceBackend, *, api_key: str | None = None
+    backend: CodexBackend | InferenceBackend | OpenCodeBackend,
+    *,
+    api_key: str | None = None,
 ) -> Any:
     """Create the FastAPI app without importing server dependencies at import time.
 
-    Two kinds of backend, one surface. A :class:`CodexBackend` has
+    Three kinds of backend, one surface. A :class:`CodexBackend` has
     ``/v1/messages`` translated to the Codex Responses protocol; an
     :class:`InferenceBackend` has it relayed verbatim (after the system hoist)
     to a pool of inference upstreams that speak BOTH protocols, and
     additionally relays ``POST /v1/chat/completions`` and ``POST
     /v1/responses`` untouched (the OpenAI protocol, for Codex — no hoist, no
     translation) plus ``GET /v1/*`` so ``/v1/models`` and the like reach the
-    upstream as they did through the hoist proxy. Authentication, ``/health``
-    and ``/v1/messages/count_tokens`` are the same for both.
+    upstream as they did through the hoist proxy. An :class:`OpenCodeBackend`
+    serves ``POST /v1/chat/completions`` by driving a local ``opencode
+    serve`` harness (the app identity Zen free SKUs demand) and answering in
+    the OpenAI envelope. Authentication, ``/health`` and
+    ``/v1/messages/count_tokens`` are the same for all three.
     """
     try:
         from fastapi import FastAPI, Request
@@ -94,6 +126,7 @@ def create_app(
     expected_key = api_key or resolve_gateway_key().value
 
     relaying = isinstance(backend, InferenceBackend)
+    opencode = isinstance(backend, OpenCodeBackend)
 
     @asynccontextmanager
     async def lifespan(app: Any) -> AsyncIterator[None]:
@@ -125,6 +158,13 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        if opencode:
+            assert isinstance(backend, OpenCodeBackend)
+            return {
+                "status": "ok",
+                "provider": "opencode-serve",
+                "serve_url": backend.serve_url,
+            }
         if relaying:
             return {
                 "status": "ok",
@@ -143,6 +183,75 @@ def create_app(
             return JSONResponse(_anthropic_error("Invalid API key", "authentication_error"), 401)
         body = await request.json()
         return {"input_tokens": _estimate_tokens(body)}
+
+    if opencode:
+        assert isinstance(backend, OpenCodeBackend)
+
+        @app.post("/v1/chat/completions")
+        async def opencode_chat_completions(request: Request) -> Any:
+            """OpenAI chat completions through the local opencode harness."""
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    raise GatewayError("Request body must be a JSON object")
+                if not isinstance(body.get("model"), str) or not body["model"]:
+                    raise GatewayError("Chat completions request requires a model")
+            except (ValueError, GatewayError) as exc:
+                return JSONResponse(
+                    _openai_error(str(exc), "invalid_request_error", 400), 400
+                )
+            try:
+                result = await backend.complete(body)
+            except UpstreamError as exc:
+                return JSONResponse(
+                    _openai_error(str(exc), exc.error_type, exc.status_code),
+                    exc.status_code,
+                )
+            except GatewayError as exc:
+                return JSONResponse(_openai_error(str(exc), "api_error", 503), 503)
+            import time as _time
+            import uuid as _uuid
+
+            completion_id = _uuid.uuid4().hex[:12]
+            return {
+                "id": f"chatcmpl-{completion_id}",
+                "object": "chat.completion",
+                "created": int(_time.time()),
+                "model": result["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": result["text"]},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+
+        @app.get("/v1/models")
+        async def opencode_models(request: Request) -> Any:
+            if not authorized(request):
+                return JSONResponse(
+                    _openai_error("Invalid API key", "authentication_error", 401),
+                    401,
+                )
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "muse-spark-1.3-contributor-free",
+                        "object": "model",
+                        "owned_by": "opencode",
+                    }
+                ],
+            }
+
+        return app
 
     if relaying:
 
@@ -172,6 +281,7 @@ def create_app(
                 relayed.body,
                 status_code=relayed.status_code,
                 media_type=relayed.content_type,
+                headers=relayed.feedback_headers,
             )
 
         @app.post("/v1/messages")
@@ -196,6 +306,66 @@ def create_app(
             return await relay(request)
 
         return app
+
+    @app.post("/v1/responses")
+    async def responses(request: Request) -> Any:
+        """Expose the native Codex Responses transport to OpenAI clients."""
+        if not authorized(request):
+            return JSONResponse(
+                _openai_error("Invalid API key", "authentication_error", 401),
+                401,
+            )
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise GatewayError("Request body must be a JSON object")
+            if not isinstance(body.get("model"), str) or not body["model"]:
+                raise GatewayError("Responses request requires a model")
+            if "input" not in body:
+                raise GatewayError("Responses request requires input")
+            requested_stream = body.get("stream") is True
+            payload = _codex_responses_payload(body)
+            session_id = _session_id(request, body)
+        except (ValueError, GatewayError) as exc:
+            return JSONResponse(
+                _openai_error(str(exc), "invalid_request_error", 400), 400
+            )
+
+        if requested_stream:
+
+            async def stream_response() -> AsyncIterator[str]:
+                try:
+                    async for event in backend.stream(
+                        payload, session_id=session_id
+                    ):
+                        event_type = str(event.get("type", "message"))
+                        data = json.dumps(event, separators=(",", ":"))
+                        yield f"event: {event_type}\ndata: {data}\n\n"
+                except GatewayError as exc:
+                    error = _openai_error(str(exc), "api_error", 503)
+                    yield f"event: error\ndata: {json.dumps(error)}\n\n"
+
+            return StreamingResponse(
+                stream_response(), media_type="text/event-stream"
+            )
+
+        try:
+            completed = None
+            async for event in backend.stream(payload, session_id=session_id):
+                if event.get("type") == "response.completed":
+                    candidate = event.get("response")
+                    if isinstance(candidate, dict):
+                        completed = candidate
+            if completed is None:
+                raise GatewayError("Codex response ended without response.completed")
+            return completed
+        except UpstreamError as exc:
+            return JSONResponse(
+                _openai_error(str(exc), exc.error_type, exc.status_code),
+                exc.status_code,
+            )
+        except GatewayError as exc:
+            return JSONResponse(_openai_error(str(exc), "api_error", 503), 503)
 
     @app.post("/v1/messages")
     async def messages(request: Request) -> Any:
