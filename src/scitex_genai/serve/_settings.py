@@ -3,7 +3,7 @@
 Everything an engine launch needs that is about the SITE rather than the
 MODEL -- the scratch base, the log directory, the node-local cache root, the
 vLLM and LiteLLM binaries, the bastion the reverse tunnel climbs, the LiteLLM
-master key -- lives here, read through scitex-config (direct -> file ->
+primary key -- lives here, read through scitex-config (direct -> file ->
 environment -> default), and never in the package. Unlike the gateway there
 are no usable defaults for the base or the bastion, so a missing section is
 an error that names the file, not a silent launch into the wrong place.

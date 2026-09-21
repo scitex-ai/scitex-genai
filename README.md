@@ -33,55 +33,9 @@
 | # | Problem | Solution |
 |---|---------|----------|
 | 1 | **Per-provider boilerplate** — every project re-writes thin wrappers around `openai`, `anthropic`, `google.genai`, `groq`, etc., each with subtly different cost / streaming / history semantics. | **Unified `GenAI` factory** — same call shape across OpenAI, Anthropic, Google, Groq, DeepSeek, Perplexity, Llama. Cost tracking, conversation history, and message formatting are provider-agnostic. |
-| 2 | **Modality fragmentation** — generative AI is splintering by modality (text, agents, image, audio, video, embeddings, multimodal); ad-hoc namespaces age badly. | **Modality-organised layout** — `scitex_genai.{llm,agent,image,audio,video,embed,multimodal}` is the public top-level shape from day one. Reserved namespaces import successfully but raise `NotImplementedError` until features land, so import paths never need to migrate. |
-| 3 | **Heavy LLM SDKs leak into ML workflows** — pulling in `scikit-learn` shouldn't pull `openai` and friends, and vice versa. | **Split package** — classical / deep ML lives in [`scitex-ml`](https://github.com/ywatanabe1989/scitex-ml); `scitex-genai` carries only generative-AI deps. |
-| 4 | **Future-proofing for litellm + Ollama** — locking the public API to one provider SDK closes off cheap routing improvements. | **Litellm-ready façade** — the planned `llm` rewrite routes through [litellm](https://github.com/BerriAI/litellm), giving 100+ providers with one OpenAI-compatible interface (Ollama is just `model="ollama/llama3"`) without changing the `GenAI(...)` call surface. |
-
-## Installation
-
-```bash
-pip install scitex-genai            # core (LLM providers)
-pip install scitex-genai[agent]     # + claude-agent-sdk (forthcoming `agent` submodule)
-pip install scitex-genai[litellm]   # + litellm router (preview)
-pip install scitex-genai[gateway]   # + Anthropic-compatible model gateway
-pip install scitex-genai[ollama]    # + local ollama
-pip install scitex-genai[all]       # everything available today
-```
-
-Through the umbrella: `pip install scitex[genai]`. Requires Python ≥ 3.10.
-
-### Claude Code with a Codex subscription backend
-
-The gateway keeps Claude Code as the agent harness. It translates only the
-model protocol and never executes tools returned by Codex.
-
-```bash
-export SCITEX_GENAI_GATEWAY_API_KEY="$(openssl rand -hex 32)"
-scitex-genai-gateway --host 127.0.0.1 --port 8765
-```
-
-By default the gateway discovers
-`~/.scitex/agent-container/accounts/openai/*/auth.json`. Set the
-path-separated `SCITEX_GENAI_CODEX_HOMES` only to override that store. Each
-configured directory contains an `auth.json` created by `codex login`.
-Tokens remain in those files and are refreshed atomically. Account selection
-is sticky per session, ranks accounts by Codex usage-window headroom, spreads
-concurrent sessions, and rotates away from rate-limited accounts. The rotation
-selector is invoked even for a one-account pool.
-
-Point Claude Code at the service without changing its hooks, skills, tools, or
-project instructions:
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
-export ANTHROPIC_API_KEY="$SCITEX_GENAI_GATEWAY_API_KEY"
-export ANTHROPIC_MODEL="gpt-5.4"
-claude
-```
-
-This integration uses the Codex client subscription transport rather than the
-separately billed OpenAI API. See the gateway skill for its protocol coverage
-and operational limitations.
+| 2 | **Modality fragmentation** — generative AI is splintering by modality (text, agents, image, audio, video, embeddings, multimodal); ad-hoc namespaces age badly. | **Modality-organised layout** — `scitex_genai.{llm,…,multimodal}` is the public shape from day one; reserved namespaces raise `NotImplementedError` until features land. |
+| 3 | **Heavy SDKs in ML workflows** — pulling `scikit-learn` shouldn't pull `openai` and friends, or vice versa. | **Split package** — classical / deep ML lives in [`scitex-ml`](https://github.com/ywatanabe1989/scitex-ml); `scitex-genai` carries only generative-AI deps. |
+| 4 | **Future-proofing for litellm + Ollama** — locking the public API to one provider SDK closes off cheap routing improvements. | **Litellm-ready façade** — a planned `llm` rewrite routes through [litellm](https://github.com/BerriAI/litellm) for 100+ providers behind the same `GenAI(...)` call surface. |
 
 ## Quick Start
 
@@ -123,33 +77,86 @@ flowchart LR
     Tracker --> Out[ai&#40;...&#41; · ai.cost · ai.history]
 ```
 
+<p align="center"><sub><b>Figure 1.</b> Provider dispatch: one <code>GenAI(model)</code> call shape routes to any supported LLM backend, with token usage and cost tracked per call.</sub></p>
+
 A second `examples/example_genai.py` runs the same flow as a script and
 is wired into `tests/examples/test_example_genai.py` for CI smoke
 coverage.
 
+## Installation
+
+```bash
+uv pip install "scitex-genai[all]"
+```
+
+Through the umbrella: `uv pip install "scitex[genai]"`. Requires Python ≥ 3.10.
+
+<details>
+<summary><b>Per-extra installs</b></summary>
+
+<br>
+
+| Extra | Pulls in |
+|---|---|
+| `agent` | `claude-agent-sdk` (forthcoming `agent` submodule) |
+| `litellm` | `litellm` router (preview) |
+| `gateway` | Anthropic-compatible model gateway (`fastapi`, `uvicorn`) |
+| `ollama` | local `ollama` |
+| `serve` | local model serving (`scitex-hpc`) |
+| `benchmark` | SGLang A/B harness (`httpx`) |
+| `image` | image payload helpers (`Pillow`) |
+
+</details>
+
+### Claude Code with a Codex subscription backend
+
+The gateway keeps Claude Code as the agent harness. It translates only the
+model protocol and never executes tools returned by Codex.
+
+```bash
+export SCITEX_GENAI_GATEWAY_API_KEY="$(openssl rand -hex 32)"
+scitex-genai-gateway --host 127.0.0.1 --port 8765
+```
+
+By default the gateway discovers
+`~/.scitex/agent-container/accounts/openai/*/auth.json`. Set the
+path-separated `SCITEX_GENAI_CODEX_HOMES` only to override that store. Each
+configured directory contains an `auth.json` created by `codex login`.
+Tokens remain in those files and are refreshed atomically. Account selection
+is sticky per session, ranks accounts by Codex usage-window headroom, spreads
+concurrent sessions, and rotates away from rate-limited accounts. The rotation
+selector is invoked even for a one-account pool.
+
+Point Claude Code at the service without changing its hooks, skills, tools, or
+project instructions:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
+export ANTHROPIC_API_KEY="$SCITEX_GENAI_GATEWAY_API_KEY"
+export ANTHROPIC_MODEL="gpt-5.4"
+claude
+```
+
+This integration uses the Codex client subscription transport rather than the
+separately billed OpenAI API. See the gateway skill for its protocol coverage
+and operational limitations.
+
 ## Architecture
 
-`scitex-genai` is organised top-down by **modality**, not by provider:
+`scitex-genai` is organised top-down by **modality**, not by provider —
+one `GenAI(model)` call shape dispatches to any LLM backend, cost and
+history tracked centrally (Figure 1).
 
+```mermaid
+flowchart TB
+    User[your code] --> GenAI[scitex_genai.llm.GenAI]
+    GenAI --> LLM[llm/ provider factory]
+    GenAI --> GW[gateway/ Anthropic-Codex bridge]
+    GenAI --> RSV[reserved: agent image audio video embed multimodal]
+    LLM --> Out[ai&#40;...&#41; · ai.cost · ai.history]
 ```
-scitex-python (umbrella)
-    └── scitex.genai ── thin sys.modules-aliasing shim
-                        └── scitex_genai (this package)
-                              ├── llm/         provider factory ``GenAI``
-                              │                 ├── _BaseGenAI         common interface
-                              │                 ├── _OpenAI / _Anthropic / _Google /
-                              │                 │   _Groq / _DeepSeek / _Perplexity / _Llama
-                              │                 ├── _PARAMS            model catalogue
-                              │                 ├── _calc_cost         token-cost accounting
-                              │                 └── _format_output_func text/markdown formatting
-                              ├── gateway/     structured Anthropic ↔ Codex protocol bridge
-                              ├── agent/        reserved (claude-agent-sdk wrapper planned)
-                              ├── image/        reserved
-                              ├── audio/        reserved
-                              ├── video/        reserved
-                              ├── embed/        reserved
-                              └── multimodal/   reserved
-```
+
+<p align="center"><sub><b>Figure 2.</b> Package layout by modality: the implemented <code>llm</code> factory and <code>gateway</code> bridge plus reserved namespaces that raise <code>NotImplementedError</code> until features land.</sub></p>
 
 Reserved modality namespaces import successfully but raise
 `NotImplementedError` on attribute access, so the public import paths
@@ -160,7 +167,9 @@ to demote them to optional and add Ollama out of the box.
 
 ## Modality layout
 
-| Submodule                   | Status        | Notes                                                |
+<p align="center"><sub><b>Table 1.</b> Submodule status: implemented, reserved, and planned namespaces.</sub></p>
+
+| Submodule | Status | Notes |
 | --------------------------- | ------------- | ---------------------------------------------------- |
 | `scitex_genai.llm`          | ✅ implemented | Provider factory `GenAI`. Litellm-backed in a follow-up. |
 | `scitex_genai.agent`        | 🔒 reserved    | Wrapper over `claude-agent-sdk` and friends planned. |

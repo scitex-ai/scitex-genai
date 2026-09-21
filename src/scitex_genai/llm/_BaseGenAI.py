@@ -240,7 +240,12 @@ class BaseGenAI(ABC):
     def _ensure_base64_encoding(image, max_size=512):
         import io
 
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise ImportError(
+                "image input needs pillow: pip install scitex-genai[image]"
+            ) from exc
 
         def resize_image(img):
             # Calculate new dimensions while maintaining aspect ratio

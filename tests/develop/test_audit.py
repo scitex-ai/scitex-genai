@@ -28,4 +28,7 @@ def test_audit_all_clean():
     pytest.importorskip("scitex_dev")
     from scitex_dev.testing import audit_all_for_package
 
-    audit_all_for_package('scitex-genai')
+    # audit_all_for_package returns None and raises/asserts non-zero exit
+    # internally — asserting the None return keeps this gate a real
+    # behavioural test (PS-206b) rather than an import smoke.
+    assert audit_all_for_package("scitex-genai") is None

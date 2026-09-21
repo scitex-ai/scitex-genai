@@ -47,7 +47,9 @@ dependencies = [
     "litellm",
     "markdown2",
     "matplotlib",
-    "Pillow",
+    # PS-149: Pillow is imported lazily in exactly one feature helper
+    # (llm/_BaseGenAI._ensure_base64_encoding) -- keep it out of the
+    # minimal install; image features ride on `scitex-genai[image]`.
     "pydantic>=2.0",
     # PS-233: unguarded runtime imports on default paths (gateway relay,
     # llm providers, benchmark runner) -- minimal installs must include these.
@@ -65,7 +67,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Forward-looking extras — wire up as modality submodules land.
+# Optional dependency groups. Still-reserved modality namespaces (audio,
+# video, embed, multimodal) declare no extras until real deps land —
+# install `scitex-genai[all]` for everything available today.
 agent = [
     "claude-agent-sdk",
 ]
@@ -86,11 +90,12 @@ gateway = [
 benchmark = [
     "httpx>=0.27",
 ]
-image = []
-audio = []
-video = []
-embed = []
-multimodal = []
+image = [
+    # PS-149: Pillow is imported lazily in exactly one feature helper
+    # (llm/_BaseGenAI._ensure_base64_encoding) -- image features ride
+    # on `scitex-genai[image]`, not on the minimal install.
+    "Pillow",
+]
 dev = [
     "scitex-hpc>=0.8.1",
     "fastapi>=0.110",
@@ -123,11 +128,14 @@ docs = [
 ]
 all = [
     "scitex-genai[agent]",
+    "scitex-genai[benchmark]",
     "scitex-genai[dev]",
     "scitex-genai[docs]",
     "scitex-genai[gateway]",
+    "scitex-genai[image]",
     "scitex-genai[litellm]",
     "scitex-genai[ollama]",
+    "scitex-genai[serve]",
 ]
 
 [project.scripts]
