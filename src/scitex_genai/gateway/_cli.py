@@ -41,6 +41,7 @@ from ._inference import (
     announce,
     telemetry_enabled,
 )
+from ._opencode import OpenCodeBackend
 from ._rollout import (
     DEFAULT_HEALTH_TIMEOUT_S,
     RolloutError,
@@ -168,6 +169,14 @@ def _add_settings_args(
         help=(
             "Request SGLang per-tier cache details on supported OpenAI routes "
             "(default: gateway.inference_cache_report_enabled, else disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--opencode-serve-url",
+        default=default,
+        help=(
+            "opencode serve base URL (default: gateway.opencode_serve_url, "
+            "else $SCITEX_GENAI_OPENCODE_SERVE_URL, else off)."
         ),
     )
 
@@ -454,8 +463,15 @@ def main(
             args.inference_continuation_qos_min_preempt_tokens
         ),
         inference_cache_report_enabled=args.inference_cache_report,
+        opencode_serve_url=args.opencode_serve_url,
     )
-    if settings.external_provider is not None:
+    if settings.opencode_serve_url:
+        backend = OpenCodeBackend(serve_url=settings.opencode_serve_url)
+        log.info(
+            "scitex-genai-gateway: opencode serve "
+            f"{settings.opencode_serve_url}; Zen free SKUs through the local harness"
+        )
+    elif settings.external_provider is not None:
         external = settings.external_provider
         upstream_key = os.getenv(external.upstream_auth_token_env, "").strip()
         if not upstream_key:

@@ -439,7 +439,7 @@ def create_app(
             import uuid as _uuid
 
             completion_id = _uuid.uuid4().hex[:12]
-            return {
+            completion = {
                 "id": f"chatcmpl-{completion_id}",
                 "object": "chat.completion",
                 "created": int(_time.time()),
@@ -453,6 +453,67 @@ def create_app(
                 ],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
+            if body.get("stream") is True:
+                chunk_id = completion["id"]
+                created = completion["created"]
+                model = completion["model"]
+                text = result["text"]
+
+                def _chunk(payload: dict[str, Any]) -> str:
+                    return (
+                        "data: "
+                        + json.dumps(payload, separators=(",", ":"))
+                        + "\n\n"
+                    )
+
+                async def stream_opencode() -> AsyncIterator[str]:
+                    yield _chunk(
+                        {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant"},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                    yield _chunk(
+                        {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                    yield _chunk(
+                        {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {"index": 0, "delta": {}, "finish_reason": "stop"}
+                            ],
+                        }
+                    )
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    stream_opencode(), media_type="text/event-stream"
+                )
+            return completion
 
         @app.get("/v1/models")
         async def opencode_models(request: Request) -> Any:
