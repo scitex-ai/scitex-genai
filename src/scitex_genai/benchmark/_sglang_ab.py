@@ -16,8 +16,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+import scitex_logging as slogging
+
 ACK_FLAG = "--i-understand-this-sends-load-to-an-isolated-canary"
 CRASH_PROBE_ACK_FLAG = "--i-understand-this-may-crash-the-isolated-canary"
+
+log = slogging.getLogger(__name__)
 _CACHE_KEYS = {
     "cached_tokens",
     "cache_hit_tokens",
@@ -378,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
-        print(f"scitex-genai-sglang-ab: {exc}", file=sys.stderr)
+        log.error(f"scitex-genai-sglang-ab: {exc}")
         return 2
     lines = _jsonl(results)
     if args.output:

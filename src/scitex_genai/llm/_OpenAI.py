@@ -11,8 +11,11 @@ THIS_FILE = "/home/ywatanabe/proj/scitex_repo/src/scitex/ai/_gen_ai/_OpenAI.py"
 import os
 
 from openai import OpenAI as _OpenAI
+import scitex_logging as slogging
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Functions & Classes"""
 
@@ -196,7 +199,7 @@ def main() -> None:
         api_key=os.getenv("OPENAI_API_KEY"),
     )
 
-    print(ai("hi, could you tell me what is in the pic?"))
+    log.info(ai("hi, could you tell me what is in the pic?"))
 
     # print(
     #     ai(

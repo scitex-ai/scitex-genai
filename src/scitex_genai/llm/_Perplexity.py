@@ -20,13 +20,15 @@ Prerequisites:
 """Imports"""
 import os
 import sys
-from pprint import pprint
 from typing import Dict, Generator, List, Optional
 
 import matplotlib.pyplot as plt
 from openai import OpenAI
+import scitex_logging as slogging
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Functions & Classes"""
 
@@ -87,7 +89,7 @@ class Perplexity(BaseGenAI):
             temperature=self.temperature,
         )
 
-        print(output)
+        log.debug(output)
 
         out_text = output.choices[0].message.content
         self.input_tokens += output.usage.prompt_tokens
@@ -111,7 +113,7 @@ class Perplexity(BaseGenAI):
                 continue
 
             if chunk.choices[0].finish_reason == "stop":
-                print(chunk.choices)
+                log.debug(chunk.choices)
                 try:
                     self.input_tokens += chunk.usage.prompt_tokens
                     self.output_tokens += chunk.usage.completion_tokens
@@ -149,7 +151,7 @@ def main() -> None:
     ]
     ai = GenAI(model=models[0], api_key=os.getenv("PERPLEXITY_API_KEY"), stream=False)
     out = ai("tell me about important citations for epilepsy prediction with citations")
-    print(out)
+    log.info(out)
 
 
 def main():
@@ -186,7 +188,7 @@ def main():
 
     response = requests.request("POST", url, json=payload, headers=headers)
 
-    pprint(response.json()["citations"])
+    log.info(response.json()["citations"])
     # pprint(response["citations"])
 
     # print(response.url)

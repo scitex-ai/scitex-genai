@@ -21,6 +21,8 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
+import scitex_logging as slogging
+
 from ._accounts import CodexAccountPool
 from ._codex import CodexBackend, CodexTransport
 from ._drain import (
@@ -72,6 +74,8 @@ RESTART_UNIT = "restart-unit"
 INSTALL_ROLLOUT = "install-rollout-units"
 ROLLOUT = "rollout-generation"
 ROLLBACK = "rollback-generation"
+
+log = slogging.getLogger(__name__)
 
 
 def _add_settings_args(
@@ -278,10 +282,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _telemetry_sink():
-    """Stdout when ``HOIST_PREFIX_TELEMETRY`` asks for it, else off."""
+    """Log lines when ``HOIST_PREFIX_TELEMETRY`` asks for it, else off."""
     if not telemetry_enabled(os.getenv(PREFIX_TELEMETRY_ENV, "")):
         return None
-    return lambda line: print(line, flush=True)
+    return lambda line: log.info(line)
 
 
 def _persist_key(*, replacing_a_unit: bool) -> None:
@@ -330,7 +334,7 @@ def _persist_key(*, replacing_a_unit: bool) -> None:
     # (kept; nothing written)" and wrote the shell-free unit anyway, leaving
     # exactly that gap open until the key was written by hand.
     stored = key.path if key.origin != "environment" else write_key(key.value)
-    print(f"scitex-genai-gateway: key {key.origin} -> {stored}", flush=True)
+    log.info(f"scitex-genai-gateway: key {key.origin} -> {stored}")
 
 
 def _install_unit(args: argparse.Namespace) -> None:
@@ -355,7 +359,7 @@ def _install_unit(args: argparse.Namespace) -> None:
         enable=not args.no_enable,
     )
     state = "written only" if args.no_enable else "reloaded and enabled --now"
-    print(f"scitex-genai-gateway: {UNIT_NAME} -> {path} ({state})", flush=True)
+    log.info(f"scitex-genai-gateway: {UNIT_NAME} -> {path} ({state})")
 
 
 def main(
@@ -392,10 +396,9 @@ def main(
             current_socket=default_current_socket_path(),
             unit_dir=args.unit_dir,
         )
-        print(
+        log.info(
             "scitex-genai-gateway: rollout frontend written but not started: "
             + ", ".join(str(path) for path in paths),
-            flush=True,
         )
         return
     if args.command in {ROLLOUT, ROLLBACK}:
@@ -469,7 +472,7 @@ def main(
         backend = ExternalProviderBackend(
             pool,
             timeout_s=settings.inference_timeout_s,
-            journal=lambda line: print(line, flush=True),
+            journal=lambda line: log.info(line),
             policy=ExternalProviderPolicy(
                 provider=external.provider,
                 upstream_api_key=upstream_key,
@@ -486,11 +489,10 @@ def main(
                 output_usd_per_million_tokens=external.output_usd_per_million_tokens,
             ),
         )
-        print(
+        log.info(
             "scitex-genai-gateway: external provider "
             f"{external.provider} -> {external.upstream}; outbound model policy: "
             f"{external.canonical_model} only",
-            flush=True,
         )
     elif settings.inference_upstreams:
         pool = InferenceUpstreamPool.from_specs(
@@ -516,7 +518,7 @@ def main(
             pool,
             timeout_s=settings.inference_timeout_s,
             telemetry_sink=_telemetry_sink(),
-            journal=lambda line: print(line, flush=True),
+            journal=lambda line: log.info(line),
             continuation_qos_enabled=(settings.inference_continuation_qos_enabled),
             continuation_qos_max_retries=(
                 settings.inference_continuation_qos_max_retries
@@ -528,12 +530,12 @@ def main(
             cache_admission_settings=settings.cache_admission,
             admission_history_path=default_admission_history_path(),
         )
-        print(announce(settings.host, settings.port, pool), flush=True)
+        log.info(announce(settings.host, settings.port, pool))
     else:
         codex_pool = CodexAccountPool.discover()
         backend = CodexBackend(codex_pool, CodexTransport(base_url=args.codex_base_url))
     key = resolve_gateway_key(create=True)
-    print(f"scitex-genai-gateway: key {key.origin}", flush=True)
+    log.info(f"scitex-genai-gateway: key {key.origin}")
     identity = gateway_identity(
         build=args.gateway_build,
         incarnation=args.gateway_incarnation,

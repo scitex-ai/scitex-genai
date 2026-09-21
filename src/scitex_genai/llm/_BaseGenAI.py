@@ -17,10 +17,13 @@ from typing import Any, Dict, Generator, List, Optional, Union
 import matplotlib.pyplot as plt
 import numpy as np
 from scitex_io import load
+import scitex_logging as slogging
 
 from ._calc_cost import calc_cost
 from ._format_output_func import format_output_func
 from ._PARAMS import MODELS
+
+log = slogging.getLogger(__name__)
 
 
 class BaseGenAI(ABC):
@@ -59,7 +62,7 @@ class BaseGenAI(ABC):
             self.verify_model()
             self.client = self._init_client()
         except Exception as error:
-            print(error)
+            log.error(error)
             self._error_messages.append(f"\nError:\n{str(error)}")
 
     @classmethod
@@ -79,7 +82,7 @@ class BaseGenAI(ABC):
             providers = MODELS.provider.tolist()
 
         for provider, model in zip(providers, models):
-            print(f"- {provider} - {model}")
+            log.info(f"- {provider} - {model}")
 
         return models
 
@@ -112,7 +115,7 @@ class BaseGenAI(ABC):
         # ----------------------------------------
         # Handles Prompt and Prompt File
         if (not prompt) and (not prompt_file):
-            print("Please input prompt\n")
+            log.warning("Please input prompt\n")
             return
 
         if prompt_file:
@@ -131,7 +134,7 @@ class BaseGenAI(ABC):
         #     )
 
         if prompt.strip() == "":
-            print("Please input prompt\n")
+            log.warning("Please input prompt\n")
             return
         # ----------------------------------------
 

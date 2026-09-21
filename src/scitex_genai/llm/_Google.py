@@ -28,6 +28,7 @@ from pprint import pprint
 from typing import Any, Dict, Generator, List, Optional
 
 import matplotlib.pyplot as plt
+import scitex_logging as slogging
 
 
 try:
@@ -36,6 +37,8 @@ except ImportError:
     genai = None
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Functions & Classes"""
 
@@ -140,9 +143,9 @@ def main() -> None:
         stream=True,
         n_keep=10,
     )
-    print(ai("hi"))
-    print(ai("My name is Yusuke"))
-    print(ai("do you remember my name?"))
+    log.info(ai("hi"))
+    log.info(ai("My name is Yusuke"))
+    log.info(ai("do you remember my name?"))
 
 
 if __name__ == "__main__":

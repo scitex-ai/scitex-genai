@@ -30,8 +30,11 @@ from typing import Dict, Generator, List, Optional
 
 import anthropic
 import matplotlib.pyplot as plt
+import scitex_logging as slogging
 
 from ._BaseGenAI import BaseGenAI
+
+log = slogging.getLogger(__name__)
 
 """Functions & Classes"""
 
@@ -140,11 +143,11 @@ def main() -> None:
         api_key=os.getenv("ANTHROPIC_API_KEY"),
         n_keep=10,
     )
-    print(ai("hi"))
-    print(ai("My name is Yusuke"))
-    print(ai("do you remember my name?"))
+    log.info(ai("hi"))
+    log.info(ai("My name is Yusuke"))
+    log.info(ai("do you remember my name?"))
 
-    print(
+    log.info(
         ai(
             "hi, could you tell me what is in the pic?",
             images=[
