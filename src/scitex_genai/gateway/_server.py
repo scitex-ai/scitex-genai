@@ -26,7 +26,6 @@ from ._inference import (
     InferenceMemberResumeError,
     estimate_input_tokens,
 )
-from ._opencode import OpenCodeBackend
 from ._secrets import resolve_gateway_key
 
 
