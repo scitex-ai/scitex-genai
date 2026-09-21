@@ -60,6 +60,7 @@ dependencies = [
     "scitex-config>=0.3.6",
     "scitex-dev>=0.59.0",
     "scitex-io>=0.2.0",
+    "scitex-logging>=0.1.0",
     "scitex-str>=0.1.0",
 ]
 
