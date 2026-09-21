@@ -29,3 +29,6 @@ docs/sphinx/_static/
 .scitex/dev/*
 !.scitex/dev/config.yaml
 .worktrees/
+
+# testmon dependency cache (regenerable, per-branch)
+.testmondata
