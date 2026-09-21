@@ -136,7 +136,7 @@ def _launch_main(argv: list[str]) -> int:
         log.error(f"scitex-genai-serve launch: {exc}")
         return 2
     if args.dry_run:
-        log.info(body)
+        sys.stdout.write(body + "\n")
         return 0
     canary_keys = [key for key in args.keys if load_engine(key, models_dir).canary_only]
     if canary_keys:
@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.list:
         for key in list_engines(args.models_dir):
-            log.info(key)
+            sys.stdout.write(key + "\n")
         return 0
     if not args.key:
         log.error("scitex-genai-serve: an engine key is required (see --list)")
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     launch = render(settings, conf, runtime_env)
     if args.dry_run:
-        log.info(describe(launch))
+        sys.stdout.write(describe(launch) + "\n")
         return 0
     if manifest is not None:
         try:
