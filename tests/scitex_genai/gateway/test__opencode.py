@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -169,3 +171,71 @@ def test_chat_completions_route_rejects_bad_key() -> None:
     )
     # Assert
     assert response.status_code == 401
+
+
+def _streaming_app() -> Any:
+    from fastapi.testclient import TestClient  # noqa: F401
+
+    backend = OpenCodeBackend()
+
+    async def fake_complete(body: dict) -> dict:
+        return {"text": "GW_OK", "model": "muse-spark-1.3-contributor-free"}
+
+    backend.complete = fake_complete  # type: ignore[method-assign]
+    return create_app(backend, api_key="k")
+
+
+def test_chat_completions_route_stream_returns_sse_frames() -> None:
+    # Arrange
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(_streaming_app())
+    # Act
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer k"},
+        json={
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [],
+            "stream": True,
+        },
+    )
+    # Assert
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    frames = [
+        frame for frame in response.text.split("\n\n") if frame.strip()
+    ]
+    assert frames[-1].strip() == "data: [DONE]"
+    payloads = [
+        _json.loads(frame.split("data:", 1)[1])
+        for frame in frames[:-1]
+        if frame.strip().startswith("data:")
+    ]
+    assert payloads, "expected at least one SSE data frame"
+    assert all(p["object"] == "chat.completion.chunk" for p in payloads)
+    deltas = [p["choices"][0]["delta"] for p in payloads]
+    assert deltas[0] == {"role": "assistant"}
+    assert {"content": "GW_OK"} in deltas
+    assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_route_without_stream_returns_json() -> None:
+    # Arrange
+    from fastapi.testclient import TestClient
+
+    client = TestClient(_streaming_app())
+    # Act
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer k"},
+        json={"model": "muse-spark-1.3-contributor-free", "messages": []},
+    )
+    # Assert
+    assert response.status_code == 200
+    assert "text/event-stream" not in response.headers.get("content-type", "")
+    payload = response.json()
+    assert payload["object"] == "chat.completion"
+    assert payload["choices"][0]["message"]["content"] == "GW_OK"
