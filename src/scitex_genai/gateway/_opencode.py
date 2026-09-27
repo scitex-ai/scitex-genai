@@ -70,7 +70,19 @@ class OpenCodeBackend:
         """No quota to poll on a local harness; satisfies the server lifespan."""
 
     def _post(self, client: Any, path: str, payload: dict[str, Any]) -> Any:
-        return client.post(f"{self.serve_url}{path}", json=payload, timeout=600.0)
+        # Status-code cascade: every upstream HTTP status is preserved, never
+        # collapsed. A response with an error status raises UpstreamError
+        # carrying the UPSTREAM code (401/403/429/...) so the server relays it
+        # verbatim; only the no-response case (timeout/transport) maps to
+        # 504/502 in complete(). Reliable systems need the real codes.
+        response = client.post(f"{self.serve_url}{path}", json=payload, timeout=600.0)
+        if response.status_code >= 400:
+            raise UpstreamError(
+                f"opencode serve returned HTTP {response.status_code}: "
+                f"{response.text[:300]}",
+                status_code=response.status_code,
+            )
+        return response
 
     async def complete(
         self, body: dict[str, Any], *, client: Any = None
@@ -111,12 +123,6 @@ class OpenCodeBackend:
                     "agent": self.agent,
                 },
             )
-            if message.status_code >= 400:
-                raise UpstreamError(
-                    f"opencode serve returned HTTP {message.status_code}: "
-                    f"{message.text[:300]}",
-                    status_code=message.status_code,
-                )
             data = message.json()
             text = _text_of(data)
             if not text:

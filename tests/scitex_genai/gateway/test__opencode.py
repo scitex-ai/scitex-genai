@@ -328,3 +328,49 @@ def test_nonstream_completions_return_reply_text() -> None:
     _status, _content_type, payload = _nonstream_response_parts()
     # Assert
     assert payload["choices"][0]["message"]["content"] == "GW_OK"
+
+
+class _FailClient:
+    def __init__(self, session_status: int, message_status: int) -> None:
+        self._session_status = session_status
+        self._message_status = message_status
+
+    def post(self, url: str, json: dict, timeout: float) -> _Response:
+        if url.endswith("/session"):
+            if self._session_status >= 400:
+                return _Response({"error": "denied"}, status=self._session_status)
+            return _Response({"id": "ses_test123"})
+        return _Response({"error": "limited"}, status=self._message_status)
+
+    def close(self) -> None:
+        pass
+
+
+def test_complete_passes_session_error_status_through() -> None:
+    # Arrange
+    import asyncio
+
+    from scitex_genai.gateway._errors import UpstreamError
+
+    backend = OpenCodeBackend()
+    body = {"model": "m1", "messages": [{"role": "user", "content": "Hi"}]}
+    # Act
+    with pytest.raises(UpstreamError) as excinfo:
+        asyncio.run(backend.complete(body, client=_FailClient(403, 200)))
+    # Assert
+    assert excinfo.value.status_code == 403
+
+
+def test_complete_passes_message_error_status_through() -> None:
+    # Arrange
+    import asyncio
+
+    from scitex_genai.gateway._errors import UpstreamError
+
+    backend = OpenCodeBackend()
+    body = {"model": "m1", "messages": [{"role": "user", "content": "Hi"}]}
+    # Act
+    with pytest.raises(UpstreamError) as excinfo:
+        asyncio.run(backend.complete(body, client=_FailClient(200, 429)))
+    # Assert
+    assert excinfo.value.status_code == 429
