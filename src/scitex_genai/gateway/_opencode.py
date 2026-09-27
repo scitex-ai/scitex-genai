@@ -50,6 +50,11 @@ def openai_messages_to_text(messages: Any) -> str:
     return "\n\n".join(chunk for chunk in chunks if chunk)
 
 
+import os as _os
+
+DEFAULT_SERVE_TIMEOUT_S = float(_os.environ.get("SCITEX_GENAI_SERVE_TIMEOUT_S", "600"))
+
+
 class OpenCodeBackend:
     """Serve OpenAI chat completions through a local ``opencode serve``."""
 
@@ -60,11 +65,13 @@ class OpenCodeBackend:
         provider_id: str = DEFAULT_PROVIDER_ID,
         agent: str = DEFAULT_AGENT,
         client: Any = None,
+        timeout_s: float | None = None,
     ) -> None:
         self.serve_url = (serve_url or DEFAULT_OPENCODE_SERVE_URL).rstrip("/")
         self.provider_id = provider_id
         self.agent = agent
         self._client = client
+        self._timeout_s = DEFAULT_SERVE_TIMEOUT_S if timeout_s is None else timeout_s
 
     async def refresh_usage(self) -> None:
         """No quota to poll on a local harness; satisfies the server lifespan."""
@@ -75,7 +82,9 @@ class OpenCodeBackend:
         # carrying the UPSTREAM code (401/403/429/...) so the server relays it
         # verbatim; only the no-response case (timeout/transport) maps to
         # 504/502 in complete(). Reliable systems need the real codes.
-        response = client.post(f"{self.serve_url}{path}", json=payload, timeout=600.0)
+        response = client.post(
+            f"{self.serve_url}{path}", json=payload, timeout=self._timeout_s
+        )
         if response.status_code >= 400:
             raise UpstreamError(
                 f"opencode serve returned HTTP {response.status_code}: "
@@ -100,7 +109,7 @@ class OpenCodeBackend:
                 raise UpstreamError(
                     "OpenCode backend requires scitex-genai[gateway]"
                 ) from exc
-            client = httpx.Client(timeout=600.0)
+            client = httpx.Client(timeout=self._timeout_s)
             own_client = True
         try:
             # Sync httpx inside async handlers blocks the event loop for up to
