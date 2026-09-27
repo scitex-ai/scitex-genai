@@ -63,9 +63,11 @@ KEY_CONTINUATION_MIN_TOKENS = "gateway.inference_continuation_qos_min_preempt_to
 KEY_CACHE_REPORT = "gateway.inference_cache_report_enabled"
 KEY_EXTERNAL_PROVIDER = "gateway.external_provider"
 KEY_OPENCODE_SERVE_URL = "gateway.opencode_serve_url"
+KEY_OPENCODE_SERVE_TIMEOUT_S = "gateway.opencode_serve_timeout_s"
 
 SCITEX_TIMEOUT_ENV = "SCITEX_GATEWAY_INFERENCE_TIMEOUT_S"
 OPENCODE_SERVE_ENV = "SCITEX_GENAI_OPENCODE_SERVE_URL"
+OPENCODE_SERVE_TIMEOUT_ENV = "SCITEX_GENAI_SERVE_TIMEOUT_S"
 RETIRED_UPSTREAM_ENVS = ("HOIST_UPSTREAM", "SCITEX_GATEWAY_INFERENCE_UPSTREAMS")
 _MISSING = object()
 
@@ -292,6 +294,7 @@ class GatewaySettings:
     cache_admission: CacheAdmissionSettings = CacheAdmissionSettings()
     external_provider: ExternalGatewaySettings | None = None
     opencode_serve_url: str = ""
+    opencode_serve_timeout_s: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", check_host(self.host))
@@ -389,6 +392,7 @@ def load_settings(
     inference_continuation_qos_min_preempt_tokens: int | None = None,
     inference_cache_report_enabled: bool | None = None,
     opencode_serve_url: str | None = None,
+    opencode_serve_timeout_s: float | None = None,
 ) -> GatewaySettings:
     """Resolve the gateway's settings: direct -> config file -> environment -> default."""
     path = Path(config_path) if config_path is not None else default_config_path()
@@ -483,10 +487,33 @@ def load_settings(
         opencode_serve_url=_resolve_serve_url(
             direct_val=opencode_serve_url, raw_gateway=raw_gateway
         ),
+        opencode_serve_timeout_s=_resolve_serve_timeout_s(
+            direct_val=opencode_serve_timeout_s, raw_gateway=raw_gateway
+        ),
     )
 
 
-def _resolve_serve_url(*, direct_val: str | None, raw_gateway: Any) -> str:
+def _resolve_serve_timeout_s(direct_val: Any, raw_gateway: Any) -> float:
+    """Serve-call timeout: direct -> config file -> env -> 0.0 (backend default).
+
+    0.0 means "no override": OpenCodeBackend falls back to
+    SCITEX_GENAI_SERVE_TIMEOUT_S (default 600s). Slow free-tier inference
+    (e.g. lead boot prompts on space-bunny-free) sets
+    ``gateway.opencode_serve_timeout_s`` in the yaml instead of relying on
+    process env, which supervisors/nohup do not always propagate.
+    """
+    if direct_val is not None:
+        return float(direct_val)
+    leaf = KEY_OPENCODE_SERVE_TIMEOUT_S.rpartition(".")[2]
+    raw_value = (
+        raw_gateway.get(leaf) if isinstance(raw_gateway, dict) else None
+    )
+    if raw_value is not None:
+        return float(raw_value)
+    return float(os.getenv(OPENCODE_SERVE_TIMEOUT_ENV, "0.0") or "0.0")
+
+
+def _resolve_serve_url(direct_val: str | None, raw_gateway: Any) -> str:
     """The opencode harness address: direct -> config file -> env -> off.
 
     Spell the cascade out by hand: ``ScitexConfig.resolve`` derives

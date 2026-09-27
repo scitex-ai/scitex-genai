@@ -179,6 +179,16 @@ def _add_settings_args(
             "else $SCITEX_GENAI_OPENCODE_SERVE_URL, else off)."
         ),
     )
+    parser.add_argument(
+        "--opencode-serve-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "opencode serve call timeout in seconds (default: "
+            "gateway.opencode_serve_timeout_s, else "
+            "$SCITEX_GENAI_SERVE_TIMEOUT_S, else backend default 600)."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -464,9 +474,13 @@ def main(
         ),
         inference_cache_report_enabled=args.inference_cache_report,
         opencode_serve_url=args.opencode_serve_url,
+        opencode_serve_timeout_s=args.opencode_serve_timeout_s,
     )
     if settings.opencode_serve_url:
-        backend = OpenCodeBackend(serve_url=settings.opencode_serve_url)
+        backend = OpenCodeBackend(
+            serve_url=settings.opencode_serve_url,
+            timeout_s=settings.opencode_serve_timeout_s,
+        )
         log.info(
             "scitex-genai-gateway: opencode serve "
             f"{settings.opencode_serve_url}; Zen free SKUs through the local harness"
