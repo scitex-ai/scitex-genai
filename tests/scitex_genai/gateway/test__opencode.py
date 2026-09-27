@@ -374,3 +374,21 @@ def test_complete_passes_message_error_status_through() -> None:
         asyncio.run(backend.complete(body, client=_FailClient(200, 429)))
     # Assert
     assert excinfo.value.status_code == 429
+
+
+def test_backend_timeout_env_override(monkeypatch) -> None:
+    # Arrange
+    import importlib
+    import os
+
+    import scitex_genai.gateway._opencode as mod
+
+    monkeypatch.setenv("SCITEX_GENAI_SERVE_TIMEOUT_S", "1800")
+    # Act
+    importlib.reload(mod)
+    # Assert
+    assert mod.DEFAULT_SERVE_TIMEOUT_S == 1800.0
+    assert mod.OpenCodeBackend()._timeout_s == 1800.0
+    assert mod.OpenCodeBackend(timeout_s=60.0)._timeout_s == 60.0
+    monkeypatch.delenv("SCITEX_GENAI_SERVE_TIMEOUT_S")
+    importlib.reload(mod)
