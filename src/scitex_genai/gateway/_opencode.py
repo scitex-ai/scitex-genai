@@ -14,6 +14,7 @@ Verified 2026-09-21 on scitex-compute-04: ``SERVE_API_OK`` round-trip
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -90,11 +91,18 @@ class OpenCodeBackend:
             client = httpx.Client(timeout=600.0)
             own_client = True
         try:
-            session = self._post(client, "/session", {"title": "genai-gateway"})
+            # Sync httpx inside async handlers blocks the event loop for up to
+            # the 600s timeout (c04 2026-09-27: wedged gateway, loud 504s, no
+            # hangs). Run upstream I/O in a thread; map transport failures to
+            # UpstreamError (504 timeout / 502 other) — fail loud, never hang.
+            session = await asyncio.to_thread(
+                self._post, client, "/session", {"title": "genai-gateway"}
+            )
             sid = session.json().get("id", "")
             if not sid:
                 raise UpstreamError("opencode serve returned no session id", status_code=502)
-            message = self._post(
+            message = await asyncio.to_thread(
+                self._post,
                 client,
                 f"/session/{sid}/message",
                 {
@@ -115,6 +123,20 @@ class OpenCodeBackend:
                 raise UpstreamError("opencode serve returned no text reply", status_code=502)
             info = data.get("info", {}) if isinstance(data, dict) else {}
             return {"text": text, "model": str(info.get("modelID") or model)}
+        except UpstreamError:
+            raise
+        except Exception as exc:
+            try:
+                import httpx as _httpx
+
+                is_timeout = isinstance(exc, _httpx.TimeoutException)
+            except ImportError:
+                is_timeout = "timeout" in type(exc).__name__.lower()
+            raise UpstreamError(
+                f"opencode serve call failed "
+                f"({type(exc).__name__}): {str(exc)[:200]}",
+                status_code=504 if is_timeout else 502,
+            ) from exc
         finally:
             if own_client:
                 client.close()
