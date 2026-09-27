@@ -71,7 +71,11 @@ class OpenCodeBackend:
         self.provider_id = provider_id
         self.agent = agent
         self._client = client
-        self._timeout_s = DEFAULT_SERVE_TIMEOUT_S if timeout_s is None else timeout_s
+        # 0/None means "no override": fall back to the env default so a
+        # config that omits the key keeps the 600s default.
+        self._timeout_s = (
+            DEFAULT_SERVE_TIMEOUT_S if not timeout_s else float(timeout_s)
+        )
 
     async def refresh_usage(self) -> None:
         """No quota to poll on a local harness; satisfies the server lifespan."""
