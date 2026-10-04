@@ -152,10 +152,6 @@ jobs:
       - name: Verify pinned checkout
         run: |
           test "$(git rev-parse HEAD)" = "${{ needs.pin.outputs.commit }}"
-      - name: Record peeled tag commit
-        id: commit
-        run: |
-          echo "commit=$(git rev-list -n 1 "${{ steps.ver.outputs.version }}")" >> "$GITHUB_OUTPUT"
       # Build INSIDE the SIF (no setup-python on the bare Spartan node).
       # build-in-sif.sh installs the `build` frontend into a writable --target
       # inside the SIF, then `python -m build` → dist/. fail-loud on empty dist.
@@ -168,7 +164,7 @@ jobs:
           test -n "$(ls -A dist 2>/dev/null)" || { echo "::error::dist/ empty after build"; exit 1; }
           {
             echo 'dist_sha256<<EOF'
-            sha256sum dist/*
+            (cd dist && sha256sum ./* | sort)
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
       # upload-artifact is a JS action — runs fine on the self-hosted runner.
@@ -197,7 +193,7 @@ jobs:
       # Explicit tag checkout: the tag — not a branch head — is the immutable source.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.build.outputs.version }}
+          ref: ${{ needs.build.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v7
@@ -225,9 +221,9 @@ jobs:
           test "$VER" = "$PYVER" || { echo "::error::tag $TAG != pyproject $PYVER"; exit 1; }
           test -n "$(ls -A dist 2>/dev/null)" || { echo "::error::dist/ empty before mint"; exit 1; }
           for f in dist/*; do case "$f" in *"$VER"*) ;; *) echo "::error::artifact $f lacks version $VER"; exit 1;; esac; done
-          GOT="$(cd dist && sha256sum ./*)"
+          GOT="$(cd dist && sha256sum ./* | sort)"
           test "$GOT" = "$BUILD_HASHES" || { echo "::error::downloaded dist hashes differ from build record"; echo "$GOT"; exit 1; }
-          "$GITHUB_WORKSPACE"/.github/ci/qualify-dist.sh "$VER" || {
+          bash .github/ci/exec-in-sif.sh qualify-dist.sh 3.12 "$VER" || {
             echo "::error::wheel/sdist METADATA name/version mismatch for $VER"; exit 1; }
           echo "qualified tag=$TAG commit=$HEAD version=$VER"
       # Manual OIDC trusted publishing INSIDE the SIF — pypa/gh-action-pypi-
@@ -250,7 +246,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.build.outputs.version }}
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: dist
