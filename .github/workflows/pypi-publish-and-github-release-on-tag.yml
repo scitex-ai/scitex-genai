@@ -55,26 +55,74 @@ env:
   SCITEX_CI_SIF: ${{ vars.SCITEX_CI_SIF }}
 
 jobs:
+  runner-admission:
+    uses: scitex-ai/.github/.github/workflows/runner-admission.yml@d7d96c34d68cdfbb5503a933591f7748b5aa30ee
+    with:
+      runs_on: '["self-hosted","Linux","X64","scitex-org-cpu"]'
+
+  pin:
+    # Resolve the tag to its immutable peeled commit ONCE. test/build/publish
+    # all check out this commit (never a moving tag), so the pinned source is
+    # literally identical everywhere downstream.
+    needs: runner-admission
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Resolve version to immutable commit
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then v="${REF#refs/tags/}"; else v="$INPUT_VERSION"; fi
+          case "$v" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version must be an existing vX.Y.Z tag (got '$v')"; exit 1;;
+          esac
+          case "$v" in *[/$'\n\r '*]*|*..*) echo "::error::version contains path/branch characters"; exit 1;; esac
+          REPO="https://github.com/${{ github.repository }}"
+          SHA="$(git ls-remote "$REPO" "refs/tags/$v^{}" | cut -f1)"
+          if [ -z "$SHA" ]; then SHA="$(git ls-remote "$REPO" "refs/tags/$v" | cut -f1)"; fi
+          test -n "$SHA" || { echo "::error::tag refs/tags/$v not found on origin"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+          echo "pinned $v -> $SHA"
+
   test:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
+    needs: [pin, runner-admission]
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - name: Resolve version
-        id: ver
+      # Organization admission gate: no test/build/publish work runs unless the
+      # admitted runner vouches membership. The expected JSON is derived from
+      # the central runner-admission source (native self-hosted request with a
+      # declared pool label yields group Organization plus the requested labels).
+      - name: Require confirmed organization admission
+        env:
+          NATIVE_AUTHORIZED: ${{ needs.runner-admission.outputs.native_authorized }}
+          ADMISSION_REASON: ${{ needs.runner-admission.outputs.reason }}
+          ADMISSION_RUNS_ON: ${{ needs.runner-admission.outputs.runs_on }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            v="${GITHUB_REF#refs/tags/}"
-          else
-            v="${{ inputs.version }}"
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          test "$NATIVE_AUTHORIZED" = true
+          test "$ADMISSION_REASON" = confirmed-organization-members
+          test "$ADMISSION_RUNS_ON" = '{"group":"Organization","labels":["self-hosted","Linux","X64","scitex-org-cpu"]}'
+          echo "admission: $ADMISSION_REASON runs_on=$ADMISSION_RUNS_ON"
       - uses: actions/checkout@v5
         with:
-          ref: ${{ steps.ver.outputs.version }}
+          ref: ${{ needs.pin.outputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ needs.pin.outputs.commit }}"
       # SIF-based self-hosted test run — mirrors pytest-matrix exactly. No
       # setup-python (the bare Spartan node has no Python tool cache; that step
       # failed "version not found for this OS"); no apt fd-install (fd is baked
@@ -83,40 +131,55 @@ jobs:
       # target, then runs pytest. fail-loud on a missing SIF/shim.
       - name: Run tests in the reused CI SIF (apptainer exec — deps layered, not on the bare runner)
         run: bash .github/ci/exec-in-sif.sh run-in-sif.sh ${{ matrix.python-version }}
+      - name: Remove owned test scratch on this runner
+        if: always()
+        run: |
+          rm -rf "/tmp/ci-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.python-version }}"
 
   build:
-    needs: test
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
+    needs: [pin, test, runner-admission]
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     outputs:
-      version: ${{ steps.ver.outputs.version }}
+      version: ${{ needs.pin.outputs.version }}
+      commit: ${{ needs.pin.outputs.commit }}
+      dist_sha256: ${{ steps.hash.outputs.dist_sha256 }}
     steps:
-      - name: Resolve version
-        id: ver
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            v="${GITHUB_REF#refs/tags/}"
-          else
-            v="${{ inputs.version }}"
-          fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
-          ref: ${{ steps.ver.outputs.version }}
+          ref: ${{ needs.pin.outputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ needs.pin.outputs.commit }}"
       # Build INSIDE the SIF (no setup-python on the bare Spartan node).
       # build-in-sif.sh installs the `build` frontend into a writable --target
       # inside the SIF, then `python -m build` → dist/. fail-loud on empty dist.
       - name: Build wheel + sdist in the CI SIF (apptainer exec)
         run: bash .github/ci/exec-in-sif.sh build-in-sif.sh 3.12
+      - name: Record dist hashes for publish provenance
+        id: hash
+        run: |
+          set -euo pipefail
+          test -n "$(ls -A dist 2>/dev/null)" || { echo "::error::dist/ empty after build"; exit 1; }
+          {
+            echo 'dist_sha256<<EOF'
+            (cd dist && sha256sum ./* | sort)
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
       # upload-artifact is a JS action — runs fine on the self-hosted runner.
       - uses: actions/upload-artifact@v6
         with:
           name: dist
           path: dist/
+      - name: Remove owned build scratch on this runner
+        if: always()
+        run: |
+          rm -rf "/tmp/build-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3.12"
 
   publish:
-    needs: build
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
+    needs: [build, runner-admission]
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     environment:
       name: pypi
       url: https://pypi.org/p/scitex-genai
@@ -127,11 +190,42 @@ jobs:
     steps:
       # Need the repo checked out so .github/ci/exec-in-sif.sh +
       # publish-in-sif.sh are on disk (the build job uploaded only dist/).
+      # Explicit tag checkout: the tag — not a branch head — is the immutable source.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist
+      # Immutable tag/commit/source+artifact qualification BEFORE token mint.
+      # The artifacts are downloaded first, then proven: wheel/sdist METADATA
+      # name+version, filename version, and sha256 equality against the hashes
+      # recorded at build from the immutable commit. No OIDC JWT is requested
+      # until every assertion below holds.
+      - name: Qualify immutable tag, commit, version and artifacts
+        env:
+          TAG: ${{ needs.build.outputs.version }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+          BUILD_HASHES: ${{ needs.build.outputs.dist_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$TAG"
+          HEAD="$(git rev-parse HEAD)"
+          test "$HEAD" = "$BUILD_COMMIT" || { echo "::error::checkout $HEAD != build commit $BUILD_COMMIT"; exit 1; }
+          test "$HEAD" = "$(git rev-list -n 1 "$TAG")" || { echo "::error::checkout not the tag peeled commit"; exit 1; }
+          VER="${TAG#v}"
+          PYVER="$(grep -m1 '^version = ' pyproject.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+          test "$VER" = "$PYVER" || { echo "::error::tag $TAG != pyproject $PYVER"; exit 1; }
+          test -n "$(ls -A dist 2>/dev/null)" || { echo "::error::dist/ empty before mint"; exit 1; }
+          for f in dist/*; do case "$f" in *"$VER"*) ;; *) echo "::error::artifact $f lacks version $VER"; exit 1;; esac; done
+          GOT="$(cd dist && sha256sum ./* | sort)"
+          test "$GOT" = "$BUILD_HASHES" || { echo "::error::downloaded dist hashes differ from build record"; echo "$GOT"; exit 1; }
+          bash .github/ci/exec-in-sif.sh qualify-dist.sh 3.12 "$VER" || {
+            echo "::error::wheel/sdist METADATA name/version mismatch for $VER"; exit 1; }
+          echo "qualified tag=$TAG commit=$HEAD version=$VER"
       # Manual OIDC trusted publishing INSIDE the SIF — pypa/gh-action-pypi-
       # publish is a Docker action and the Spartan compute nodes have no Docker.
       # publish-in-sif.sh: GitHub OIDC JWT (audience=pypi) → PyPI mint-token →
@@ -139,16 +233,22 @@ jobs:
       # ACTIONS_ID_TOKEN_REQUEST_* env vars into the SIF. fail-loud at each step.
       - name: Publish to PyPI via manual OIDC trusted publishing in the SIF
         run: bash .github/ci/exec-in-sif.sh publish-in-sif.sh 3.12
+      - name: Remove owned publish scratch on this runner
+        if: always()
+        run: |
+          rm -rf "/tmp/publish-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3.12"
 
   release:
-    needs: [build, publish]
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
+    needs: [build, publish, runner-admission]
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.build.outputs.version }}
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: dist
@@ -173,3 +273,7 @@ jobs:
             --title "${{ needs.build.outputs.version }}" \
             --notes-file release-notes.md \
             dist/*
+      - name: Remove owned release scratch on this runner
+        if: always()
+        run: |
+          rm -rf release-notes.md dist
