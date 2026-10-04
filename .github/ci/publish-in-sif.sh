@@ -98,8 +98,7 @@ echo "PyPI token minted (length=${#MINTED})"
 
 # --- step 3: install twine into the writable target, then upload ---
 echo "=== installing twine (--target) ==="
-uv pip install --python "$PY" --target="$TMPDIR/site" twine ||
-    "$PY" -m pip install --target="$TMPDIR/site" twine
+uv pip install --python "$PY" --target="$TMPDIR/site" twine
 export PYTHONPATH="$TMPDIR/site${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "=== twine upload dist/* ==="

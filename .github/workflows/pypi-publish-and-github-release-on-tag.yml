@@ -55,13 +55,33 @@ env:
   SCITEX_CI_SIF: ${{ vars.SCITEX_CI_SIF }}
 
 jobs:
+  runner-admission:
+    uses: scitex-ai/.github/.github/workflows/runner-admission.yml@d7d96c34d68cdfbb5503a933591f7748b5aa30ee
+    with:
+      runs_on: '["self-hosted","Linux","X64","scitex-ci"]'
+
   test:
+    needs: runner-admission
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
+      # Organization admission gate: no test/build/publish work runs unless the
+      # admitted runner vouches membership. The exact group/labels JSON is
+      # recorded here for the audit trail; tightening it to an exact-match
+      # assertion is a one-line follow-up once the first admitted run pins it.
+      - name: Require confirmed organization admission
+        env:
+          NATIVE_AUTHORIZED: ${{ needs.runner-admission.outputs.native_authorized }}
+          ADMISSION_REASON: ${{ needs.runner-admission.outputs.reason }}
+          ADMISSION_RUNS_ON: ${{ needs.runner-admission.outputs.runs_on }}
+        run: |
+          set -euo pipefail
+          test "$NATIVE_AUTHORIZED" = true
+          test "$ADMISSION_REASON" = confirmed-organization-members
+          echo "admission: $ADMISSION_REASON runs_on=$ADMISSION_RUNS_ON"
       - name: Resolve version
         id: ver
         run: |
@@ -85,7 +105,7 @@ jobs:
         run: bash .github/ci/exec-in-sif.sh run-in-sif.sh ${{ matrix.python-version }}
 
   build:
-    needs: test
+    needs: [test, runner-admission]
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -115,7 +135,7 @@ jobs:
           path: dist/
 
   publish:
-    needs: build
+    needs: [build, runner-admission]
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
     environment:
       name: pypi
@@ -127,7 +147,29 @@ jobs:
     steps:
       # Need the repo checked out so .github/ci/exec-in-sif.sh +
       # publish-in-sif.sh are on disk (the build job uploaded only dist/).
+      # Explicit tag checkout: the tag — not a branch head — is the immutable source.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.build.outputs.version }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Immutable tag/commit/source+artifact qualification BEFORE token mint.
+      # No OIDC JWT is requested until every assertion below holds.
+      - name: Qualify immutable tag, commit, version and artifacts
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.version }}"
+          test -n "$TAG"
+          HEAD="$(git rev-parse HEAD)"
+          TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+          test "$HEAD" = "$TAG_COMMIT" || { echo "::error::checkout $HEAD != tag $TAG ($TAG_COMMIT)"; exit 1; }
+          VER="${TAG#v}"
+          PYVER="$(grep -m1 '^version = ' pyproject.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+          test "$VER" = "$PYVER" || { echo "::error::tag $TAG != pyproject $PYVER"; exit 1; }
+          test -n "$(ls -A dist 2>/dev/null)" || { echo "::error::dist/ empty before mint"; exit 1; }
+          for f in dist/*; do case "$f" in *"$VER"*) ;; *) echo "::error::artifact $f lacks version $VER"; exit 1;; esac; done
+          sha256sum dist/* | tee "$RUNNER_TEMP/dist-$VER.sha256"
+          echo "qualified tag=$TAG commit=$HEAD version=$VER"
       - uses: actions/download-artifact@v7
         with:
           name: dist
@@ -141,7 +183,7 @@ jobs:
         run: bash .github/ci/exec-in-sif.sh publish-in-sif.sh 3.12
 
   release:
-    needs: [build, publish]
+    needs: [build, publish, runner-admission]
     runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
     permissions:
       contents: write
@@ -173,3 +215,14 @@ jobs:
             --title "${{ needs.build.outputs.version }}" \
             --notes-file release-notes.md \
             dist/*
+
+  cleanup:
+    needs: [test, build, publish, release]
+    if: always()
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-ci"]') }}
+    steps:
+      - name: Remove owned node-local scratch
+        run: |
+          rm -rf "/tmp/ci-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* \
+            "/tmp/build-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* \
+            "/tmp/publish-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* || true

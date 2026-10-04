@@ -49,11 +49,10 @@ unset VIRTUAL_ENV || true
 export PATH="$VENV/bin:$PATH"
 echo "build: py=$("$PY" -V) target=$TMPDIR/site"
 
-# Install the PEP 517 build frontend into the writable target (uv fast path,
-# pip safety net), then build with it. Clean dist/ first so only the freshly
-# built artifacts are uploaded.
-uv pip install --python "$PY" --target="$TMPDIR/site" build ||
-    "$PY" -m pip install --target="$TMPDIR/site" build
+# Install the PEP 517 build frontend into the writable target, canonical UV
+# only, then build with it. Clean dist/ first so only the freshly built
+# artifacts are uploaded.
+uv pip install --python "$PY" --target="$TMPDIR/site" build
 
 export PYTHONPATH="$TMPDIR/site${PYTHONPATH:+:$PYTHONPATH}"
 
