@@ -13,7 +13,7 @@ _TARGET = SystemOneTarget(
 _BUDGET = DecisionBudget(timeout_s=2, max_response_bytes=4096)
 
 
-def test_default_transport_posts_once_with_bounded_read_and_no_env_proxy(monkeypatch):
+def test_carrier_posts_once_with_bounded_read_and_no_env_proxy():
     # Arrange
     calls = []
     handlers = []
@@ -39,9 +39,8 @@ def test_default_transport_posts_once_with_bounded_read_and_no_env_proxy(monkeyp
         handlers.extend(values)
         return Opener()
 
-    monkeypatch.setattr(_transport, "build_opener", build_opener)
     # Act
-    result = _transport._HTTPSinglePost().post(
+    result = _transport._HTTPSinglePost(opener_factory=build_opener).post(
         target=_TARGET,
         body=b"original body",
         budget=DecisionBudget(2, 3),
@@ -78,7 +77,7 @@ def test_redirect_is_not_followed():
     assert redirected is None
 
 
-def test_default_http_error_body_is_retained_and_closed(monkeypatch):
+def test_http_error_body_is_retained_and_closed():
     # Arrange
     calls = []
     body = io.BytesIO(b"original unauthorized body")
@@ -89,9 +88,8 @@ def test_default_http_error_body_is_retained_and_closed(monkeypatch):
             calls.append(request.get_method())
             raise error
 
-    monkeypatch.setattr(_transport, "build_opener", lambda *args: Opener())
     # Act
-    result = _transport._HTTPSinglePost().post(
+    result = _transport._HTTPSinglePost(opener_factory=lambda *args: Opener()).post(
         target=_TARGET,
         body=b"request",
         budget=_BUDGET,

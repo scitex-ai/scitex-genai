@@ -6,6 +6,7 @@ import json
 import math
 from typing import Mapping
 
+from ._credential_echo import _echoes_credential
 from ._transport import _HTTPSinglePost
 from ._types import (
     ChoiceDecision,
@@ -34,29 +35,6 @@ def _nonfinite(value):
 
 def _number(value):
     return type(value) in (int, float) and 0 <= value <= 1 and math.isfinite(value)
-
-
-def _echoes_credential(response, api_key):
-    """Withhold exact credential echoes; never redact an original response.
-
-    Check raw UTF-8 bytes, header fields and decoded JSON keys/strings, including
-    duplicates. This is not a universal secret or arbitrary-encoding detector.
-    """
-    if api_key.encode("utf-8") in response.body or any(
-        api_key in value for pair in response.headers for value in pair
-    ):
-        return True
-    try:
-        pending = [json.loads(response.body.decode("utf-8"), object_pairs_hook=list)]
-    except (ValueError, RecursionError):
-        return False
-    while pending:
-        value = pending.pop()
-        if type(value) is str and api_key in value:
-            return True
-        if type(value) in (list, tuple):
-            pending.extend(value)
-    return False
 
 
 def _parse(response, *, target, choices, hold_choice, question):

@@ -158,7 +158,7 @@ def test_valid_choice_and_hold_preserve_vendor_response(choice, probabilities, i
     )
 
 
-def test_probabilities_are_immutable_and_do_not_share_caller_mapping():
+def test_probabilities_do_not_share_caller_mapping():
     # Arrange
     probabilities = {"figure": 0.58, "hold": 0.42}
     transport = _RecordingTransport(_response(_payload(probabilities=probabilities)))
@@ -166,9 +166,17 @@ def test_probabilities_are_immutable_and_do_not_share_caller_mapping():
     result = _call(transport)
     probabilities["figure"] = 0
     # Assert
+    assert dict(result.probabilities) == {"figure": 0.58, "hold": 0.42}
+
+
+def test_returned_probabilities_refuse_mutation():
+    # Arrange
+    transport = _RecordingTransport(_response())
+    # Act
+    result = _call(transport)
+    # Assert
     with pytest.raises(TypeError):
         result.probabilities["figure"] = 0
-    assert dict(result.probabilities) == {"figure": 0.58, "hold": 0.42}
 
 
 def test_custom_question_uses_the_same_protocol_and_fixed_answer_key():
@@ -348,11 +356,14 @@ def test_response_envelope_and_question_are_exact(payload):
 def test_invalid_local_input_never_posts(overrides):
     # Arrange
     transport = _RecordingTransport(_response())
+    rejected = False
     # Act
-    with pytest.raises(ValueError):
+    try:
         _call(transport, **overrides)
+    except ValueError:
+        rejected = True
     # Assert
-    assert transport.calls == []
+    assert (rejected, transport.calls) == (True, [])
 
 
 @pytest.mark.parametrize(
@@ -368,9 +379,12 @@ def test_invalid_local_input_never_posts(overrides):
     ],
 )
 def test_invalid_io_budget_is_rejected(timeout, limit):
-    # Arrange / Act / Assert
+    # Arrange
+    values = {"timeout_s": timeout, "max_response_bytes": limit}
+    # Act
+    # Assert
     with pytest.raises(ValueError):
-        DecisionBudget(timeout_s=timeout, max_response_bytes=limit)
+        DecisionBudget(**values)
 
 
 @pytest.mark.parametrize(
@@ -383,9 +397,12 @@ def test_invalid_io_budget_is_rejected(timeout, limit):
     ],
 )
 def test_target_cannot_hide_credentials_in_endpoint(endpoint):
-    # Arrange / Act / Assert
+    # Arrange
+    arguments = ("offline", "model", "account", endpoint)
+    # Act
+    # Assert
     with pytest.raises(ValueError):
-        SystemOneTarget("offline", "model", "account", endpoint)
+        SystemOneTarget(*arguments)
 
 
 @pytest.mark.parametrize("status", [302, 401, 429, 500])

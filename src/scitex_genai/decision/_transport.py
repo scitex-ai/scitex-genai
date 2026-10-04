@@ -14,6 +14,11 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class _HTTPSinglePost:
+    def __init__(self, *, opener_factory=None):
+        # An explicit private collaborator permits offline carrier controls
+        # without replacing process-global urllib functions.
+        self._opener_factory = opener_factory or build_opener
+
     def post(
         self,
         *,
@@ -32,7 +37,7 @@ class _HTTPSinglePost:
             },
             method="POST",
         )
-        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        opener = self._opener_factory(ProxyHandler({}), _NoRedirect())
         try:
             response = opener.open(request, timeout=budget.timeout_s)
         except HTTPError as error:
