@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   barrier before systemd cutover. Draining health is non-ready, and a bounded
   timeout leaves admission closed with exact remaining ownership counts.
 
+## [0.2.2] - 2026-10-04
+
+### Added
+
+- Typed one-call Systemone decisions with explicit provider, model, account
+  label, choices, HOLD outcome and request/response limits. The existing text
+  and streaming APIs remain unchanged.
+
+### Fixed
+
+- Decision responses that echo the request credential are withheld, while
+  accepted responses retain the original payload and reported model metadata.
+- Gateway tests now wait for the admitted upstream request before exercising
+  the existing failure fence, preserving the fast-failure and cleanup checks.
+
 ## [0.2.0] - 2026-09-05
 
 ### Added
