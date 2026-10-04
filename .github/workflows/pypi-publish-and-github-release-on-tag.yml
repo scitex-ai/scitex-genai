@@ -58,7 +58,7 @@ jobs:
   runner-admission:
     uses: scitex-ai/.github/.github/workflows/runner-admission.yml@d7d96c34d68cdfbb5503a933591f7748b5aa30ee
     with:
-      runs_on: '["self-hosted","Linux","X64","scitex-ci"]'
+      runs_on: '["self-hosted","Linux","X64","scitex-org-cpu"]'
 
   pin:
     # Resolve the tag to its immutable peeled commit ONCE. test/build/publish
@@ -113,7 +113,7 @@ jobs:
           set -euo pipefail
           test "$NATIVE_AUTHORIZED" = true
           test "$ADMISSION_REASON" = confirmed-organization-members
-          test "$ADMISSION_RUNS_ON" = '{"group":"Organization","labels":["self-hosted","Linux","X64","scitex-ci"]}'
+          test "$ADMISSION_RUNS_ON" = '{"group":"Organization","labels":["self-hosted","Linux","X64","scitex-org-cpu"]}'
           echo "admission: $ADMISSION_REASON runs_on=$ADMISSION_RUNS_ON"
       - uses: actions/checkout@v5
         with:
