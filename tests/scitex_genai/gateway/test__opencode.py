@@ -354,11 +354,14 @@ def test_complete_passes_session_error_status_through() -> None:
 
     backend = OpenCodeBackend()
     body = {"model": "m1", "messages": [{"role": "user", "content": "Hi"}]}
+    error_status = None
     # Act
-    with pytest.raises(UpstreamError) as excinfo:
+    try:
         asyncio.run(backend.complete(body, client=_FailClient(403, 200)))
+    except UpstreamError as error:
+        error_status = error.status_code
     # Assert
-    assert excinfo.value.status_code == 403
+    assert error_status == 403
 
 
 def test_complete_passes_message_error_status_through() -> None:
@@ -369,26 +372,49 @@ def test_complete_passes_message_error_status_through() -> None:
 
     backend = OpenCodeBackend()
     body = {"model": "m1", "messages": [{"role": "user", "content": "Hi"}]}
+    error_status = None
     # Act
-    with pytest.raises(UpstreamError) as excinfo:
+    try:
         asyncio.run(backend.complete(body, client=_FailClient(200, 429)))
+    except UpstreamError as error:
+        error_status = error.status_code
     # Assert
-    assert excinfo.value.status_code == 429
+    assert error_status == 429
 
 
-def test_backend_timeout_env_override(monkeypatch) -> None:
+def test_backend_timeout_env_override() -> None:
     # Arrange
-    import importlib
+    import json
     import os
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    import scitex_genai.gateway._opencode as mod
-
-    monkeypatch.setenv("SCITEX_GENAI_SERVE_TIMEOUT_S", "1800")
+    source_file = str(Path(sys.modules[OpenCodeBackend.__module__].__file__).resolve())
+    import_paths = [str(Path(source_file).parents[2]), *sys.path]
+    child_env = dict(os.environ, SCITEX_GENAI_SERVE_TIMEOUT_S="1800")
+    child_code = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "sys.path[:0] = json.loads(sys.argv[1])\n"
+        "from scitex_genai.gateway import _opencode as mod\n"
+        "print(json.dumps([mod.DEFAULT_SERVE_TIMEOUT_S, "
+        "mod.OpenCodeBackend()._timeout_s, "
+        "mod.OpenCodeBackend(timeout_s=60.0)._timeout_s, "
+        "str(Path(mod.__file__).resolve())]))\n"
+    )
     # Act
-    importlib.reload(mod)
+    child = subprocess.run(
+        [sys.executable, "-I", "-S", "-B", "-c", child_code, json.dumps(import_paths)],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=7,
+        check=False,
+    )
     # Assert
-    assert mod.DEFAULT_SERVE_TIMEOUT_S == 1800.0
-    assert mod.OpenCodeBackend()._timeout_s == 1800.0
-    assert mod.OpenCodeBackend(timeout_s=60.0)._timeout_s == 60.0
-    monkeypatch.delenv("SCITEX_GENAI_SERVE_TIMEOUT_S")
-    importlib.reload(mod)
+    assert (child.returncode, child.stdout.strip(), child.stderr) == (
+        0,
+        json.dumps([1800.0, 1800.0, 60.0, source_file]),
+        "",
+    )

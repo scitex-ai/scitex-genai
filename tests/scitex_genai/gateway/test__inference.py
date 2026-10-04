@@ -595,16 +595,21 @@ async def test_inflight_request_fails_fast_then_retry_uses_reachable_member(
             headers=headers,
         )
     )
-    started = await asyncio.to_thread(failed.request_started.wait, 1)
-
-    # Act
-    await backend.probe_upstreams()
     try:
+        # Finish real request-arrival setup before fencing its member. The
+        # scheduler metrics probe may precede generation dispatch on slow CI.
+        await _wait_for_requests(failed, 1)
+        started = await asyncio.to_thread(failed.request_started.wait, 1)
+
+        # Act
+        await backend.probe_upstreams()
         first_error = await asyncio.wait_for(_raised_async(first), timeout=1)
     finally:
         # Never leave the real HTTP fixture blocked when the assertion above
         # fails; otherwise fixture teardown obscures the relay failure.
         release.set()
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
     retry = await backend.relay(
         "POST", "/v1/messages", body=json.dumps(_request()).encode(), headers=headers
     )
