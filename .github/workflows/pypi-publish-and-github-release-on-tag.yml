@@ -60,8 +60,40 @@ jobs:
     with:
       runs_on: '["self-hosted","Linux","X64","scitex-ci"]'
 
-  test:
+  pin:
+    # Resolve the tag to its immutable peeled commit ONCE. test/build/publish
+    # all check out this commit (never a moving tag), so the pinned source is
+    # literally identical everywhere downstream.
     needs: runner-admission
+    runs-on: ${{ fromJSON(needs.runner-admission.outputs.runs_on) }}
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Resolve version to immutable commit
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then v="${REF#refs/tags/}"; else v="$INPUT_VERSION"; fi
+          case "$v" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version must be an existing vX.Y.Z tag (got '$v')"; exit 1;;
+          esac
+          case "$v" in *[/$'\n\r '*]*|*..*) echo "::error::version contains path/branch characters"; exit 1;; esac
+          REPO="https://github.com/${{ github.repository }}"
+          SHA="$(git ls-remote "$REPO" "refs/tags/$v^{}" | cut -f1)"
+          if [ -z "$SHA" ]; then SHA="$(git ls-remote "$REPO" "refs/tags/$v" | cut -f1)"; fi
+          test -n "$SHA" || { echo "::error::tag refs/tags/$v not found on origin"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+          echo "pinned $v -> $SHA"
+
+  test:
+    needs: [pin, runner-admission]
     runs-on: ${{ fromJSON(needs.runner-admission.outputs.runs_on) }}
     strategy:
       fail-fast: false
@@ -83,30 +115,14 @@ jobs:
           test "$ADMISSION_REASON" = confirmed-organization-members
           test "$ADMISSION_RUNS_ON" = '{"group":"Organization","labels":["self-hosted","Linux","X64","scitex-ci"]}'
           echo "admission: $ADMISSION_REASON runs_on=$ADMISSION_RUNS_ON"
-      - name: Resolve version
-        id: ver
-        env:
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = push ]; then v="${REF#refs/tags/}"; else v="$INPUT_VERSION"; fi
-          case "$v" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::version must be an existing vX.Y.Z tag (got '$v')"; exit 1;;
-          esac
-          case "$v" in *[/$'\n\r '*]*|*..*) echo "::error::version contains path/branch characters"; exit 1;; esac
-          echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
-          ref: ${{ steps.ver.outputs.version }}
+          ref: ${{ needs.pin.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Record peeled tag commit
-        id: commit
+      - name: Verify pinned checkout
         run: |
-          echo "commit=$(git rev-list -n 1 "${{ steps.ver.outputs.version }}")" >> "$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "${{ needs.pin.outputs.commit }}"
       # SIF-based self-hosted test run — mirrors pytest-matrix exactly. No
       # setup-python (the bare Spartan node has no Python tool cache; that step
       # failed "version not found for this OS"); no apt fd-install (fd is baked
@@ -118,36 +134,24 @@ jobs:
       - name: Remove owned test scratch on this runner
         if: always()
         run: |
-          rm -rf "/tmp/ci-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* || true
+          rm -rf "/tmp/ci-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.python-version }}"
 
   build:
-    needs: [test, runner-admission]
+    needs: [pin, test, runner-admission]
     runs-on: ${{ fromJSON(needs.runner-admission.outputs.runs_on) }}
     outputs:
-      version: ${{ steps.ver.outputs.version }}
-      commit: ${{ steps.commit.outputs.commit }}
+      version: ${{ needs.pin.outputs.version }}
+      commit: ${{ needs.pin.outputs.commit }}
       dist_sha256: ${{ steps.hash.outputs.dist_sha256 }}
     steps:
-      - name: Resolve version
-        id: ver
-        env:
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = push ]; then v="${REF#refs/tags/}"; else v="$INPUT_VERSION"; fi
-          case "$v" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::version must be an existing vX.Y.Z tag (got '$v')"; exit 1;;
-          esac
-          case "$v" in *[/$'\n\r '*]*|*..*) echo "::error::version contains path/branch characters"; exit 1;; esac
-          echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
-          ref: ${{ steps.ver.outputs.version }}
+          ref: ${{ needs.pin.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify pinned checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ needs.pin.outputs.commit }}"
       - name: Record peeled tag commit
         id: commit
         run: |
@@ -175,7 +179,7 @@ jobs:
       - name: Remove owned build scratch on this runner
         if: always()
         run: |
-          rm -rf "/tmp/build-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* || true
+          rm -rf "/tmp/build-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3.12"
 
   publish:
     needs: [build, runner-admission]
@@ -236,7 +240,7 @@ jobs:
       - name: Remove owned publish scratch on this runner
         if: always()
         run: |
-          rm -rf "/tmp/publish-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"* || true
+          rm -rf "/tmp/publish-scitex_genai-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3.12"
 
   release:
     needs: [build, publish, runner-admission]
@@ -274,4 +278,4 @@ jobs:
       - name: Remove owned release scratch on this runner
         if: always()
         run: |
-          rm -rf release-notes.md dist || true
+          rm -rf release-notes.md dist

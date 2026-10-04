@@ -59,7 +59,17 @@ export PIP_CACHE_DIR="$TMPDIR/pip-cache"
 unset VIRTUAL_ENV || true
 export PATH="$VENV/bin:$PATH"
 
-# --- step 1: request the OIDC JWT (audience=pypi) from GitHub ---
+# --- step 1: install then qualify the genuine upload tool (before any mint) ---
+echo "=== installing twine (--target, canonical UV only) ==="
+uv pip install --python "$PY" --target="$TMPDIR/site" twine
+export PYTHONPATH="$TMPDIR/site${PYTHONPATH:+:$PYTHONPATH}"
+TWINE_BIN="$TMPDIR/site/bin/twine"
+test -x "$TWINE_BIN" || { echo "::error::twine not installed at $TWINE_BIN"; exit 1; }
+TWINE_VER="$("$PY" -m twine --version 2>&1 | head -1)"
+test -n "$TWINE_VER" || { echo "::error::twine --version empty"; exit 1; }
+echo "twine qualified: $TWINE_VER"
+
+# --- step 2: request the OIDC JWT (audience=pypi) from GitHub ---
 : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?ACTIONS_ID_TOKEN_REQUEST_TOKEN not set — the publish job needs 'permissions: id-token: write'}"
 : "${ACTIONS_ID_TOKEN_REQUEST_URL:?ACTIONS_ID_TOKEN_REQUEST_URL not set — the publish job needs 'permissions: id-token: write'}"
 
@@ -74,7 +84,7 @@ test -n "$JWT" || {
 }
 echo "OIDC JWT obtained (length=${#JWT})"
 
-# --- step 2: exchange the JWT for a short-lived PyPI API token ---
+# --- step 3: exchange the JWT for a short-lived PyPI API token ---
 echo "=== exchanging JWT at PyPI mint-token endpoint ==="
 MINT_RESP="$(curl -sS -X POST https://pypi.org/_/oidc/mint-token \
     -d "{\"token\":\"${JWT}\"}")"
@@ -95,11 +105,6 @@ if [ -z "$MINTED" ]; then
     exit 1
 fi
 echo "PyPI token minted (length=${#MINTED})"
-
-# --- step 3: install twine into the writable target, then upload ---
-echo "=== installing twine (--target) ==="
-uv pip install --python "$PY" --target="$TMPDIR/site" twine
-export PYTHONPATH="$TMPDIR/site${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "=== twine upload dist/* ==="
 TWINE_USERNAME="__token__" TWINE_PASSWORD="$MINTED" \
