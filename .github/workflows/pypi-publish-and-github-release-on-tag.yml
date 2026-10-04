@@ -65,7 +65,7 @@ jobs:
     # all check out this commit (never a moving tag), so the pinned source is
     # literally identical everywhere downstream.
     needs: runner-admission
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-org-cpu"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       commit: ${{ steps.resolve.outputs.commit }}
@@ -94,7 +94,7 @@ jobs:
 
   test:
     needs: [pin, runner-admission]
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-org-cpu"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -138,7 +138,7 @@ jobs:
 
   build:
     needs: [pin, test, runner-admission]
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-org-cpu"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     outputs:
       version: ${{ needs.pin.outputs.version }}
       commit: ${{ needs.pin.outputs.commit }}
@@ -179,7 +179,7 @@ jobs:
 
   publish:
     needs: [build, runner-admission]
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-org-cpu"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     environment:
       name: pypi
       url: https://pypi.org/p/scitex-genai
@@ -240,7 +240,7 @@ jobs:
 
   release:
     needs: [build, publish, runner-admission]
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","Linux","X64","scitex-org-cpu"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && fromJSON('["ubuntu-latest"]') || fromJSON(needs.runner-admission.outputs.runs_on) }}
     permissions:
       contents: write
     steps:
