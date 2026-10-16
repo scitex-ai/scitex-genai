@@ -1187,10 +1187,10 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
         capacity_per_upstream=1,
         max_queue_size=1,
     )
-    # The /health probe below must reach the fixture server within the probe
-    # deadline; on a loaded CI runner 1.0s is racy (measured py3.12 timeouts).
-    # The assertion is about admission counts, not probe latency.
-    backend = InferenceBackend(pool, health_probe_timeout_s=10.0)
+    # The counting assertions do not depend on probe latency; give the live
+    # loopback probe a generous budget so CI load cannot fence the member
+    # (1s default) and turn the queued waiter into an unreachable error.
+    backend = InferenceBackend(pool, health_probe_timeout_s=30.0)
     admitted = await pool.acquire("first")
     waiting = asyncio.create_task(pool.acquire("second"))
     for _ in range(100):
@@ -1226,7 +1226,9 @@ async def test_relay_health_exposes_live_token_admission_counts(
     pool = InferenceUpstreamPool.from_urls(
         upstream.url, token_capacity_per_upstream=1_000
     )
-    backend = InferenceBackend(pool)
+    # Same generous probe budget as the admission-counts test above: this
+    # test also holds a queued waiter across a live /health probe.
+    backend = InferenceBackend(pool, health_probe_timeout_s=30.0)
     admitted = await pool.acquire("first", input_tokens=700)
     waiting = asyncio.create_task(pool.acquire("second", input_tokens=400))
     for _ in range(100):
