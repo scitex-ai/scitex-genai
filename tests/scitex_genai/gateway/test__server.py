@@ -1187,7 +1187,10 @@ async def test_relay_health_exposes_live_admission_counts(upstream_factory) -> N
         capacity_per_upstream=1,
         max_queue_size=1,
     )
-    backend = InferenceBackend(pool)
+    # The /health probe below must reach the fixture server within the probe
+    # deadline; on a loaded CI runner 1.0s is racy (measured py3.12 timeouts).
+    # The assertion is about admission counts, not probe latency.
+    backend = InferenceBackend(pool, health_probe_timeout_s=10.0)
     admitted = await pool.acquire("first")
     waiting = asyncio.create_task(pool.acquire("second"))
     for _ in range(100):
