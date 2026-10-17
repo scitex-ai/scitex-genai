@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 
+import scitex_logging as slogging
+
 from . import probe_provider_key
 
 
@@ -30,7 +32,7 @@ def main():
         )
     except ValueError as error:
         parser.error(str(error))
-    print(json.dumps(result.to_dict()))
+    slogging.getPlainConsole(__name__).emit(json.dumps(result.to_dict()))
     return 0 if result.available is True else 1
 
 

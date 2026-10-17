@@ -182,6 +182,21 @@ class RecordingUpstream:
             daemon=True,
         )
         self.thread.start()
+        # Wait until the server accepts connections: on a loaded CI runner
+        # the thread may not have entered serve_forever yet when the first
+        # probe fires, producing a connection timeout unrelated to the code.
+        import socket as _socket
+        import time as _time
+
+        _deadline = _time.monotonic() + 5.0
+        while True:
+            try:
+                with _socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=0.2):
+                    break
+            except OSError:
+                if _time.monotonic() > _deadline:
+                    raise
+                _time.sleep(0.01)
 
     def close(self) -> None:
         self.server.shutdown()

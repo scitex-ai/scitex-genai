@@ -16,6 +16,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+import scitex_logging as slogging
+
 from ._identity import gateway_code_fingerprint
 from ._settings import default_gateway_session_state_path
 from ._unit import (
@@ -39,6 +41,11 @@ class RolloutError(RuntimeError):
 
 Systemctl = Callable[[Sequence[str]], None]
 HealthCall = Callable[[str | Path, float], Mapping[str, Any]]
+
+
+def _report(message: str) -> None:
+    """Default progress reporter: prefix-free stdout via scitex-logging."""
+    slogging.getPlainConsole(__name__).emit(message)
 
 
 def default_runtime_dir() -> Path:
@@ -280,9 +287,10 @@ def rollout(
     bootstrap_coordinated: bool = False,
     systemctl: Systemctl = _systemctl,
     health_call: HealthCall = _health,
-    report: Callable[[str], None] = print,
+    report: Callable[[str], None] | None = None,
 ) -> None:
     """Verify a private candidate, atomically promote it, then drain the old one."""
+    announce = report if report is not None else _report
     generation = validate_generation(generation)
     if not build.strip():
         raise ValueError("build must be non-empty")
@@ -317,7 +325,7 @@ def rollout(
     )
     systemctl(["systemctl", "--user", "daemon-reload"])
     systemctl(["systemctl", "--user", "start", unit])
-    report(f"candidate {generation}: started {unit}")
+    announce(f"candidate {generation}: started {unit}")
     expected_fingerprint = gateway_code_fingerprint()
     try:
         candidate_health = wait_healthy(
@@ -334,7 +342,7 @@ def rollout(
         systemctl(["systemctl", "--user", "stop", unit])
         raise
     incarnation = str(candidate_health["gateway"]["incarnation"])
-    report(f"candidate {generation}: identity and upstream readiness verified")
+    announce(f"candidate {generation}: identity and upstream readiness verified")
     try:
         systemctl(["systemctl", "--user", "enable", unit])
     except Exception:
@@ -422,7 +430,7 @@ def rollout(
             "generations": generations,
         },
     )
-    report(f"candidate {generation}: frontend cut over atomically")
+    announce(f"candidate {generation}: frontend cut over atomically")
     if previous_generation is not None and previous_generation != generation:
         systemctl(
             [
@@ -433,7 +441,7 @@ def rollout(
                 backend_unit_name(previous_generation),
             ]
         )
-        report(f"generation {previous_generation}: drained and stopped")
+        announce(f"generation {previous_generation}: drained and stopped")
 
 
 @_serialized
@@ -446,9 +454,10 @@ def rollback(
     health_timeout_s: float = DEFAULT_HEALTH_TIMEOUT_S,
     systemctl: Systemctl = _systemctl,
     health_call: HealthCall = _health,
-    report: Callable[[str], None] = print,
+    report: Callable[[str], None] | None = None,
 ) -> None:
     """Re-promote the recorded previous generation, then drain the current one."""
+    announce = report if report is not None else _report
     runtime = runtime_dir or default_runtime_dir()
     state_file = state_path or default_rollout_state_path()
     state = _read_state(state_file)
@@ -507,4 +516,4 @@ def rollback(
     record["incarnation"] = str(restored_health["gateway"]["incarnation"])
     _write_json_atomic(state_file, state)
     systemctl(["systemctl", "--user", "disable", "--now", backend_unit_name(active)])
-    report(f"rollback: {previous} is active; {active} drained and stopped")
+    announce(f"rollback: {previous} is active; {active} drained and stopped")
