@@ -12,7 +12,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import scitex_logging as slogging
+
 from ._unit import UNIT_NAME
+
+
+def _report(message: str) -> None:
+    """Default progress reporter: prefix-free stdout via scitex-logging."""
+    slogging.getPlainConsole(__name__).emit(message)
 
 DEFAULT_DRAIN_TIMEOUT_S = 1800.0
 DEFAULT_POLL_INTERVAL_S = 2.0
@@ -107,13 +114,14 @@ def restart_when_drained(
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     http_call: HttpCall = _http_json,
     systemctl_call: SystemctlCall = _systemctl,
-    report: Callable[[str], None] = print,
+    report: Callable[[str], None] | None = None,
 ) -> None:
     """Cross the server's atomic empty barrier, then restart the user unit."""
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("timeout_s must be finite and > 0")
     if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
         raise ValueError("poll_interval_s must be finite and > 0")
+    announce = report if report is not None else _report
     base_url = health_url.removesuffix("/health").rstrip("/")
     query = urllib.parse.urlencode({"timeout_s": f"{timeout_s:g}"})
     drain_url = f"{base_url}/admin/drain?{query}"
@@ -125,11 +133,11 @@ def restart_when_drained(
             "gateway did not confirm a closed, empty admission barrier; "
             "restart refused and admission was not reopened"
         )
-    report("scitex-genai-gateway: admission closed; in_flight=0 queued=0")
+    announce("scitex-genai-gateway: admission closed; in_flight=0 queued=0")
     try:
         systemctl_call(["systemctl", "--user", "restart", UNIT_NAME])
     except Exception as exc:
         raise DrainError(
             f"restart failed while admission remains closed: {exc}"
         ) from exc
-    report(f"scitex-genai-gateway: drained; restarted {UNIT_NAME}")
+    announce(f"scitex-genai-gateway: drained; restarted {UNIT_NAME}")

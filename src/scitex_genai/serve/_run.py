@@ -24,8 +24,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import scitex_logging as slogging
+
 from ._ready import READY, Readiness, probe_health, wait_ready
 from ._render import CACHE_SUBDIRS, SGLANG_ENGINE_GENERATION_PLACEHOLDER, Launch
+
+
+def _log_message(message: str) -> None:
+    """Default engine log line: prefix-free stdout via scitex-logging."""
+    slogging.getPlainConsole(__name__).emit(message)
 
 Popen = Callable[..., Any]
 Log = Callable[[str], None]
@@ -46,7 +53,7 @@ class EngineRunner:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         http_get: Callable[[str], bool] = probe_health,
-        log: Log = print,
+        log: Log | None = None,
         engine_restart_s: float = 15.0,
         sidecar_restart_s: float = 10.0,
         tunnel_retry_s: float = 20.0,
@@ -59,7 +66,7 @@ class EngineRunner:
         self._sleep = sleep
         self._clock = clock
         self._http_get = http_get
-        self._log = log
+        self._log = log if log is not None else _log_message
         self.engine_restart_s = engine_restart_s
         self.sidecar_restart_s = sidecar_restart_s
         self.tunnel_retry_s = tunnel_retry_s
